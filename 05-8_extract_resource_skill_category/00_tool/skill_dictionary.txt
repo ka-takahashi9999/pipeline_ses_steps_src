@@ -1,0 +1,761 @@
+# スキル辞書 (YAML形式)
+# カテゴリごとにキーワードリストを管理する。
+# ・大文字小文字を区別しないマッチングを行う
+# ・複合スキル（"SQL Server"など）は単体スキルより先にマッチングされる
+# ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
+
+バックエンド:
+  - Java
+  - Python
+  - "C#"
+  - Ruby
+  - Go
+  - PHP
+  - Kotlin
+  - Scala
+  - Golang
+  - Perl
+  - "Node.js"
+  - NodeJS
+  - Spring Boot
+  - Springboot
+  - Spring Framework
+  - Spring
+  - ".NET Core"
+  - ".NET Framework"
+  - ".NET"
+  - "ASP.NET"
+  - Django
+  - FastAPI
+  - Flask
+  - Rails
+  - Laravel
+  - Symfony
+  - Express
+  - NestJS
+  - Gin
+  - Echo
+  - gRPC
+  - GraphQL
+  - "REST API"
+  - RESTful
+  - REST
+  - Rust
+  - WebAPI
+  - "Web API"
+  - COBOL
+  - VB.NET
+  - "Visual Basic"
+  - RPG
+  - "PL/SQL"
+  - "T-SQL"
+  - AS400
+  - ABAP
+  - "Spring Batch"
+  - TERASOLUNA
+  - "C#.NET"
+  - AzureFunction
+  - "Azure Functions"
+  - PLSQL
+  - Java21
+  - Struts
+  - "Java Spring Boot"
+  - "DGS framework"
+  - DDD
+  - クリーンアーキテクチャ
+  - モダンPHP
+  - "PHP5.6"
+  - "CakePHP2"
+  - "FuelPHP1.8"
+  - Thymeleaf
+  - "Ruby on Rails"
+  - JavaAPI
+  - JSP
+  - API設計構築
+  - API設計
+  - Strawberry
+  - Groovy
+  - puma
+  - Cake
+  - 楽々FW3
+  - "intra-mart"
+  - HeartCore
+  - SpringBoot
+  - Mybatis
+  - Hibernate
+  - ".NET 8"
+  - CodeIgniter
+  - Go言語
+  - "Visual Basic6.0"
+  - "Visual InterDev6.0"
+  - JavaEE
+  - VB
+
+
+フロントエンド:
+  - JavaScript
+  - TypeScript
+  - "React.js"
+  - "Vue.js"
+  - "Angular.js"
+  - React
+  - Vue
+  - Angular
+  - HTML
+  - CSS
+  - Sass
+  - SCSS
+  - Less
+  - jQuery
+  - Webpack
+  - Vite
+  - "Next.js"
+  - "Nuxt.js"
+  - Redux
+  - Vuex
+  - Pinia
+  - Storybook
+  - Bootstrap
+  - Tailwind
+  - "Tailwind CSS"
+  - MUI
+  - "Material UI"
+  - Svelte
+  - Remix
+  - Astro
+  - Apollo
+  - "React Router"
+  - "Vue.js 3"
+  - Blazor
+  - "Gatsby.js"
+  - "Vue3.js"
+  - HTML5
+  - CSS3
+  - Vercel
+  - SvelteKit
+
+インフラ:
+  - AWS
+  - Azure
+  - GCP
+  - "Google Cloud"
+  - Linux
+  - Unix
+  - Docker
+  - Kubernetes
+  - k8s
+  - Terraform
+  - Ansible
+  - Jenkins
+  - "GitHub Actions"
+  - "GitLab CI"
+  - CircleCI
+  - "CI/CD"
+  - Nginx
+  - Apache
+  - IIS
+  - Vagrant
+  - VMware
+  - Serverless
+  - ECS
+  - EKS
+  - EC2
+  - S3
+  - RDS
+  - Lambda
+  - CloudFormation
+  - Prometheus
+  - Grafana
+  - Datadog
+  - "TCP/IP"
+  - VPN
+  - ファイアウォール
+  - Helm
+  - ArgoCD
+  - オンプレミス
+  - オンプレ
+  - Cisco
+  - Juniper
+  - Palo Alto
+  - PaloAlto
+  - Fortinet
+  - FortiGate
+  - F5
+  - ルーター
+  - スイッチ
+  - ネットワーク設計
+  - NW
+  - Windows Server
+  - "Windows Server 2019"
+  - "Windows Server 2022"
+  - ネットワークエンジニア
+  - サーバーエンジニア
+  - サーバ設計
+  - ネットワーク領域
+  - Zabbix
+  - Cacti
+  - "Netflow Analyzer"
+  - "JP1/AJS"
+  - HYCU
+  - Veeam
+  - vSphere
+  - "CF Operations"
+  - "Log Analytics"
+  - bicep
+  - azCLI
+  - SystemManager
+  - 5Gコアネットワーク
+  - "Tomcat 10.1"
+  - "Apache 2"
+  - fargate
+  - Fargate
+  - sqs
+  - IaaS
+  - SendGrid
+  - Sentry
+  - JP1
+  - "Oracle Cloud"
+  - Airflow
+  - "Step Functions"
+  - EventBridge
+  - ALB
+  - RHEL
+  - "HP-UX"
+  - ESXi
+  - "Amazon Linux"
+  - CCNP
+  - "LPIC Level3"
+  - "CA Spectrum"
+  - MRTG
+  - OpenView
+  - "Serverless Framework"
+  - "Entra ID"
+  - SCCM
+  - AzureMonitor
+  - LocalStack
+  - "Cisco ACI"
+  - "L2/L3"
+  - Arista
+  - Citrix
+  - Opengear
+  - AIX
+  - BIG-IP
+  - IAM
+  - VPC
+  - CloudWatch
+  - SNS
+  - EBS
+  - ELB
+  - "JP1/AO"
+  - "JP1/AJS3"
+  - "JP1/IM"
+  - "ESS REC"
+  - Acronis
+  - PowerVM
+  - "IBM MQ"
+  - "Amazon Route53"
+  - "Cisco Router"
+  - "Cisco Catalyst"
+  - "VMware vSphere"
+  - "Red Hat Enterprise Linux"
+  - "CISCO UCS"
+  - "F5 BIG-IP"
+  - "CCIE Routing&Switching"
+  - "VMware ESXi"
+  - RHCE
+  - "VCP-DCV"
+  - "Cloud Scheduler"
+  - chef
+  - "Hyper-V"
+  - "Ansible Playbook"
+  
+
+クラウドサービス:
+  - AWS Bedrock
+
+DB:
+  - "SQL Server"
+  - MySQL
+  - PostgreSQL
+  - Oracle
+  - SQLite
+  - MongoDB
+  - Redis
+  - DynamoDB
+  - Cassandra
+  - Elasticsearch
+  - OpenSearch
+  - BigQuery
+  - SQL
+  - NoSQL
+  - DBMS
+  - Snowflake
+  - DB2
+  - MariaDB
+  - InfluxDB
+  - データベース
+  - MaxGuage
+  - ISAM
+  - HIRDB
+  - SQLServer
+  - "Azure SQL Server"
+  - Prisma
+  - Redshift
+  - redshift
+  - "Azure SQL"
+  - PGvector
+  - OracleDB
+  - "RDS for Oracle"
+  - "Amazon Aurora"
+  - CommonSQL
+  - Oracle12c
+  - Access
+  - "Windows SQL Server"
+  - MDB
+  - "Oracle Database"
+  - Realm
+  - Symfoware
+
+モバイル:
+  - iOS
+  - Android
+  - Swift
+  - "Objective-C"
+  - Flutter
+  - "React Native"
+  - Xamarin
+  - Dart
+  - Xcode
+  - "Android Studio"
+  - モバイルアプリ
+  - スマホアプリ
+  - スマートフォンアプリ
+  - SwiftUI
+  - Firebase
+  - Expo
+  - ReactNative
+  - UIKit
+  - "Jetpack Compose"
+
+データ分析/AI:
+  - "Machine Learning"
+  - "Deep Learning"
+  - TensorFlow
+  - PyTorch
+  - "scikit-learn"
+  - Spark
+  - Hadoop
+  - 機械学習
+  - 深層学習
+  - データサイエンス
+  - LangChain
+  - LightGBM
+  - VectorDB
+  - Pinecone
+  - ELT
+  - Looker
+  - データエンジニアリング
+  - ETL処理
+  - Gurobi
+  - RAG
+  - 機械学習基盤
+
+データ分析:
+  - Pandas
+  - NumPy
+  - Tableau
+  - "Power BI"
+  - PowerBI
+  - BI
+  - BIツール
+  - Qlik
+  - "Google Analytics"
+  - Googleアナリティクス
+  - GoogleAnalytics
+  - 統計
+  - データ分析
+  - QGIS
+  - GeoPandas
+  - ETL
+  - kql
+  - SAS
+  - dbt
+  - EMR
+  - Confluent
+  - "Apache Kafka"
+  - DataSpider
+  - "Apache Airflow"
+  - LookerStudio
+  - ETLツール
+
+AI:
+  - "OpenAI API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
+  - "Anthropic API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
+  - "Gemini API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
+  - Claude  # AI駆動開発（Claude Code / SDD）経験
+  - "GitHub Copilot"
+  - "Claude Code"
+  - Cursor
+  - ChatGPT
+  - Gemini
+  - "Gemini AI"
+  - MCP
+  - LLM
+  - "AI/LLM"
+  - AI領域
+  - AIプロダクト
+  - AI技術
+  - 生成AI
+  - AIの知見
+  - AI
+  - AI駆動開発
+  - "Codex CLI"
+
+セキュリティ:
+  - OAuth
+  - SAML
+  - JWT
+  - ISMS
+  - "SOC 2"
+  - SOC2
+  - ゼロトラスト
+  - セキュリティ設計
+  - 特権ID
+  - CyberArk
+  - "Firebase Authentication"
+  - "McAfee Application Control"
+  - "Trend Vision One"
+  - DeepSecurity
+  - サイバーセキュリティ
+
+テスト/品質:
+  - JUnit
+  - pytest
+  - RSpec
+  - Selenium
+  - Cypress
+  - Jest
+  - Mocha
+  - JMeter
+  - テスト設計
+  - テスト自動化
+  - "E2Eテスト"
+  - "E2E"
+  - QA
+  - テストケース作成
+  - Playwright
+  - Kotest
+  - spock
+  - MagicPod
+  - JSTQB
+  - CANoe
+  - テストケース作成
+  - システムテスト
+  - SoftwareFactry
+  - "CAT-TCM"
+  - TestRail
+  - TDD
+
+プロジェクト管理:
+  - Agile
+  - Scrum
+  - Kanban
+  - アジャイル
+  - ウォーターフォール
+  - PMO
+  - PMP
+  - PMBOK
+  - PM
+  - UML
+  - スクラム
+  - "As-Is/To-Beモデル"
+  - "As-Is/To-Be"
+  - "AsIs/ToBe"
+  - 顧客折衝
+  - テックリード
+
+組み込み:
+  - "C++"
+  - RTOS
+  - 組み込み
+  - マイコン
+  - Arduino
+  - "Raspberry Pi"
+  - FPGA
+  - VHDL
+  - Verilog
+  - C言語
+  - "Renesas R-Car"
+  - Flashデバイス
+  - DRAM
+  - 組込
+  - アセンブラ
+  - ルネサス
+  - 三菱マイコン
+  - "C/C++"
+  - ASM
+
+業務系:
+  - SAP
+  - Salesforce
+  - ServiceNow
+  - kintone
+  - ERP
+  - CRM
+  - 基幹システム
+  - 会計システム
+  - GRANDIT
+  - 給与奉行
+  - 弥生
+  - 勘定奉行
+  - GLOVIA
+  - COMPANY
+  - SuperStream
+  - SmartDB
+  - "ServiceDesk Plus"
+  - 楽々フレームワーク
+  - 楽々WF
+  - "Dynamics365 Finance & Operations"
+  - BaaN
+  - Anaplan
+  - MES
+  - kintoneプラグイン
+  - POS
+  - "Active!mail"
+  - "Active!Zone"
+  - "Enterprise Audit"
+  - "m-FILTER@Cloud"
+  - "Microsoft Dataverse" #業務データ基盤（Power Platform系）
+  - GAS #業務自動化／スクリプト
+  - Maya #DCCツール（3D制作）
+  - "Substance Painter" #DCCツール（3Dアート）
+  - XML
+  - Apex
+  - Visualforce
+  - Lightning
+  - "SAP S/4HANA"
+  - ShareGate
+  - "AvePoint Fly"
+
+
+ミドルウェア・基盤:
+  - Postfix
+  - Dovecot
+  - XMAP
+
+営業系:
+  - 法人営業
+  - アウトバウンド営業
+
+ヘルプデスク:
+  - ヘルプデスク
+
+秘書系:
+  - 秘書
+
+CAD系:
+  - autoCAD
+  - CAD
+
+基地局系:
+  - 基地局
+  - 屋内配線
+  - 光回線
+  - 通信インフラ工事
+  - 施工管理
+  - 工事調整
+
+ロースキル系:
+  - ロースキル
+  - 未経験可
+  - PCスキル
+  - キッティング
+  - Windows11端末
+  - Windows11パソコン
+  - 一次対応
+  - アカウント管理
+  - 営業支援
+  - 事務経験
+  - 定期メンテナンス
+  - エスカレーション
+  - 問い合わせ対応
+
+ゲーム系:
+  - ゲーム
+  - Unity
+  - "3D背景"
+  - モーション
+  - アニメーション
+  - "2Dデザイナー"
+  - "Unreal Engine" #ゲーム／リアルタイム3Dエンジン
+  - 描画パイプライン
+  - シェーダ
+  - ポストエフェクト
+  - GLSL
+  - HLSL
+
+デザイン系:
+  - Figma
+  - "Adobe XD"
+  - Photoshop
+  - Illustrator
+  - "CLIP STUDIO"
+  - "Adobe Photoshop"
+  - グラフィックデザイナー
+  - UIデザイナー
+  - "UX/UIデザイナー"
+  - イラスト
+  - XD
+
+言語系:
+  - 英語
+  - 日本語
+  - バイリンガル
+  - グローバルチーム
+  - ベトナム語
+  - 中国語
+
+汎用機系:
+  - IBM汎用機
+  - "PL/I"
+  - IBMメインフレーム
+  - "z/OS"
+  - メインフレーム
+  - NetView
+  - "IBM COBOL"
+  - "PL/1"
+
+RPA系:
+  - RPA
+  - "Autometion Anywhere"
+  - "RPA UiPath"
+  - "Power Automate Desktop"
+  - PAD
+  - UiPath
+  - BizRobo
+  - PowerAutomate
+  - WinActor
+  - RPAワークフロー
+
+VBA系:
+  - VBA
+  - Excelマクロ
+  - "Excel VBA"
+  - ExcelVBA
+  - "Excel VBA"
+  - ExcelVBA
+  - AccessVBA
+
+M365系:
+  - "Microsoft 365"
+  - MCM
+  - "Microsoft Configuration Manager"
+  - "Dynamics 365"
+  - "Power Platform"
+  - PowerQuery
+  - Outlook
+  - Teams
+  - "Microsoft Office製品"
+  - M365
+  - AzureAD
+  - "Active Directory"
+  - ActiveDirectory
+  - "Microsoft Intune"
+  - MDM
+  - "Microsoft Entra"
+  - EntraID
+  - Intune
+  - MECM
+  - Autopilot
+  - PowerApps
+  - "Power Apps"
+  - "Power Automate"
+  - "Power Pages"
+  - "Copilot Studio"
+
+Google系:
+  - GoogleApps
+  - GoogleWorkspace
+  - "Google Workspace"
+
+ブロックチェーン:
+  - Geth
+  - IPFS
+  - ブロックチェーン
+
+CMS系:
+  - WordPress
+  - CMS
+
+#ネットワークのファイアーウォールとバックエンドのフレームワークと混在する恐れがあるので独立
+FW:
+  - FW
+
+#分類不可の為
+その他:
+  - SVFCloud
+  - Solidity
+  - GPU負荷軽減
+  - Stripe
+  - FORTRAN
+  - DevOps
+  - "Graph API"
+  - クラウド型データ分析基盤
+  - クラウドリフト
+  - E2Eアーキテクチャ
+
+#Excel/Word/PowerPoint系: #汎用的すぎて広範囲で一致が発生する為除外
+#  - Excel
+#  - PowerPoint
+#  - Word
+#  - VLOOKUP
+#  - ピボットテーブル
+#  - VBA
+#  - Excelマクロ
+
+#バージョン管理: #汎用的すぎて広範囲で一致が発生する為除外
+#  - Git
+#  - GitHub
+#  - GitLab
+#  - Bitbucket
+#  - SVN
+#  - Subversion
+#  - TortoiseSVN
+
+#管理ツール: #汎用的すぎて広範囲で一致が発生する為除外
+#  - JIRA
+#  - Confluence
+#  - Backlog
+#  - Redmine
+
+#開発ツール:
+#  - Eclipse
+#  - "Visual Studio Code"
+#  - VisualStudio Code
+#  - VSCode
+#  - phpMyAdmin
+#  - pgAdmin
+#  - TeraTerm
+#  - WinSCP
+#  - IntelliJ
+
+#用途不明:
+#  - Play
+#  - Mybatix # スペルミス
+
+#広すぎる為
+#プロンプト系:
+#  - ShellScript
+#  - Shell script
+#  - Shell Script
+#  - Shell
+#  - Bash
+#  - PowerShell
+
+#広すぎる為
+#OS/MW系:
+#  - Windows
+#  - Windows10
+#  - Mac
+#  - Tomcat
+#  - VirtualBox
