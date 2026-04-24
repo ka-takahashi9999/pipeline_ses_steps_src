@@ -26,6 +26,13 @@ SESマッチングシステムの構築
 - 各 step は前 step の結果を入力として扱う
 - 後続 step から前 step を逆参照する設計は禁止
 
+# Git運用ルール
+- このディレクトリ `/home/ec2-user/pipeline_ses_steps` は実行・作業用であり、git 管理対象ではない
+- ソースコード管理用リポジトリは `/home/ec2-user/pipeline_ses_steps_src` を使用する
+- git による差分確認、commit、push が必要な場合は、原則 `/home/ec2-user/pipeline_ses_steps_src` 側で行う
+- 作業ディレクトリの変更をソース管理用リポジトリへ反映する場合は、`/home/ec2-user/pipeline_ses_steps_src/sync.sh` または `~/sync_and_push_pipeline_ses_steps_src.sh` を利用してよい
+- `01_result/` `02_confirm/` `99_execution_time/` `*.json` `*.jsonl` などの生成物・成果物は git 管理しない
+
 # JSONLルール
 - 1行1JSON を厳守する
 - UTF-8 を使用する
