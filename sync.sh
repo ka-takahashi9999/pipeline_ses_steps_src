@@ -10,6 +10,9 @@ mkdir -p "$DST"
 
 # 共通ファイル
 cp "$SRC/AGENTS.md" "$DST/"
+if [ -f "$SRC/CLAUDE.md" ]; then
+  cp "$SRC/CLAUDE.md" "$DST/"
+fi
 
 if [ -d "$SRC/common" ]; then
   rm -rf "$DST/common"
