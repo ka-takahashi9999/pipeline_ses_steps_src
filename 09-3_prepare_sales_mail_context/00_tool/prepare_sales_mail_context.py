@@ -202,7 +202,7 @@ def ensure_required_inputs(paths: List[Path]) -> None:
 
 
 def parse_sequence(file_name: str) -> int:
-    match = re.search(r"_pair_(\d+)\.txt$", file_name)
+    match = re.search(r"_pair_(\d+)(?:_前回出力済)?\.txt$", file_name)
     if not match:
         raise ValueError(f"pair連番を抽出できません: {file_name}")
     return int(match.group(1))
