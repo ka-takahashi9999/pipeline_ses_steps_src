@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="/home/ec2-user/pipeline_ses_steps"
-LOG="$ROOT/00_pipeline/01_result/pipeline_script_exec.log"
+LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
 RUN_DATE="${RUN_DATE:-$(date '+%Y%m%d')}"
 
 mkdir -p "$ROOT/00_pipeline/01_result"
@@ -11,14 +11,34 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
 }
 
+publish_current_step() {
+  local step="$1"
+  if [ -n "${PIPELINE_CURRENT_STEP_FILE:-}" ]; then
+    printf '%s\n' "$step" > "${PIPELINE_CURRENT_STEP_FILE}.tmp.$$"
+    mv "${PIPELINE_CURRENT_STEP_FILE}.tmp.$$" "$PIPELINE_CURRENT_STEP_FILE"
+  fi
+  if [ -n "${PIPELINE_STATUS_WRITER:-}" ]; then
+    python3 "$PIPELINE_STATUS_WRITER" --status RUNNING --current-step "$step"
+  fi
+}
+
 run_step() {
   local step="$1"
   shift
+  publish_current_step "$step"
   log "=== START $step ==="
   local start_ts
+  local exit_code
+  local -a pipeline_status
   start_ts=$(date +%s)
+  set +e
   python3 "$@" 2>&1 | tee -a "$LOG"
-  local exit_code=${PIPESTATUS[0]}
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  exit_code="${pipeline_status[0]}"
+  if [ "$exit_code" -eq 0 ] && [ "${pipeline_status[1]}" -ne 0 ]; then
+    exit_code="${pipeline_status[1]}"
+  fi
   local elapsed=$(( $(date +%s) - start_ts ))
   if [ "$exit_code" -ne 0 ]; then
     log "=== FAILED $step (exit=$exit_code, elapsed=${elapsed}s) ==="
@@ -171,6 +191,7 @@ run_step "09-4_remove_category_mismatch_sales_candidates(RUN_DATE=$RUN_DATE)" "$
 run_step "09-5_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-5_generate_sales_reply_draft/00_tool/generate_sales_reply_draft.py" --target-date "$RUN_DATE"
 
 ##アシスタントツール（shスクリプトのためrun_stepではなくbashで直接実行）
+publish_current_step "run_suggest_and_cleanup"
 log "=== START run_suggest_and_cleanup ==="
 bash "$ROOT/00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh" 2>&1 | tee -a "$LOG"
 log "=== DONE run_suggest_and_cleanup ==="
