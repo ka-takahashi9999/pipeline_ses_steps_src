@@ -72,6 +72,8 @@ run_step "03-51_extract_project_required_skills_list" "$ROOT/03-51_extract_proje
 
 run_step "04-1_fetch_skillsheets_text" "$ROOT/04-1_fetch_skillsheets_text/00_tool/fetch_skillsheets_text.py"
 
+run_step "04-2_normalize_skillsheets_text" "$ROOT/04-2_normalize_skillsheets_text/00_tool/normalize_skillsheets_text.py"
+
 run_step "05-1_extract_resource_budget" "$ROOT/05-1_extract_resource_budget/00_tool/extract_resource_budget.py"
 
 run_step "05-2_extract_resource_age" "$ROOT/05-2_extract_resource_age/00_tool/extract_resource_age.py"
@@ -136,8 +138,13 @@ run_step "06-30_match_contract_type" "$ROOT/06-30_match_contract_type/00_tool/ma
 run_step "06-80_duplicate_proposal_check" "$ROOT/06-80_duplicate_proposal_check/00_tool/duplicate_proposal_check.py"
 
 # 07-1 は LLM使用step。06-80で仕分けた新規ペアのみを処理する。
-run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" #新規のみ全件
+# 07-1 raw版を使う場合はこちら
+#run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" #新規のみ全件
 #run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" --limit 2000 #件数指定(100件を例)
+
+# 07-1 normalized版: 04-2 normalized skillsheet を利用
+run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py" #新規のみ全件
+#run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py" --limit 2000 #件数指定(100件を例)
 
 run_step "08-1_restore_and_merge_requirement_skill_ai_matching" "$ROOT/08-1_restore_and_merge_requirement_skill_ai_matching/00_tool/restore_and_merge_requirement_skill_ai_matching.py"
 
@@ -159,7 +166,9 @@ run_step "09-3_prepare_sales_proposal_input(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_pre
 # 新しい営業メール文脈生成/ドラフト生成は同一 RUN_DATE で固定して後続追加する。
 run_step "09-3_prepare_sales_mail_context(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_prepare_sales_mail_context/00_tool/prepare_sales_mail_context.py" --target-date "$RUN_DATE"
 
-run_step "09-4_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-4_generate_sales_reply_draft/00_tool/generate_sales_reply_draft.py" --target-date "$RUN_DATE"
+run_step "09-4_remove_category_mismatch_sales_candidates(RUN_DATE=$RUN_DATE)" "$ROOT/09-4_remove_category_mismatch_sales_candidates/00_tool/remove_category_mismatch_sales_candidates.py" --target-date "$RUN_DATE"
+
+run_step "09-5_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-5_generate_sales_reply_draft/00_tool/generate_sales_reply_draft.py" --target-date "$RUN_DATE"
 
 ##アシスタントツール（shスクリプトのためrun_stepではなくbashで直接実行）
 log "=== START run_suggest_and_cleanup ==="
