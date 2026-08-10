@@ -202,7 +202,9 @@ _ONSITE_PATTERNS = [
 def _parse_weekly_days(m: re.Match) -> int:
     """週N日リモートのNを整数に変換する。"""
     raw = m.group(1)
-    return _WEEKLY_REMOTE_KANJI.get(raw, int(raw))
+    if raw in _WEEKLY_REMOTE_KANJI:
+        return _WEEKLY_REMOTE_KANJI[raw]
+    return int(raw)
 
 
 def rule_extract_remote(body: str) -> Tuple[str, str, Optional[int], Optional[str]]:
