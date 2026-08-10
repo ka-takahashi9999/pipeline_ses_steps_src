@@ -109,9 +109,16 @@ RX_DAILY_MAN  = re.compile(r"日給\s*(\d{1,2})\s*万[円]?")
 RX_DAILY_YEN  = re.compile(r"日給\s*(\d{3,6})\s*円")
 RX_HOURLY_YEN = re.compile(r"時給\s*(\d{3,5})\s*円")
 RX_HOURLY_MAN = re.compile(r"時給\s*(\d{1,2})\s*万[円]?")
-RX_HOURLY_YEN_SLASH = re.compile(r"(\d{3,5})\s*円\s*/\s*[hｈ時]")
+RX_HOURLY_YEN_SLASH_COMMA = re.compile(
+    r"(?<![\d,])(\d{1,3}(?:,\d{3})+)\s*円\s*/\s*[hHｈ時]"
+)
+RX_HOURLY_YEN_SLASH = re.compile(r"(?<![\d,])(\d{3,5})\s*円\s*/\s*[hHｈ時]")
 # 数値のみ範囲（万なし）: 単価:60-65 / 単価:60~65 → 万として解釈
 RX_NUM_RANGE_ONLY = re.compile(r"(\d{2,3})\s*[〜~\-]\s*(\d{2,3})(?!\s*万)(?!\s*\d)")
+# 価格キーワードなし要員リスト形式: 5月～/63万円
+RX_START_DATE_SLASH_MAN = re.compile(
+    r"(?:即日|\d{1,2}\s*月)\s*[〜~\-]?\s*[\/／]\s*(\d{2,3})\s*万[円]?"
+)
 
 
 # ── セグメント抽出 ────────────────────────────────────────
@@ -152,6 +159,11 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
     if m:
         v = int(m.group(1)) * HOURLY_TO_MONTHLY
         return v, None, None, "hourly-yen", m.group(0)
+
+    m = RX_HOURLY_YEN_SLASH_COMMA.search(seg)
+    if m:
+        v = int(m.group(1).replace(",", "")) * HOURLY_TO_MONTHLY
+        return v, None, None, "hourly-yen-slash", m.group(0)
 
     m = RX_HOURLY_YEN_SLASH.search(seg)
     if m:
@@ -241,6 +253,18 @@ def _man_patterns(seg: str) -> Optional[Tuple]:
     return None
 
 
+def _fallback_start_date_slash_man(text: str) -> Optional[Tuple]:
+    """価格キーワードなしの要員リスト形式から希望単価を抽出する。"""
+    for line in text.splitlines():
+        m = RX_START_DATE_SLASH_MAN.search(line)
+        if not m:
+            continue
+        v = int(m.group(1)) * 10000
+        if 200_000 <= v <= 3_000_000:
+            return v, None, None, "start-date-slash-man", m.group(0)
+    return None
+
+
 def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int], str, str]:
     """
     ルールベースで希望単価を抽出。
@@ -253,6 +277,10 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int]
     segments = _get_segments(text)
 
     if not segments:
+        result = _fallback_start_date_slash_man(text)
+        if result:
+            price, p_min, p_max, reason, raw = result
+            return price, p_min, p_max, reason, raw
         if len(text) <= 200:
             segments = [text]
         else:
