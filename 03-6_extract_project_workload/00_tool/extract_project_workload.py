@@ -83,6 +83,16 @@ _PCT_SINGLE_WORKLOAD_RE = re.compile(
     r"稼働\s*(\d{1,3})\s*%"
 )
 
+# 3. 週N日〜週M日稼働: 週4日〜週5日稼働 / 週4〜5日稼働
+_WEEK_WORKLOAD_RANGE_RE = re.compile(
+    r"週\s*([1-5一二三四五])\s*日?\s*[〜~\-]\s*(?:週\s*)?"
+    r"([1-5一二三四五])\s*日\s*稼働"
+)
+
+# 4. 人月表記: 1人月 / 1.0人月 / 0.8人月
+_PERSON_MONTH_RE = re.compile(r"(?<![\d.])((?:0\.[1-9]|1(?:\.0+)?))\s*人\s*月")
+_PERSON_MONTH_CONSULT_RE = re.compile(r"相談可|検討可|応相談")
+
 # 参考用: 週N日/週N回は原則 workload 抽出に使わない
 _WEEK_RANGE_RE = re.compile(
     r"週\s*([1-5一二三四五])\s*[日回]?\s*[〜~]\s*([1-5一二三四五])\s*[日回]"
@@ -128,6 +138,52 @@ _HOURS_RE = re.compile(
 )
 
 
+def _week_day_to_pct(value: str) -> int:
+    table = {
+        "1": 20, "一": 20,
+        "2": 40, "二": 40,
+        "3": 60, "三": 60,
+        "4": 80, "四": 80,
+        "5": 100, "五": 100,
+    }
+    return table[value]
+
+
+def _person_month_to_pct(value: str) -> int:
+    return int(round(float(value) * 100))
+
+
+def _extract_week_workload_range(text: str) -> Optional[Tuple[int, int, str]]:
+    for line in text.splitlines():
+        if _WEEKLY_NON_WORKLOAD_RE.search(line):
+            continue
+        m = _WEEK_WORKLOAD_RANGE_RE.search(line)
+        if not m:
+            continue
+        lo = _week_day_to_pct(m.group(1))
+        hi = _week_day_to_pct(m.group(2))
+        return min(lo, hi), max(lo, hi), m.group(0)
+    return None
+
+
+def _extract_person_month(text: str) -> Optional[Tuple[int, int, str]]:
+    candidates = []
+    for idx, line in enumerate(text.splitlines()):
+        for m in _PERSON_MONTH_RE.finditer(line):
+            pct = _person_month_to_pct(m.group(1))
+            if 1 <= pct <= 100:
+                candidates.append(
+                    (_PERSON_MONTH_CONSULT_RE.search(line) is not None, idx, pct, m.group(0))
+                )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    _, _, pct, raw = candidates[0]
+    return pct, pct, raw
+
+
 def rule_extract_workload(body: str) -> Tuple[int, int, str, Optional[str]]:
     """
     ルールベースで稼働率を抽出する。
@@ -159,17 +215,29 @@ def rule_extract_workload(body: str) -> Tuple[int, int, str, Optional[str]]:
         if 1 <= pct <= 100:
             return pct, pct, "extracted", m.group(0)
 
-    # 3. 稼働時間（H/月 / 精算幅）→ 100%
+    # 3. 週N日〜週M日稼働（リモート/出社頻度行は除外）
+    week_range = _extract_week_workload_range(text)
+    if week_range:
+        lo, hi, raw = week_range
+        return lo, hi, "extracted", raw
+
+    # 4. 人月表記（相談可/検討可/応相談の行は後回し）
+    person_month = _extract_person_month(text)
+    if person_month:
+        lo, hi, raw = person_month
+        return lo, hi, "extracted", raw
+
+    # 5. 稼働時間（H/月 / 精算幅）→ 100%
     m = _HOURS_RE.search(text)
     if m:
         return DEFAULT_WORKLOAD, DEFAULT_WORKLOAD, "extracted", m.group(0)
 
-    # 4. フルタイム/常勤/フル稼働
+    # 6. フルタイム/常勤/フル稼働
     m = _FULLTIME_RE.search(text)
     if m:
         return DEFAULT_WORKLOAD, DEFAULT_WORKLOAD, "extracted", m.group(0)
 
-    # 5. 稼働率/稼働: 週5系
+    # 7. 稼働率/稼働: 週5系
     m = _WEEK5_WORKLOAD_RE.search(text)
     if m:
         return DEFAULT_WORKLOAD, DEFAULT_WORKLOAD, "extracted", m.group(0)
