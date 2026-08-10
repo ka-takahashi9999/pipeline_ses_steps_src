@@ -36,9 +36,25 @@ INPUT_FILES = [
     ("match_score_sort_0percent.jsonl",      "0percent"),
 ]
 
+PREVIOUS_OUTPUT_SUFFIX = "_前回出力済"
+
 
 def is_no_match_file(records: list) -> bool:
     return len(records) == 1 and records[0].get("status") == "no_match"
+
+
+def is_duplicate_proposal(pair: dict) -> bool:
+    value = pair.get("duplicate_proposal_check", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "済"}
+    return False
+
+
+def build_output_filename(label: str, seq: int, pair: dict) -> str:
+    suffix = PREVIOUS_OUTPUT_SUFFIX if is_duplicate_proposal(pair) else ""
+    return f"mail_display_format_{label}_pair_{seq:04d}{suffix}.txt"
 
 
 def normalize_body(body: str) -> str:
@@ -62,7 +78,7 @@ def normalize_body(body: str) -> str:
 
 def format_pair(pair: dict, mail_master: dict) -> str:
     """1ペアのテキスト出力を生成する。"""
-    is_duplicate = pair.get("duplicate_proposal_check", False)
+    is_duplicate = is_duplicate_proposal(pair)
     duplicate_flag = "済" if is_duplicate else "未"
 
     project_mid = pair.get("project_info", {}).get("message_id", "")
@@ -167,7 +183,7 @@ def main():
 
             for seq, pair in enumerate(records, 1):
                 text = format_pair(pair, mail_master)
-                out_filename = f"mail_display_format_{label}_pair_{seq:04d}.txt"
+                out_filename = build_output_filename(label, seq, pair)
                 out_path = output_dir / out_filename
                 out_path.write_text(text, encoding="utf-8")
                 total_pairs += 1
