@@ -1,0 +1,1153 @@
+{
+  "Comment": "Orchestrate SES matching pipeline using a short-lived SSM launcher and S3 status polling.",
+  "QueryLanguage": "JSONPath",
+  "TimeoutSeconds": 72000,
+  "StartAt": "ValidateRunDateInput",
+  "States": {
+    "ValidateRunDateInput": {
+      "Type": "Choice",
+      "QueryLanguage": "JSONata",
+      "Choices": [
+        {
+          "Condition": "{% ($hasRunDate := $exists($states.input.run_date); $hasUpperRunDate := $exists($states.input.RUN_DATE); ($not($hasRunDate) and $not($hasUpperRunDate)) or (($hasRunDate and $not($hasUpperRunDate)) ? (($type($states.input.run_date) = 'string') ? $exists($match($states.input.run_date, /^[0-9]{8}$/)) : false) : false)) %}",
+          "Next": "PrepareRunContext"
+        }
+      ],
+      "Default": "InvalidRunDateInput"
+    },
+    "InvalidRunDateInput": {
+      "Type": "Fail",
+      "Error": "InvalidRunDateInput",
+      "Cause": "Optional run_date must be a YYYYMMDD string; RUN_DATE is not supported."
+    },
+    "PrepareRunContext": {
+      "Type": "Pass",
+      "QueryLanguage": "JSONata",
+      "Output": "{% {'run_id': 'sfn-' & $uuid(), 'run_date': $exists($states.input.run_date) ? $states.input.run_date : $fromMillis($toMillis($states.context.Execution.StartTime), '[Y0001][M01][D01]', '+0900'), 'waits': {'ec2_running': 0, 'ssm_ready': 0, 'launcher': 0}} %}",
+      "Next": "StartEC2"
+    },
+    "StartEC2": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
+      "Parameters": {
+        "InstanceIds": [
+          "i-06c075528d0039c3a"
+        ]
+      },
+      "ResultPath": "$.start_ec2_result",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetStartEC2Failure"
+        }
+      ],
+      "Next": "WaitForEC2Running"
+    },
+    "WaitForEC2Running": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "DescribeEC2"
+    },
+    "DescribeEC2": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+      "Parameters": {
+        "InstanceIds": [
+          "i-06c075528d0039c3a"
+        ]
+      },
+      "ResultPath": "$.describe_ec2_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetDescribeEC2Failure"
+        }
+      ],
+      "Next": "IsEC2Running"
+    },
+    "IsEC2Running": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.describe_ec2_result.Reservations[0].Instances[0].State.Name",
+          "StringEquals": "running",
+          "Next": "WaitForSSMReady"
+        }
+      ],
+      "Default": "IncrementEC2RunningWait"
+    },
+    "IncrementEC2RunningWait": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "waits": {
+          "ec2_running.$": "States.MathAdd($.waits.ec2_running, 1)",
+          "ssm_ready.$": "$.waits.ssm_ready",
+          "launcher.$": "$.waits.launcher"
+        }
+      },
+      "Next": "CheckEC2RunningWaitLimit"
+    },
+    "CheckEC2RunningWaitLimit": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.waits.ec2_running",
+          "NumericGreaterThanEquals": 15,
+          "Next": "SetEC2RunningTimeoutFailure"
+        }
+      ],
+      "Default": "WaitForEC2Running"
+    },
+    "WaitForSSMReady": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckSSMManagedInstance"
+    },
+    "CheckSSMManagedInstance": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Parameters": {
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values": [
+              "i-06c075528d0039c3a"
+            ]
+          }
+        ]
+      },
+      "ResultPath": "$.ssm_instance_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetSSMDescribeFailure"
+        }
+      ],
+      "Next": "IsSSMReady"
+    },
+    "IsSSMReady": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ssm_instance_result.InstanceInformationList[0].PingStatus",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ssm_instance_result.InstanceInformationList[0].PingStatus",
+              "StringEquals": "Online"
+            }
+          ],
+          "Next": "SendLauncherCommand"
+        }
+      ],
+      "Default": "IncrementSSMReadyWait"
+    },
+    "IncrementSSMReadyWait": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "waits": {
+          "ec2_running.$": "$.waits.ec2_running",
+          "ssm_ready.$": "States.MathAdd($.waits.ssm_ready, 1)",
+          "launcher.$": "$.waits.launcher"
+        }
+      },
+      "Next": "CheckSSMReadyWaitLimit"
+    },
+    "CheckSSMReadyWaitLimit": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.waits.ssm_ready",
+          "NumericGreaterThanEquals": 30,
+          "Next": "SetSSMReadyTimeoutFailure"
+        }
+      ],
+      "Default": "WaitForSSMReady"
+    },
+    "SendLauncherCommand": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "InstanceIds": [
+          "i-06c075528d0039c3a"
+        ],
+        "DocumentName": "AWS-RunShellScript",
+        "Comment": "Launch SES matching pipeline managed systemd unit",
+        "Parameters": {
+          "commands.$": "States.Array(States.Format('/usr/bin/env RUN_ID={} RUN_DATE={} /usr/bin/bash /home/ec2-user/pipeline_ses_steps/00_pipeline/00_tool/launch_full_pipeline_async.sh', $.run_id, $.run_date))",
+          "executionTimeout": [
+            "300"
+          ]
+        },
+        "CloudWatchOutputConfig": {
+          "CloudWatchLogGroupName": "/aws/ssm/auto-match-llm-classifier-pipeline",
+          "CloudWatchOutputEnabled": true
+        }
+      },
+      "ResultPath": "$.send_command_result",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetSendLauncherFailure"
+        }
+      ],
+      "Next": "WaitForLauncherCommand"
+    },
+    "WaitForLauncherCommand": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "GetLauncherCommandInvocation"
+    },
+    "GetLauncherCommandInvocation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.send_command_result.Command.CommandId",
+        "InstanceId": "i-06c075528d0039c3a"
+      },
+      "ResultPath": "$.command_invocation_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExist",
+            "Ssm.InvocationDoesNotExistException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExist",
+            "Ssm.InvocationDoesNotExistException"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "IncrementLauncherWait"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetGetLauncherFailure"
+        }
+      ],
+      "Next": "CheckLauncherCommandStatus"
+    },
+    "CheckLauncherCommandStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.command_invocation_result.Status",
+          "StringEquals": "Success",
+          "Next": "InitializeStatusPolling"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "Cancelled"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "TimedOut"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "ExecutionTimedOut"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "DeliveryTimedOut"
+            }
+          ],
+          "Next": "SetLauncherStatusFailure"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "Pending"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "InProgress"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "Delayed"
+            },
+            {
+              "Variable": "$.command_invocation_result.Status",
+              "StringEquals": "Cancelling"
+            }
+          ],
+          "Next": "IncrementLauncherWait"
+        }
+      ],
+      "Default": "SetUnknownLauncherStatusFailure"
+    },
+    "IncrementLauncherWait": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "send_command_result.$": "$.send_command_result",
+        "waits": {
+          "ec2_running.$": "$.waits.ec2_running",
+          "ssm_ready.$": "$.waits.ssm_ready",
+          "launcher.$": "States.MathAdd($.waits.launcher, 1)"
+        }
+      },
+      "Next": "CheckLauncherWaitLimit"
+    },
+    "CheckLauncherWaitLimit": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.waits.launcher",
+          "NumericGreaterThanEquals": 30,
+          "Next": "SetLauncherTimeoutFailure"
+        }
+      ],
+      "Default": "WaitForLauncherCommand"
+    },
+    "InitializeStatusPolling": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "launcher_command_id.$": "$.send_command_result.Command.CommandId",
+        "poll": {
+          "status_key.$": "States.Format('pipeline_ses_steps/pipeline-status/{}/{}/status.json', $.run_date, $.run_id)",
+          "missing_waits": 0,
+          "running_waits": 0
+        }
+      },
+      "Next": "ListPipelineStatusObject"
+    },
+    "ListPipelineStatusObject": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+      "Parameters": {
+        "Bucket": "technoverse",
+        "Prefix.$": "$.poll.status_key",
+        "MaxKeys": 1
+      },
+      "ResultPath": "$.poll.list_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetS3ListFailure"
+        }
+      ],
+      "Next": "IsPipelineStatusObjectPresent"
+    },
+    "IsPipelineStatusObjectPresent": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll.list_result.KeyCount",
+          "NumericEquals": 0,
+          "Next": "CheckMissingStatusWaitLimit"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.poll.list_result.Contents[0].Key",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.poll.list_result.Contents[0].Key",
+              "StringEqualsPath": "$.poll.status_key"
+            }
+          ],
+          "Next": "GetPipelineStatus"
+        }
+      ],
+      "Default": "SetUnexpectedS3ListFailure"
+    },
+    "CheckMissingStatusWaitLimit": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll.missing_waits",
+          "NumericGreaterThanEquals": 20,
+          "Next": "SetStatusMissingTimeoutFailure"
+        }
+      ],
+      "Default": "WaitForStatusObject"
+    },
+    "WaitForStatusObject": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "IncrementMissingStatusWait"
+    },
+    "IncrementMissingStatusWait": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "launcher_command_id.$": "$.launcher_command_id",
+        "poll": {
+          "status_key.$": "$.poll.status_key",
+          "missing_waits.$": "States.MathAdd($.poll.missing_waits, 1)",
+          "running_waits.$": "$.poll.running_waits"
+        }
+      },
+      "Next": "ListPipelineStatusObject"
+    },
+    "GetPipelineStatus": {
+      "Type": "Task",
+      "QueryLanguage": "JSONata",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Arguments": {
+        "Bucket": "technoverse",
+        "Key": "{% $states.input.poll.status_key %}"
+      },
+      "Output": "{% $merge([$states.input, {'poll': $merge([$states.input.poll, {'status_document': $parse($states.result.Body)}])}]) %}",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "S3.NoSuchKeyException",
+            "S3.NoSuchKey"
+          ],
+          "Output": "{% $states.input %}",
+          "Next": "CheckMissingStatusWaitLimit"
+        },
+        {
+          "ErrorEquals": [
+            "States.QueryEvaluationError"
+          ],
+          "Output": "{% $states.input %}",
+          "Next": "SetJsonInvalidFailure"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Output": "{% $states.input %}",
+          "Next": "SetS3GetFailure"
+        }
+      ],
+      "Next": "ValidateStatusEnvelope"
+    },
+    "ValidateStatusEnvelope": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.schema_version",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.schema_version",
+              "StringEquals": "1.0"
+            },
+            {
+              "Variable": "$.poll.status_document.run_id",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.run_date",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.status",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.started_at",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.finished_at",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.poll.status_document.finished_at_source",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code_source",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.current_step",
+              "IsString": true
+            },
+            {
+              "Not": {
+                "Variable": "$.poll.status_document.current_step",
+                "StringEquals": ""
+              }
+            },
+            {
+              "Variable": "$.poll.status_document.error_message",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.log_s3_uri",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.updated_at",
+              "IsString": true
+            }
+          ],
+          "Next": "CheckStatusIdentity"
+        }
+      ],
+      "Default": "SetMalformedStatusFailure"
+    },
+    "CheckStatusIdentity": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.run_id",
+              "StringEqualsPath": "$.run_id"
+            },
+            {
+              "Variable": "$.poll.status_document.run_date",
+              "StringEqualsPath": "$.run_date"
+            }
+          ],
+          "Next": "CheckPipelineStatus"
+        }
+      ],
+      "Default": "SetStatusIdentityMismatchFailure"
+    },
+    "CheckPipelineStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll.status_document.status",
+          "StringEquals": "RUNNING",
+          "Next": "ValidateRunningDocument"
+        },
+        {
+          "Variable": "$.poll.status_document.status",
+          "StringEquals": "SUCCEEDED",
+          "Next": "ValidateSucceededDocument"
+        },
+        {
+          "Variable": "$.poll.status_document.status",
+          "StringEquals": "FAILED",
+          "Next": "ValidateFailedDocument"
+        }
+      ],
+      "Default": "SetUnknownStatusFailure"
+    },
+    "ValidateRunningDocument": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.finished_at",
+              "IsNull": true
+            },
+            {
+              "Variable": "$.poll.status_document.finished_at_source",
+              "StringEquals": "not_finished"
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "IsNull": true
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code_source",
+              "StringEquals": "pending"
+            }
+          ],
+          "Next": "CheckRunningWaitLimit"
+        }
+      ],
+      "Default": "SetMalformedStatusFailure"
+    },
+    "CheckRunningWaitLimit": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll.running_waits",
+          "NumericGreaterThanEquals": 216,
+          "Next": "SetRunningTimeoutFailure"
+        }
+      ],
+      "Default": "WaitForPipelineStatus"
+    },
+    "WaitForPipelineStatus": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "IncrementRunningWait"
+    },
+    "IncrementRunningWait": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "run_date.$": "$.run_date",
+        "launcher_command_id.$": "$.launcher_command_id",
+        "poll": {
+          "status_key.$": "$.poll.status_key",
+          "missing_waits.$": "$.poll.missing_waits",
+          "running_waits.$": "States.MathAdd($.poll.running_waits, 1)"
+        }
+      },
+      "Next": "ListPipelineStatusObject"
+    },
+    "ValidateSucceededDocument": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.finished_at",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.finished_at_source",
+              "StringEquals": "managed_wrapper"
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "IsNumeric": true
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "NumericEquals": 0
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code_source",
+              "StringEquals": "managed_wrapper"
+            },
+            {
+              "Variable": "$.poll.status_document.error_message",
+              "StringEquals": ""
+            }
+          ],
+          "Next": "StopEC2AfterSuccess"
+        }
+      ],
+      "Default": "SetMalformedStatusFailure"
+    },
+    "ValidateFailedDocument": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.finished_at",
+              "IsString": true
+            },
+            {
+              "Variable": "$.poll.status_document.finished_at_source",
+              "StringEquals": "managed_wrapper"
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "IsNumeric": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.poll.status_document.exit_code",
+                  "NumericGreaterThan": 0
+                },
+                {
+                  "Variable": "$.poll.status_document.exit_code",
+                  "NumericLessThan": 0
+                }
+              ]
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code_source",
+              "StringEquals": "managed_wrapper"
+            },
+            {
+              "Not": {
+                "Variable": "$.poll.status_document.error_message",
+                "StringEquals": ""
+              }
+            }
+          ],
+          "Next": "IsAlreadyRunningFailure"
+        }
+      ],
+      "Default": "SetMalformedStatusFailure"
+    },
+    "IsAlreadyRunningFailure": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.poll.status_document.current_step",
+              "StringEquals": "ALREADY_RUNNING"
+            },
+            {
+              "Variable": "$.poll.status_document.exit_code",
+              "NumericEquals": 75
+            }
+          ],
+          "Next": "SetAlreadyRunningFailure"
+        }
+      ],
+      "Default": "SetPipelineFailed"
+    },
+    "SetStartEC2Failure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "START_EC2_FAILED",
+        "message": "StartInstances API failed; ownership of the instance is uncertain, so no stop is attempted."
+      },
+      "ResultPath": "$.failure",
+      "Next": "PublishFailureNotification"
+    },
+    "SetDescribeEC2Failure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "DESCRIBE_EC2_FAILED",
+        "message": "DescribeInstances failed after StartInstances was accepted."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetEC2RunningTimeoutFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "EC2_RUNNING_TIMEOUT",
+        "message": "EC2 did not reach running state within 15 minutes."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetSSMDescribeFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "SSM_DESCRIBE_FAILED",
+        "message": "DescribeInstanceInformation failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetSSMReadyTimeoutFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "SSM_READY_TIMEOUT",
+        "message": "SSM managed instance did not become Online within 15 minutes."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetSendLauncherFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "SEND_LAUNCHER_FAILED",
+        "message": "SSM SendCommand for the asynchronous launcher failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetGetLauncherFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "GET_LAUNCHER_STATUS_FAILED",
+        "message": "SSM GetCommandInvocation for the launcher failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetLauncherStatusFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "code": "LAUNCHER_COMMAND_FAILED",
+        "message.$": "States.Format('Launcher SSM command ended with status {}.', $.command_invocation_result.Status)"
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetUnknownLauncherStatusFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "UNKNOWN_LAUNCHER_STATUS",
+        "message": "Launcher SSM command returned an unknown status."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetLauncherTimeoutFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "LAUNCHER_TIMEOUT",
+        "message": "Launcher SSM command did not complete within 5 minutes."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetS3ListFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "S3_LIST_FAILED",
+        "message": "ListObjectsV2 for pipeline status failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetUnexpectedS3ListFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "S3_LIST_UNEXPECTED",
+        "message": "ListObjectsV2 did not return zero keys or the exact status key."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetS3GetFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "S3_GET_FAILED",
+        "message": "GetObject for pipeline status failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetJsonInvalidFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "STATUS_JSON_INVALID",
+        "message": "S3 status object Body is not valid JSON."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetMalformedStatusFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "STATUS_MALFORMED",
+        "message": "S3 status document violates schema_version 1.0 or status-specific invariants."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetStatusIdentityMismatchFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "STATUS_IDENTITY_MISMATCH",
+        "message": "S3 status run_id or run_date does not match this execution."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetUnknownStatusFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "code": "STATUS_UNKNOWN",
+        "message.$": "States.Format('Unknown pipeline status: {}.', $.poll.status_document.status)"
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetStatusMissingTimeoutFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "STATUS_NOT_CREATED_TIMEOUT",
+        "message": "Pipeline status object was not created within 10 minutes after launcher success."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetRunningTimeoutFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "PIPELINE_RUNNING_TIMEOUT",
+        "message": "Pipeline remained RUNNING for 18 hours."
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetPipelineFailed": {
+      "Type": "Pass",
+      "Parameters": {
+        "code": "PIPELINE_FAILED",
+        "message.$": "States.Format('Pipeline failed at {} with exit_code {}: {}', $.poll.status_document.current_step, $.poll.status_document.exit_code, $.poll.status_document.error_message)"
+      },
+      "ResultPath": "$.failure",
+      "Next": "StopEC2AfterFailure"
+    },
+    "SetAlreadyRunningFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "code": "ALREADY_RUNNING",
+        "message.$": "States.Format('Another pipeline is active: {}', $.poll.status_document.error_message)"
+      },
+      "ResultPath": "$.failure",
+      "Next": "PublishAlreadyRunningNotification"
+    },
+    "SetStopAfterSuccessFailure": {
+      "Type": "Pass",
+      "Result": {
+        "code": "STOP_AFTER_SUCCESS_FAILED",
+        "message": "Pipeline succeeded, but StopInstances failed."
+      },
+      "ResultPath": "$.failure",
+      "Next": "PublishFailureNotification"
+    },
+    "SetStopAfterFailureFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "code": "STOP_AFTER_FAILURE_FAILED",
+        "message.$": "States.Format('StopInstances failed while handling failure {}.', $.failure.code)"
+      },
+      "ResultPath": "$.failure",
+      "Next": "PublishFailureNotification"
+    },
+    "StopEC2AfterSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds": [
+          "i-06c075528d0039c3a"
+        ]
+      },
+      "ResultPath": "$.stop_ec2_result",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetStopAfterSuccessFailure"
+        }
+      ],
+      "Next": "SucceedExecution"
+    },
+    "StopEC2AfterFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds": [
+          "i-06c075528d0039c3a"
+        ]
+      },
+      "ResultPath": "$.stop_ec2_result",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.caught_error",
+          "Next": "SetStopAfterFailureFailure"
+        }
+      ],
+      "Next": "PublishFailureNotification"
+    },
+    "PublishFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ap-northeast-1:166714029268:sns-ses-match-perf-alert",
+        "Subject": "SES matching pipeline orchestration failed",
+        "Message.$": "States.Format('code={} message={} run_id={} run_date={}', $.failure.code, $.failure.message, $.run_id, $.run_date)"
+      },
+      "ResultPath": "$.failure_notification_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.notification_error",
+          "Next": "FailExecution"
+        }
+      ],
+      "Next": "FailExecution"
+    },
+    "PublishAlreadyRunningNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:ap-northeast-1:166714029268:sns-ses-match-perf-alert",
+        "Subject": "SES matching pipeline skipped: already running",
+        "Message.$": "States.Format('code=ALREADY_RUNNING message={} run_id={} run_date={}. EC2 was not stopped.', $.failure.message, $.run_id, $.run_date)"
+      },
+      "ResultPath": "$.failure_notification_result",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.notification_error",
+          "Next": "FailAlreadyRunning"
+        }
+      ],
+      "Next": "FailAlreadyRunning"
+    },
+    "SucceedExecution": {
+      "Type": "Succeed"
+    },
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "PipelineOrchestrationFailed",
+      "Cause": "Failure context is recorded in execution history; EC2 stop was attempted when safe."
+    },
+    "FailAlreadyRunning": {
+      "Type": "Fail",
+      "Error": "PipelineAlreadyRunning",
+      "Cause": "Another RUN_ID owns the pipeline lock. EC2 was intentionally not stopped."
+    }
+  }
+}
