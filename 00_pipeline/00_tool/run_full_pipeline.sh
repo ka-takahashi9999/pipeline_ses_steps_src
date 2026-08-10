@@ -50,9 +50,11 @@ run_step() {
 log "########## pipeline start ##########"
 log "RUN_DATE=$RUN_DATE"
 
-run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after 2026/04/14 --before 2026/04/17 --max 3000
-# 当日分のメールを自動取得（20時定時実行想定: after=当日 before=翌日 で当日送信分3000件を取得）
-#run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after "$(date '+%Y/%m/%d')" --before "$(date -d '+1 day' '+%Y/%m/%d')" --max 3000
+# RUN_DATEを処理対象データ日とし、当日から翌日までのメールを取得する。
+RUN_DATE_ISO="$(date -d "$RUN_DATE" "+%Y-%m-%d")"
+FETCH_AFTER="$(date -d "$RUN_DATE_ISO" "+%Y/%m/%d")"
+FETCH_BEFORE="$(date -d "$RUN_DATE_ISO +1 day" "+%Y/%m/%d")"
+run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after "$FETCH_AFTER" --before "$FETCH_BEFORE" --max 3000
 
 run_step "01-2_remove_duplicate_emails" "$ROOT/01-2_remove_duplicate_emails/00_tool/remove_duplicate_emails.py"
 
