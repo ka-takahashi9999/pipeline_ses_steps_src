@@ -218,6 +218,7 @@ _PROJECT_CONTEXT_RE = [re.compile(p) for p in _PROJECT_CONTEXT_PATTERNS]
 
 # subject の強力な判別パターン（本文が薄い場合も有効）
 _SUBJ_RESOURCE_RE = [re.compile(p) for p in [
+    r"直人材",
     r"直フリーランス",
     r"直個人",
     r"プロパー",
