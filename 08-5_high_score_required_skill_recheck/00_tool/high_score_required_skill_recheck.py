@@ -106,6 +106,21 @@ SYSTEM_PROMPT = """あなたはIT人材評価の専門家です。
 - 各必須スキルの判定では、案件が求める文脈（例: ミドルウェアとしての構築経験）と要員の使用文脈（例: DB操作のみ）の違いを考慮する
 - reason に文脈の違いがあれば明記すること（例:「OracleのDB操作経験はあるが、ミドルウェアとしての構築経験の根拠なし」）
 
+【年数・期間の読み取り】
+- スキルシートに「2024年～2025年 Java詳細設計」「2023年～2024年 Java詳細設計」のような期間付き経歴が複数行ある場合、該当技術・工程の経験期間として合算または累積的に評価すること
+- 「YYYY年～YYYY年」「YYYY/MM～YYYY/MM」「YYYY年MM月～YYYY年MM月」「nヶ月」「n年」などの期間表記は経験年数の根拠として扱うこと
+- 同一技術・同一工程、または明らかに同系統の技術・工程が複数案件に出ている場合は、年数条件の根拠として評価すること
+- 年数が明確に算出でき、要件年数以上であれば confirmed とする
+- 期間表記はあるが、対象技術・工程との対応が曖昧な場合のみ human_review とし、reason に「年数は読み取れるが対象技術との対応が不明確」など確認点を書くこと
+- 期間表記がなく、年数条件を満たす根拠がない場合は human_review または not_confirmed とする
+
+【OR条件・例示条件】
+- 「AまたはB」「A / B」「A、B、Cなど」「いずれか」は原則ORまたは例示として扱う
+- OR条件のうち1つでも明確な根拠があれば confirmed とする
+- 例: 「Kotlin / Java」に対して「Android(Java)開発経験」があれば confirmed
+- 例: 「AWS、Azure、OCIなどへのクラウドリフト」に対して「オンプレからAWS移行」があれば confirmed
+- 未経験側の技術があることだけを理由に human_review にしない
+
 【出力ルール】
 - JSONのみ返すこと。説明文・```マーク不要
 - required_skill_checks の件数は入力 required_skills と同数にする
@@ -318,6 +333,37 @@ def _apply_auto_true_override(checks: List[Dict[str, Any]]) -> int:
     return count
 
 
+def _is_or_or_example_skill(skill: str) -> bool:
+    return any(marker in skill for marker in ("または", "又は", "/", "／", "いずれか", "など", "等"))
+
+
+def _apply_or_example_override(checks: List[Dict[str, Any]]) -> int:
+    """OR/例示条件で根拠がある human_review を confirmed に寄せる。
+
+    LLMが「AWSはあるがOCI不明」「JavaはあるがKotlin不明」のように、
+    OR/例示条件の未経験側だけを理由に human_review としたケースを補正する。
+    """
+    count = 0
+    uncertainty_markers = ("不明", "不明確", "明確でない", "不足", "記載なし", "確認")
+    for check in checks:
+        if check.get("confidence") != "human_review":
+            continue
+        skill = str(check.get("skill") or "")
+        evidence = str(check.get("evidence") or "").strip()
+        reason = str(check.get("reason") or "")
+        if not evidence:
+            continue
+        if not _is_or_or_example_skill(skill):
+            continue
+        if not any(marker in reason for marker in uncertainty_markers):
+            continue
+        check["confidence"] = "confirmed"
+        check["recheck_match"] = True
+        check["reason"] = f"{reason} / OR・例示条件の一部に根拠があるためconfirmed補正"
+        count += 1
+    return count
+
+
 def _decide_recheck_status(checks: List[Dict[str, Any]]) -> str:
     confidences = [check.get("confidence") for check in checks]
     if any(conf == "not_confirmed" for conf in confidences):
@@ -341,6 +387,7 @@ def _add_recheck_result(
     # LLM正常応答かつschema検証済みの経路に限り confidence=confirmed 固定へ上書きする。
     if apply_auto_true_override:
         _apply_auto_true_override(checks)
+        _apply_or_example_override(checks)
     status = _decide_recheck_status(checks)
     result["source_score_band"] = source_score_band
     result["recheck_info"] = {
