@@ -25,6 +25,7 @@ import sys
 import re
 import json
 import base64
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -111,6 +112,31 @@ TITLE_ONLY_TEXTS = {
     "職務経歴書",
 }
 
+LIST_SHEET_MARKERS = (
+    "=== シート: 案件一覧リスト ===",
+    "=== シート: 注力人材 ===",
+    "=== シート: サマリ ===",
+    "=== シート: 開発希望若手 ===",
+)
+
+URL_CONTEXT_POSITIVE_KEYWORDS = (
+    "スキルシート",
+    "職務経歴書",
+    "経歴書",
+    "Skill Sheet",
+    "skillsheet",
+)
+
+URL_CONTEXT_NEGATIVE_KEYWORDS = (
+    "要員リスト",
+    "人材リスト",
+    "一覧",
+    "案件一覧",
+    "配信停止",
+    "会社HP",
+    "URL :",
+)
+
 # HTTP ダウンロード共通ヘッダー
 HTTP_HEADERS = {
     "User-Agent": (
@@ -122,7 +148,20 @@ HTTP_HEADERS = {
 # タイムアウト設定
 TIMEOUT_GDRIVE = 30   # Google Drive はやや大きめ
 TIMEOUT_OTHER = 10    # その他 URL は短め
+EXTRACT_TIMEOUT_SECONDS = 30
 MIN_TEXT_LENGTH = 30
+
+EXCEL_NOISE_CELL_TEXTS = {
+    "FALSE",
+    "TRUE",
+    "#REF!",
+    "#VALUE!",
+    "#DIV/0!",
+    "#N/A",
+    "#NAME?",
+    "#NULL!",
+    "#NUM!",
+}
 
 
 @dataclass
@@ -142,6 +181,28 @@ def _base64url_encode(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class ExtractTimeoutError(TimeoutError):
+    """ファイル抽出処理が規定秒数を超過した場合の例外。"""
+
+
+def _extract_timeout_handler(signum: int, frame: Any) -> None:
+    raise ExtractTimeoutError(f"抽出タイムアウト({EXTRACT_TIMEOUT_SECONDS}秒)")
+
+
+def extract_text_from_bytes_with_timeout(data: bytes, filename: str = "") -> str:
+    """抽出処理全体を SIGALRM でタイムアウト制御する。"""
+    old_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _extract_timeout_handler)
+    signal.alarm(EXTRACT_TIMEOUT_SECONDS)
+    try:
+        return extract_text_from_bytes(data, filename)
+    except ExtractTimeoutError as e:
+        raise ExtractTimeoutError(f"{e}: filename={filename}") from e
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 def extract_text_from_pdf(data: bytes) -> str:
     """PDFバイナリからテキストを抽出する。"""
     import pdfplumber
@@ -153,6 +214,21 @@ def extract_text_from_pdf(data: bytes) -> str:
             if t:
                 texts.append(t)
     return "\n".join(texts)
+
+
+def _normalize_excel_cell_text(value: Any) -> Optional[str]:
+    """Excelセル値を抽出対象テキストへ正規化する。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.upper() in EXCEL_NOISE_CELL_TEXTS:
+        return None
+    return text
 
 
 def extract_text_from_excel(data: bytes, filename: str = "") -> str:
@@ -169,11 +245,11 @@ def extract_text_from_excel(data: bytes, filename: str = "") -> str:
             sheet = wb.sheet_by_name(sname)
             rows.append(f"=== シート: {sname} ===")
             for ri in range(sheet.nrows):
-                cells = [
-                    str(sheet.cell(ri, ci).value).strip()
-                    for ci in range(sheet.ncols)
-                    if sheet.cell(ri, ci).value
-                ]
+                cells = []
+                for ci in range(sheet.ncols):
+                    cell_text = _normalize_excel_cell_text(sheet.cell(ri, ci).value)
+                    if cell_text is not None:
+                        cells.append(cell_text)
                 if cells:
                     rows.append(" | ".join(cells))
         return "\n".join(rows)
@@ -181,13 +257,17 @@ def extract_text_from_excel(data: bytes, filename: str = "") -> str:
     # .xlsx (ZIP形式)
     import openpyxl
 
-    wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
+    wb = openpyxl.load_workbook(BytesIO(data), data_only=True, read_only=True)
     rows = []
     for sname in wb.sheetnames:
         sheet = wb[sname]
         rows.append(f"=== シート: {sname} ===")
         for row in sheet.iter_rows(values_only=True):
-            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            cells = []
+            for cell_value in row:
+                cell_text = _normalize_excel_cell_text(cell_value)
+                if cell_text is not None:
+                    cells.append(cell_text)
             if cells:
                 rows.append(" | ".join(cells))
     return "\n".join(rows)
@@ -333,6 +413,8 @@ def extract_text_from_bytes(data: bytes, filename: str = "") -> str:
         # 拡張子不明 → Excel を先に試す
         try:
             return extract_text_from_excel(data, filename)
+        except ExtractTimeoutError:
+            raise
         except Exception:
             return extract_text_from_word(data)
 
@@ -387,7 +469,7 @@ def extract_from_attachment(attachment: Dict[str, Any]) -> str:
     raw_bytes = base64.urlsafe_b64decode(padded)
 
     filename = attachment.get("filename", "")
-    return extract_text_from_bytes(raw_bytes, filename)
+    return extract_text_from_bytes_with_timeout(raw_bytes, filename)
 
 
 # ---------------------------------------------------------------------------
@@ -517,11 +599,41 @@ def classify_url_candidate(url: str) -> str:
     return "direct_adopt_ng"
 
 
-def sort_urls_by_priority(urls: List[str]) -> List[Tuple[str, str]]:
+def _url_context_score(body_text: str, url: str, window_size: int = 100) -> int:
+    """本文上で URL の近くにある語から優先度スコアを返す。"""
+    if not body_text or not url:
+        return 0
+
+    scores: List[int] = []
+    start = 0
+    while True:
+        index = body_text.find(url, start)
+        if index < 0:
+            break
+        window_start = max(0, index - window_size)
+        window_end = min(len(body_text), index + len(url) + window_size)
+        context = body_text[window_start:window_end]
+        context_lower = context.lower()
+
+        score = 0
+        for keyword in URL_CONTEXT_POSITIVE_KEYWORDS:
+            if keyword.lower() in context_lower:
+                score += 10
+        for keyword in URL_CONTEXT_NEGATIVE_KEYWORDS:
+            if keyword.lower() in context_lower:
+                score -= 10
+        scores.append(score)
+        start = index + len(url)
+
+    return max(scores) if scores else 0
+
+
+def sort_urls_by_priority(urls: List[str], body_text: str = "") -> List[Tuple[str, str]]:
     """
     URL リストを (url, category) のタプルリストにして優先順位順に並べ替える。
     優先:
       google_drive > one_drive > ctsu_public_talent > cloudinary_raw > extension_file > conditional > direct_adopt_ng
+    同一種別内では本文上の URL 近傍文脈を優先する。
     """
     priority = {
         "google_drive": 0,
@@ -532,16 +644,71 @@ def sort_urls_by_priority(urls: List[str]) -> List[Tuple[str, str]]:
         "conditional": 5,
         "direct_adopt_ng": 6,
     }
-    tagged = [(u, classify_url_candidate(u)) for u in urls]
-    tagged.sort(key=lambda x: priority[x[1]])
+    tagged = [
+        (u, classify_url_candidate(u), _url_context_score(body_text, u), i)
+        for i, u in enumerate(urls)
+    ]
+    tagged.sort(key=lambda x: (priority[x[1]], -x[2], x[3]))
     # 重複 URL を除去（同じ URL が複数あっても1回だけ試す）
     seen: Set[str] = set()
     deduped = []
-    for u, s in tagged:
+    for u, s, _score, _index in tagged:
         if u not in seen:
             seen.add(u)
             deduped.append((u, s))
     return deduped
+
+
+def is_skillsheet_link_text(text: str) -> bool:
+    """HTMLリンク表示テキストがスキルシート系かを判定する。"""
+    normalized = (text or "").lower()
+    return any(keyword.lower() in normalized for keyword in URL_CONTEXT_POSITIVE_KEYWORDS)
+
+
+def extract_skillsheet_urls_from_html_links(
+    mail_record: Optional[Dict[str, Any]],
+) -> List[str]:
+    """mail_master.html_links からスキルシート系リンクの href を出現順に抽出する。"""
+    html_links = (mail_record or {}).get("html_links") or []
+    urls: List[str] = []
+    for link in html_links:
+        if not isinstance(link, dict):
+            continue
+        href = (link.get("href") or "").strip()
+        if not href:
+            continue
+        if is_skillsheet_link_text(link.get("text", "") or ""):
+            urls.append(href)
+    return urls
+
+
+def build_url_candidates(
+    mail_record: Optional[Dict[str, Any]],
+    cleanup_record: Optional[Dict[str, Any]],
+) -> Tuple[List[Tuple[str, str]], List[str], List[str]]:
+    """
+    URL候補を構築する。
+    HTMLリンク由来のスキルシート系 href を本文URLより優先し、同じURLは1回だけ試す。
+    """
+    body_text = (cleanup_record or {}).get("body_text", "") or ""
+    html_urls = extract_skillsheet_urls_from_html_links(mail_record)
+    body_urls = extract_urls_from_text(body_text)
+
+    ordered: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for url in html_urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        ordered.append((url, classify_url_candidate(url)))
+
+    for url, category in sort_urls_by_priority(body_urls, body_text):
+        if url in seen:
+            continue
+        seen.add(url)
+        ordered.append((url, category))
+
+    return ordered, html_urls, body_urls
 
 
 def is_probable_file_url(url: str) -> bool:
@@ -608,6 +775,12 @@ def validate_skillsheet_text(text: str) -> Optional[str]:
     if any(marker in lowered for marker in ("<!doctype html", "<html", "<head", "<body")):
         return "HTML本文のため不採用"
 
+    if any(marker in stripped for marker in LIST_SHEET_MARKERS):
+        return "一覧シート本文のため不採用"
+
+    if text.count("(cid:") >= 20:
+        return "cid文字化け混入のため不採用"
+
     compact = re.sub(r"\s+", "", stripped)
     if len(compact) < MIN_TEXT_LENGTH:
         return f"テキストが短すぎるため不採用({len(compact)}文字)"
@@ -637,7 +810,10 @@ def validate_skillsheet_text(text: str) -> Optional[str]:
 def classify_attachment_failure(filename: str, error: Exception) -> str:
     """添付ファイル失敗理由を対象区分つきで整形する。"""
     message = str(error).strip() or "unknown attachment error"
-    if (
+    if isinstance(error, ExtractTimeoutError) or "抽出タイムアウト" in message:
+        scope = "要確認"
+        kind = "extract_timeout"
+    elif (
         "could not read strings" in message.lower()
         or "サポートされていないファイル形式" in message
         or "旧Word(.doc)抽出未対応" in message
@@ -645,6 +821,12 @@ def classify_attachment_failure(filename: str, error: Exception) -> str:
     ):
         scope = "対象外"
         kind = "extract_unsupported_file"
+    elif (
+        "一覧シート本文のため不採用" in message
+        or "cid文字化け混入のため不採用" in message
+    ):
+        scope = "対象外"
+        kind = "extract_quality_ng"
     else:
         scope = "要確認"
         kind = "attachment_fetch_failed"
@@ -657,7 +839,10 @@ def classify_url_failure(category: str, url: str, error: Exception) -> str:
     host = urlparse(url).netloc.lower()
     lower = message.lower()
 
-    if host_matches(host, "d.bmb.jp") or host_matches(host, "a.bme.jp"):
+    if isinstance(error, ExtractTimeoutError) or "抽出タイムアウト" in message:
+        scope = "要確認"
+        kind = "extract_timeout"
+    elif host_matches(host, "d.bmb.jp") or host_matches(host, "a.bme.jp"):
         scope = "改善対象"
         kind = "redirect_url_resolution"
     elif category == "one_drive" or host_matches(host, "1drv.ms"):
@@ -680,6 +865,12 @@ def classify_url_failure(category: str, url: str, error: Exception) -> str:
     ):
         scope = "対象外"
         kind = "extract_unsupported_file"
+    elif (
+        "一覧シート本文のため不採用" in message
+        or "cid文字化け混入のため不採用" in message
+    ):
+        scope = "対象外"
+        kind = "extract_quality_ng"
     else:
         scope = "要確認"
         kind = "url_fetch_failed"
@@ -1167,6 +1358,7 @@ def fetch_skillsheet(
                 # 添付がスキルシート対象外（画像等）の場合はスキップ
                 continue
             try:
+                logger.info(f"添付ファイル抽出開始: {filename}", message_id)
                 text = extract_from_attachment(att)
                 quality_error = validate_skillsheet_text(text)
                 if quality_error is None:
@@ -1193,15 +1385,14 @@ def fetch_skillsheet(
             logger.warn(f"添付ファイル取得失敗（URL抽出に進む）: {errors}", message_id)
 
     # --- ② URL からの取得 ---
-    body_text = (cleanup_record or {}).get("body_text", "") or ""
-    urls = extract_urls_from_text(body_text)
-    sorted_urls = sort_urls_by_priority(urls)
+    sorted_urls, html_urls, body_urls = build_url_candidates(mail_record, cleanup_record)
 
     tried_urls: List[str] = []
     for url, category in sorted_urls:
         tried_urls.append(url)
         source = classify_url(url)
         try:
+            logger.info(f"URL取得開始 ({source}/{category}): {url}", message_id)
             if source == "google_drive":
                 download_result = download_google_drive(url)
             elif source == "one_drive":
@@ -1228,7 +1419,8 @@ def fetch_skillsheet(
             else:
                 filename_url = download_result.final_url if is_probable_file_url(download_result.final_url) else url
                 url_filename = urlparse(filename_url).path.rsplit("/", 1)[-1]
-            text = extract_text_from_bytes(download_result.content, url_filename)
+            logger.info(f"URLファイル抽出開始 ({source}/{category}): {url_filename}", message_id)
+            text = extract_text_from_bytes_with_timeout(download_result.content, url_filename)
 
             quality_error = validate_skillsheet_text(text)
             if quality_error is None:
@@ -1267,7 +1459,7 @@ def fetch_skillsheet(
     if failure_reasons:
         result["failure_reason"] = " | ".join(failure_reasons[:10])
     else:
-        if urls:
+        if html_urls or body_urls:
             result["failure_reason"] = "要確認[unknown_failure] URL取得失敗理由が記録されていません"
         else:
             result["failure_reason"] = "対象外[no_actual_file_url] 本文に実URLなし"

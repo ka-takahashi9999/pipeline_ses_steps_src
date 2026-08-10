@@ -17,11 +17,13 @@ Gmail APIで対象メールを取得し、1行1レコードのJSONLとして保�
 
 import argparse
 import base64
+import html
 import json
 import os
 import re
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +97,66 @@ def html_to_text(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+class LinkExtractor(HTMLParser):
+    """HTML内の a タグから表示テキストと href を出現順に抽出する。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: List[Dict[str, str]] = []
+        self._current_href: Optional[str] = None
+        self._current_text_parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = ""
+        for name, value in attrs:
+            if name.lower() == "href":
+                href = value or ""
+                break
+        self._current_href = html.unescape(href).strip()
+        self._current_text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None:
+            self._current_text_parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self._current_href is not None:
+            self._current_text_parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._current_href is not None:
+            self._current_text_parts.append(f"&#{name};")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or self._current_href is None:
+            return
+        if self._current_href:
+            text = html.unescape("".join(self._current_text_parts))
+            text = re.sub(r"\s+", " ", text).strip()
+            self.links.append(
+                {
+                    "text": text,
+                    "href": self._current_href,
+                    "source": "text/html",
+                }
+            )
+        self._current_href = None
+        self._current_text_parts = []
+
+
+def extract_html_links(raw_html: str) -> List[Dict[str, str]]:
+    """HTML本文から a タグのリンク情報だけを抽出する。"""
+    parser = LinkExtractor()
+    try:
+        parser.feed(raw_html)
+        parser.close()
+    except Exception as e:
+        logger.warn(f"HTMLリンク抽出失敗: {e}")
+    return parser.links
+
+
 def extract_headers(payload_headers: List[Dict[str, str]]) -> Dict[str, Any]:
     """メールヘッダーから必要フィールドを抽出する。null禁止のためデフォルト値を設定。"""
     h = {x.get("name", "").lower(): x.get("value", "") for x in (payload_headers or [])}
@@ -117,6 +179,7 @@ def walk_parts(
     part: Dict[str, Any],
     plain_texts: List[str],
     html_texts: List[str],
+    html_links: List[Dict[str, str]],
     attachments: List[Dict[str, Any]],
 ) -> None:
     """MIMEパートを再帰的に走査してテキスト・添付情報を収集する。"""
@@ -143,26 +206,29 @@ def walk_parts(
     elif mime.startswith("text/plain") and data:
         plain_texts.append(b64url_decode(data).decode("utf-8", errors="replace"))
     elif mime.startswith("text/html") and data:
-        html_texts.append(html_to_text(b64url_decode(data).decode("utf-8", errors="replace")))
+        raw_html = b64url_decode(data).decode("utf-8", errors="replace")
+        html_texts.append(html_to_text(raw_html))
+        html_links.extend(extract_html_links(raw_html))
 
     for sub in (part.get("parts") or []):
-        walk_parts(sub, plain_texts, html_texts, attachments)
+        walk_parts(sub, plain_texts, html_texts, html_links, attachments)
 
 
 def extract_body_and_attachments(
     payload: Dict[str, Any],
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, str]]]:
     """
     メールペイロードから本文テキストと添付ファイル情報を抽出する。
     text/plain優先、なければtext/htmlをテキスト化する。
     """
     plain_texts: List[str] = []
     html_texts: List[str] = []
+    html_links: List[Dict[str, str]] = []
     attachments: List[Dict[str, Any]] = []
 
     if payload.get("parts"):
         for part in payload["parts"]:
-            walk_parts(part, plain_texts, html_texts, attachments)
+            walk_parts(part, plain_texts, html_texts, html_links, attachments)
     else:
         body = payload.get("body") or {}
         data = body.get("data")
@@ -170,7 +236,9 @@ def extract_body_and_attachments(
         if mime.startswith("text/plain") and data:
             plain_texts.append(b64url_decode(data).decode("utf-8", errors="replace"))
         elif mime.startswith("text/html") and data:
-            html_texts.append(html_to_text(b64url_decode(data).decode("utf-8", errors="replace")))
+            raw_html = b64url_decode(data).decode("utf-8", errors="replace")
+            html_texts.append(html_to_text(raw_html))
+            html_links.extend(extract_html_links(raw_html))
 
     if plain_texts:
         body_text = "\n\n".join(t for t in plain_texts if t).strip()
@@ -178,7 +246,7 @@ def extract_body_and_attachments(
         body_text = "\n\n".join(t for t in html_texts if t).strip()
 
     body_text = re.sub(r"[ \t]+\n", "\n", body_text)
-    return body_text, attachments
+    return body_text, attachments, html_links
 
 
 def download_attachment_data(
@@ -266,7 +334,7 @@ def build_record(
 
     payload = full.get("payload") or {}
     headers = extract_headers(payload.get("headers") or [])
-    body_text, attachments = extract_body_and_attachments(payload)
+    body_text, attachments, html_links = extract_body_and_attachments(payload)
 
     # 添付ファイルデータをダウンロード
     for att in attachments:
@@ -287,6 +355,7 @@ def build_record(
         "date": headers["date"],
         "body_text": body_text,
         "attachments": attachments,
+        "html_links": html_links,
     }
 
 
