@@ -59,7 +59,8 @@ SKILL_BASED_PRICE = 1_000_000
 # ── 正規化 ─────────────────────────────────────────────────
 def _n(s: str) -> str:
     """NFKC正規化（全角→半角、波ダッシュ等を統一）"""
-    return unicodedata.normalize("NFKC", s or "")
+    text = re.sub(r"[①②③④⑤⑥⑦⑧⑨⑩]", " ", s or "")
+    return unicodedata.normalize("NFKC", text)
 
 
 # ── パターン定義（NFKC 正規化済みテキストに適用）─────────────
@@ -70,7 +71,7 @@ _SEP = r"[〜~\-]"
 _PRICE_KW_RE = re.compile(
     r"(単\s*価|単\s*金|月\s*額|人月単価|報\s*酬|金\s*額|フィー|予\s*算|費\s*用"
     r"|【単価】|【単金】|【報酬】|【金額】|【予算】|日給\s*制"
-    r"|単価条件|単金条件|スキル見合)"
+    r"|単価条件|単金条件|スキル見合|給\s*与)"
 )
 
 # スキル見合い系
@@ -322,6 +323,20 @@ def _man_patterns(seg: str) -> Optional[Tuple]:
     """万円パターンで価格を抽出"""
     if _prefer_skill_based(seg):
         return SKILL_BASED_PRICE, None, "skill-based", 0.70, "monthly", "スキル見合い"
+
+    # 先頭側が open-high の場合は、後続の別項番価格と閉区間としてまたがせない
+    open_high_matches = list(RX_OPEN_HIGH.finditer(seg))
+    open_high = open_high_matches[0] if open_high_matches else None
+    closed_matches = [
+        m for m in (RX_MAN_MAN.search(seg), RX_NUM_MAN.search(seg)) if m
+    ]
+    first_closed_start = min((m.start() for m in closed_matches), default=None)
+    if len(open_high_matches) >= 2 and open_high and (
+        first_closed_start is None or open_high.start() < first_closed_start
+    ):
+        v = int(open_high.group(1)) * 10000
+        if _PRICE_MIN <= v <= _PRICE_MAX:
+            return v, {"min": None, "max": v}, "range-open-high", 0.88, "monthly", open_high.group(0)
 
     # 万-万 閉区間
     m = RX_MAN_MAN.search(seg)
