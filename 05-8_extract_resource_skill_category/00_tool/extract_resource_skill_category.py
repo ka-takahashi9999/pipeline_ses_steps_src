@@ -44,6 +44,7 @@ from config import ENABLE_SKILL_CATEGORY
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.skill_canonical_map import SKILL_CANONICAL_MAP
 
 STEP_NAME = "05-8_extract_resource_skill_category"
 logger = get_logger(STEP_NAME)
@@ -57,13 +58,6 @@ INPUT_RESOURCES = str(
 SKILL_DICT_PATH  = str(_STEP_DIR / "00_tool" / "skill_dictionary.txt")
 OUTPUT_EXTRACTED = "extract_resource_skill_category.jsonl"
 OUTPUT_NULL      = "99_skill_category_null_extract_resource_skill_category.jsonl"
-
-SKILL_CANONICAL_MAP = {
-    "Springboot": "Spring Boot",
-    "SpringBoot": "Spring Boot",
-    "NodeJS": "Node.js",
-}
-
 
 # ── 正規化 ─────────────────────────────────────────────────
 def _n(s: str) -> str:

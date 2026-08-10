@@ -298,6 +298,7 @@ DB:
   - ISAM
   - HIRDB
   - SQLServer
+  - SQL-Server
   - "Azure SQL Server"
   - Prisma
   - Redshift

@@ -25,6 +25,7 @@ sys.path.insert(0, str(project_root))
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import merge_match_info, read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.skill_canonical_map import SKILL_ALIAS_MAP
 
 STEP_NAME = "06-11_match_required_skills_list"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -121,17 +122,24 @@ def keyword_matches_in_text(keyword: str, text: str) -> bool:
     return normalized_kw in normalized_text
 
 
-def search_keywords_in_text(keywords: List[str], text: str) -> List[str]:
+def _keyword_aliases(keyword: str, use_aliases: bool) -> List[str]:
+    if not use_aliases:
+        return [keyword]
+    return SKILL_ALIAS_MAP.get(keyword, [keyword])
+
+
+def search_keywords_in_text(keywords: List[str], text: str, use_aliases: bool = True) -> List[str]:
     """
     textにkeywordsのうち含まれるものを返す（1件でもヒットすればよい）。
     NFKC正規化済みテキスト・キーワードで比較。
     英字は小文字化して比較。
+    aliasがヒットした場合も、返す値はrequired keyword側の代表表記にする。
     """
     if not text:
         return []
     matched = []
     for kw in keywords:
-        if keyword_matches_in_text(kw, text):
+        if any(keyword_matches_in_text(alias, text) for alias in _keyword_aliases(kw, use_aliases)):
             matched.append(kw)
     return matched
 
@@ -168,7 +176,11 @@ def judge_match(
             continue
 
         if strong_required_phase_keywords:
-            strong_phase_hits = search_keywords_in_text(strong_required_phase_keywords, text)
+            strong_phase_hits = search_keywords_in_text(
+                strong_required_phase_keywords,
+                text,
+                use_aliases=False,
+            )
             if strong_phase_hits:
                 return True, skill_hits, strong_phase_hits, [source_name]
             if len(skill_hits) > len(best_skill_hits):
@@ -177,7 +189,11 @@ def judge_match(
             continue
 
         if weak_required_phase_keywords:
-            weak_phase_hits = search_keywords_in_text(weak_required_phase_keywords, text)
+            weak_phase_hits = search_keywords_in_text(
+                weak_required_phase_keywords,
+                text,
+                use_aliases=False,
+            )
             return True, skill_hits, weak_phase_hits, [source_name]
 
         return True, skill_hits, [], [source_name]
