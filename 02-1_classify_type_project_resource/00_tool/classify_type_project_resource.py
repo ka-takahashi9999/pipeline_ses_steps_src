@@ -220,7 +220,6 @@ _PROJECT_CONTEXT_RE = [re.compile(p) for p in _PROJECT_CONTEXT_PATTERNS]
 _SUBJ_RESOURCE_RE = [re.compile(p) for p in [
     r"直人材",
     r"直フリーランス",
-    r"直個人",
     r"プロパー",
     r"弊社正社員",
     r"弊社要員",
@@ -252,6 +251,18 @@ _SUBJ_PROJECT_RE = [re.compile(p) for p in [
     r"長期案件",
     r"案件探してます",    # 「案件探してます」「AWS案件探してます」等
     r"案件探しております",
+]]
+
+# 件名内の要員表現は、複数のプロフィール属性と組み合わせた場合のみ強いシグナルにする。
+# 「直個人」は単独では resource 加点せず、「直個人可」等の案件側の許容表現も除外する。
+_STRONG_RESOURCE_PROFILE_SUBJECT_RE = re.compile(
+    r"直個人(?!\s*(?:(?:も|相談|様)\s*)?可)|直人材|直フリーランス|弊社要員|弊社人材|弊社正社員|"
+    r"当社社員|当社プロパー|自社社員"
+)
+_RESOURCE_SUBJECT_PROFILE_RES: List[re.Pattern] = [re.compile(p) for p in [
+    r"\d{2}歳(?!まで|以下|迄)",
+    r"(?:^|[\s/|｜])(?:男性|女性)(?:$|[\s/|｜])",
+    r"[^\s/|｜]{1,20}駅(?:[（(][^)）]+[)）])?",
 ]]
 
 # 「案件」キーワード（コンテキストに応じて重みを調整するため個別管理）
@@ -310,6 +321,15 @@ _CJK_INNER_SPACE_RE = re.compile(
 def _remove_cjk_inner_spaces(s: str) -> str:
     """CJK文字間の半角スペースを除去する（NFKC正規化後に適用）。"""
     return _CJK_INNER_SPACE_RE.sub('', s)
+
+
+def _has_strong_resource_subject_profile(subject: str) -> bool:
+    """件名内の明確な要員シグナルと複数プロフィール属性を確認する。"""
+    norm_subj = _normalize(subject or "")
+    if not _STRONG_RESOURCE_PROFILE_SUBJECT_RE.search(norm_subj):
+        return False
+    profile_hits = sum(1 for pattern in _RESOURCE_SUBJECT_PROFILE_RES if pattern.search(norm_subj))
+    return profile_hits >= 2
 
 
 def score_text(
@@ -467,6 +487,20 @@ def rule_classify(
     # 案件構造ラベル（3種類以上 = project確定）
     # ただし要員紹介シグナルが強い場合は早期確定させず、通常スコア判定に流す。
     proj_struct = sum(1 for p in _PROJECT_STRUCT_LABEL_RES if p.search(body_cjk))
+
+    # 技術経歴が長い要員紹介は案件系キーワードのスコアが過大になりやすい。
+    # 明確な要員件名 + 複数プロフィール属性があり、案件側の明示シグナルが
+    # ない場合は、スコア比較より要員プロフィール構造を優先する。
+    norm_subj = _normalize(subject or "")
+    subj_proj = any(pat.search(norm_subj) for pat in _SUBJ_PROJECT_RE)
+    if (
+        _has_strong_resource_subject_profile(subject)
+        and not subj_proj
+        and proj_ctx == 0.0
+        and proj_struct < 3
+    ):
+        return "resource", 0.95, sorted(set(res_hits))
+
     if proj_struct >= 3 and res_ctx < 3.5:
         return "project", 0.9, []
 
@@ -475,7 +509,6 @@ def rule_classify(
         return _classify_by_subject_only(subject)
 
     # 動的マージン: 強いコンテキストパターンがある場合は閾値を下げる
-    norm_subj = _normalize(subject or "")
     effective_margin = RULE_MARGIN
     margin_reduced = False
 
@@ -485,7 +518,6 @@ def rule_classify(
     strong_res = res_ctx >= 3.5
     strong_proj = proj_ctx >= 3.0
     subj_res = any(pat.search(norm_subj) for pat in _SUBJ_RESOURCE_RE)
-    subj_proj = any(pat.search(norm_subj) for pat in _SUBJ_PROJECT_RE)
 
     if (strong_res or subj_res) and res_score > proj_score:
         effective_margin = max(0.2, RULE_MARGIN * 0.25)

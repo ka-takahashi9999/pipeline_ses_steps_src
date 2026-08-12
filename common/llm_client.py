@@ -31,6 +31,10 @@ _MIN_INTERVAL_SECONDS: float = 0.5  # 最小呼び出し間隔
 _HTTP_ERROR_BODY_MAX_CHARS: int = 1000
 
 
+class LLMOutputTruncatedError(ValueError):
+    """LLM出力がトークン上限で途中終了したことを表す。"""
+
+
 def _get_api_key() -> str:
     """AWS SSM Parameter StoreからOpenAI APIキーを取得する（プロセス内キャッシュあり）。"""
     global _api_key_cache
@@ -122,6 +126,7 @@ def call_llm(
 
     Raises:
         RuntimeError: APIキー取得失敗・全リトライ失敗時
+        LLMOutputTruncatedError: finish_reason=length で出力が途中終了した時
         ValueError: レスポンスJSONのパース失敗時
     """
     api_key = _get_api_key()
@@ -164,11 +169,25 @@ def call_llm(
                 timeout=60,
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
+            choice = resp.json()["choices"][0]
+            content = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "length":
+                content_chars = len(content or "")
+                error_message = (
+                    "LLM output truncated: "
+                    f"finish_reason=length model={model} "
+                    f"max_tokens={max_tokens} content_chars={content_chars}"
+                )
+                _logger.warn(error_message)
+                raise LLMOutputTruncatedError(error_message)
             parsed = json.loads(content)
             _validate_schema_keys(parsed, response_schema)
             _logger.llm(f"API呼び出し成功 (attempt={attempt})")
             return parsed
+        except LLMOutputTruncatedError:
+            # 同じmax_tokensで再試行しても解消しないため即時に呼び出し元へ返す。
+            raise
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             http_error_detail = _format_http_error_detail(e.response)

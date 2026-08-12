@@ -22,7 +22,7 @@ sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_execution_time
 from common.json_utils import append_jsonl, read_jsonl
-from common.llm_client import call_llm
+from common.llm_client import LLMOutputTruncatedError, call_llm
 from common.logger import get_logger
 from common.skill_policy import (
     AUTO_TRUE_NOTE,
@@ -33,6 +33,7 @@ from common.skill_policy import (
 STEP_NAME = "07-1_requirement_skill_ai_matching"
 STEP_DIR = Path(__file__).resolve().parents[2]
 LLM_MODEL = "gpt-4o-mini"
+MAX_PROJECT_SKILLS_PER_PAIR = 40
 
 INPUT_PAIRS = (
     project_root
@@ -244,6 +245,16 @@ def process_pair(
 
     required_skills: List[Dict[str, Any]] = proj_rec.get("required_skills") or []
     optional_skills: List[Dict[str, Any]] = proj_rec.get("optional_skills") or []
+    total_skill_count = len(required_skills) + len(optional_skills)
+    if total_skill_count > MAX_PROJECT_SKILLS_PER_PAIR:
+        return None, _make_error(
+            p_mid,
+            r_mid,
+            "project_skill_count_exceeded",
+            "project skills count exceeded: "
+            f"required={len(required_skills)} optional={len(optional_skills)} "
+            f"total={total_skill_count} limit={MAX_PROJECT_SKILLS_PER_PAIR}",
+        )
 
     # 04-1 join
     ss_rec = skillsheet_map.get(r_mid)
@@ -285,6 +296,8 @@ def process_pair(
             max_tokens=2048,
             max_retries=3,
         )
+    except LLMOutputTruncatedError as e:
+        return None, _make_error(p_mid, r_mid, "llm_output_truncated", str(e)[:300])
     except ValueError as e:
         return None, _make_error(p_mid, r_mid, "llm_parse_error", str(e)[:300])
     except Exception as e:
