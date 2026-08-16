@@ -360,15 +360,13 @@ fi
 
 # ---- push（通常pushのみ / force不可）----
 if [ "$NO_PUSH" -eq 1 ]; then
-  info "--no-push 指定のため push しません"
+  info "--no-push 指定のため push しません（未pushのcommitが残ります）"
   exit 0
 fi
 
-ahead="$(git -C "$DST" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)"
-if [ "$ahead" -eq 0 ]; then
-  info "push対象のcommitはありません"
-  exit 0
-fi
-info "未push commit: ${ahead}件"
+# push は常に実行し、git 自身の終了コードを成功/失敗の正本とする。
+# ahead件数の推定でスキップ判定すると、upstream取得やrev-listの失敗を
+# 「push不要」と誤認して未push commitを黙って残す（fail-open）ため行わない。
+echo "--- git push ---"
 git -C "$DST" push
 info "push 完了"

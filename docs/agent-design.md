@@ -222,6 +222,9 @@ pipeline_ses_steps_src/tools/pipeline_sync_git.sh ← GitHubへpush
   DST側は中間の親ディレクトリがsymlinkでDST外へ抜ける経路を拒否
 - 書き込み前に全対象をvalidationし、1件でも違反があれば何も変更しない
 - `git add` は具体的ファイルのみ（`git add .` / `-A` / ディレクトリ指定はしない）
+- **push判定はfail-closed**: ahead件数を推定してスキップ判定せず、通常実行では常に `git push` を
+  実行し、`git push` の終了コードを成功/失敗の正本とする。
+  upstream取得やrev-listの失敗を「push不要」と誤認して未push commitを残さないため
 - force push機能を持たない
 - `--dry-run` 対応（冪等）
 

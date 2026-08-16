@@ -60,7 +60,13 @@ Git管理リポジトリ `/home/ec2-user/pipeline_ses_steps_src` へ反映する
    → 通常 push
    ```
 
+通常実行では**最後に必ず `git push` を実行する**。差分がなくても push は試行され、
+成功/失敗は `git push` の終了コードがそのまま結果になる
+（upstream未設定などでpushできなければ非ゼロ終了。成功扱いにはしない）。
+そのため push に失敗した場合は、同じコマンドを再実行すれば push だけが再試行される。
+
 `--no-push` は commit で止めたい例外時のみ使う（標準フローでは使わない）。
+この場合は未push commitが残るため、後で必ず通常実行して push すること。
 
 ## 禁止操作
 - `git push --force` / `--force-with-lease`
