@@ -91,11 +91,11 @@ default・`*_source` / 副作用 / 冪等性 / 再実行耐性 / 将来事故 �
 # 対象を確認（dry-run）
 /home/ec2-user/bin/pipeline_sync_git.sh --dry-run AGENTS.md .agents/skills
 
-# 同期 + commit（pushしない）
-/home/ec2-user/bin/pipeline_sync_git.sh --no-push -m "Update skills" AGENTS.md .agents/skills
-
-# 同期 + commit + push
+# 同期 + stage + diff確認 + commit + push（通常はこの1回で完結）
 /home/ec2-user/bin/pipeline_sync_git.sh -m "Update skills" AGENTS.md .agents/skills
+
+# commit で止めたい例外時のみ
+/home/ec2-user/bin/pipeline_sync_git.sh --no-push -m "Update skills" AGENTS.md .agents/skills
 
 # ファイル削除も反映する（指定ディレクトリ配下限定）
 /home/ec2-user/bin/pipeline_sync_git.sh --prune -m "Reorganize skills" .agents/skills
@@ -104,15 +104,19 @@ default・`*_source` / 副作用 / 冪等性 / 再実行耐性 / 将来事故 �
 /home/ec2-user/bin/pipeline_sync_git.sh --self-check
 ```
 
+標準フローは **dry-run → 通常実行の2段階**。通常実行1回で push まで完結する。
+
 スクリプトの配置:
 
-| 役割 | パス |
-|---|---|
-| 正本（Git管理対象） | `pipeline_ses_steps/tools/pipeline_sync_git.sh` |
-| 実行用コピー | `/home/ec2-user/bin/pipeline_sync_git.sh` |
+| 役割 | パス | 備考 |
+|---|---|---|
+| 正本（Git管理対象） | `pipeline_ses_steps/tools/pipeline_sync_git.sh` | 編集用。**実行経路にはしない** |
+| 実行用コピー | `/home/ec2-user/bin/pipeline_sync_git.sh` | 正規実行経路 |
 
 スクリプトを直したいときは**正本を編集** → `cp -p` で実行用へ反映 → `--self-check` で確認 →
 正規経路で `tools` を `_src` へ同期、の順で行う。
+
+正本と実行用コピーが不一致のまま実行すると、**同期もcommitもpushも開始せず異常終了**する。
 
 - 対象パスの明示が必須（全同期はしない）
 - 生成物（`01_result/` `02_confirm/` `99_execution_time/` `*.jsonl` 等）は自動除外

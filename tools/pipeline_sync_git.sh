@@ -2,17 +2,25 @@
 #
 # pipeline_sync_git.sh
 #   pipeline_ses_steps の「明示した対象パスだけ」を pipeline_ses_steps_src へ同期し、
-#   diff確認 → 対象限定add → commit → 通常push まで行う正規経路。
+#   diff確認 → 対象ファイル限定add → commit → 通常push まで行う正規経路。
 #
+#   安全仕様:
 #   - 全同期はしない（対象パスの明示が必須）
+#   - ディレクトリ入力は内部で具体的ファイルへ展開し、以降はすべてファイル単位で処理する
 #   - 生成物は除外する
-#   - `..` / 絶対パス / SRC外への脱出は拒否する
-#   - 同期対象外の想定外Git変更があれば停止する
+#   - `..` / 絶対パス / SRC外・DST外へ抜けるsymlink経路は拒否する
+#   - 同期対象ファイル以外の変更・untrackedが _src に1件でもあれば停止する
+#   - git add は具体的ファイルのみ（`git add .` / `git add -A` / ディレクトリ指定はしない）
+#   - 書き込み前に全対象をvalidationし、1件でも違反があれば何も変更せず停止する
+#   - 正本と実行用コピーの checksum 不一致時は fail-closed（何もせず異常終了）
 #   - force push / reset --hard / clean の機能は持たない
 #
 #   正本   : /home/ec2-user/pipeline_ses_steps/tools/pipeline_sync_git.sh （Git管理対象）
-#   実行用 : /home/ec2-user/bin/pipeline_sync_git.sh （正本のコピー）
-#   両者の一致は `--self-check` で確認する。
+#   実行用 : /home/ec2-user/bin/pipeline_sync_git.sh （正規実行経路 / Codex rulesでallow）
+#
+#   標準フロー（2段階）:
+#     1. pipeline_sync_git.sh --dry-run <対象パス>...
+#     2. pipeline_sync_git.sh -m "message" <対象パス>...   # 同期→stage→diff→commit→push
 #
 # usage:
 #   pipeline_sync_git.sh [--dry-run] [--no-push] [--prune] [-m "message"] <相対パス>...
@@ -41,20 +49,20 @@ INCLUDE_ALWAYS=('.claude/settings.json')
 
 usage() {
   cat <<'EOF'
-usage: pipeline_sync_git.sh [--dry-run] [--no-push] [-m "message"] <相対パス>...
+usage: pipeline_sync_git.sh [--dry-run] [--no-push] [--prune] [-m "message"] <相対パス>...
+       pipeline_sync_git.sh --self-check
 
   <相対パス>  /home/ec2-user/pipeline_ses_steps からの相対パス（ファイル / ディレクトリ）
-  --dry-run   同期・git操作を行わず、対象と除外だけ表示する
-  --no-push   commit まで行い push しない
-  --prune     指定した「ディレクトリ」配下に限り、SRC に存在しないファイルを DST から削除する
-              （ディレクトリ配下限定。それ以外は削除しない）
-  --self-check   正本と実行用コピーの sha256 一致だけを確認して終了する
+              ディレクトリは内部で具体的ファイルへ展開される
+  --dry-run   同期・git操作を行わず、対象 / 除外 / 削除対象だけ表示する
+  --no-push   commit まで行い push しない（標準フローでは使わない）
+  --prune     指定したディレクトリ配下に限り、SRC に存在しないファイルを DST から削除する
+  --self-check  正本と実行用コピーの sha256 一致だけを確認して終了する
   -m, --message  commit message（省略時は自動生成）
 
-例:
-  pipeline_sync_git.sh --dry-run AGENTS.md CLAUDE.md .agents/skills
-  pipeline_sync_git.sh -m "Update agent design" AGENTS.md docs
-  pipeline_sync_git.sh --self-check
+標準フロー:
+  pipeline_sync_git.sh --dry-run AGENTS.md .agents/skills     # 1. 内容確認
+  pipeline_sync_git.sh -m "Update skills" AGENTS.md .agents/skills  # 2. commit+pushまで
 EOF
 }
 
@@ -62,21 +70,30 @@ die() { echo "[ERROR] $*" >&2; exit 1; }
 info() { echo "[INFO] $*"; }
 warn() { echo "[WARN] $*" >&2; }
 
-# 正本と実行用コピーの checksum 照合
+# ---- 正本と実行用コピーの checksum 照合 ----
+# $1: quiet で出力抑制
 self_check() {
-  local a b
-  [ -f "$CANONICAL" ] || { warn "正本が見つかりません: $CANONICAL"; return 2; }
-  [ -f "$INSTALLED" ] || { warn "実行用コピーが見つかりません: $INSTALLED"; return 2; }
+  local quiet="${1:-}" a b
+  if [ ! -f "$CANONICAL" ]; then
+    [ "$quiet" = quiet ] || warn "正本が見つかりません: $CANONICAL"
+    return 2
+  fi
+  if [ ! -f "$INSTALLED" ]; then
+    [ "$quiet" = quiet ] || warn "実行用コピーが見つかりません: $INSTALLED"
+    return 2
+  fi
   a="$(sha256sum "$CANONICAL" | awk '{print $1}')"
   b="$(sha256sum "$INSTALLED" | awk '{print $1}')"
   if [ "$a" = "$b" ]; then
-    info "self-check OK: 正本と実行用コピーは一致 ($a)"
+    [ "$quiet" = quiet ] || info "self-check OK: 正本と実行用コピーは一致 ($a)"
     return 0
   fi
-  warn "self-check NG: 正本と実行用コピーが不一致"
-  warn "  正本   $CANONICAL  $a"
-  warn "  実行用 $INSTALLED  $b"
-  warn "  同期する場合: cp -p $CANONICAL $INSTALLED"
+  if [ "$quiet" != quiet ]; then
+    warn "self-check NG: 正本と実行用コピーが不一致"
+    warn "  正本   $CANONICAL  $a"
+    warn "  実行用 $INSTALLED  $b"
+    warn "  反映する場合: cp -p $CANONICAL $INSTALLED"
+  fi
   return 1
 }
 
@@ -97,8 +114,11 @@ done
 
 [ "${#TARGETS[@]}" -gt 0 ] || { usage; die "対象パスが指定されていません（全同期は行いません）"; }
 
-# 正本と実行用コピーのズレは警告のみ（実行は止めない）
-self_check >/dev/null 2>&1 || warn "正本と実行用コピーが不一致、または一方が欠落しています（--self-check で確認）"
+# ---- checksum は fail-closed（不一致なら何もせず異常終了）----
+if ! self_check quiet; then
+  self_check || true
+  die "正本と実行用コピーの整合が取れないため実行を中止しました（同期 / commit / push は行っていません）"
+fi
 
 [ -d "$SRC" ] || die "SRC が存在しません: $SRC"
 [ -d "$DST/.git" ] || die "DST がGitリポジトリではありません: $DST"
@@ -126,6 +146,23 @@ is_excluded() {
   return 1
 }
 
+# ---- 途中の親ディレクトリがsymlinkでないことを確認 ----
+# $1: base, $2: 相対パス  -> 中間componentにsymlinkがあれば 1
+check_parent_chain() {
+  local base="$1" rel="$2" i n cur
+  cur="$base"
+  local IFS='/'
+  # shellcheck disable=SC2206
+  local parts=($rel)
+  unset IFS
+  n=${#parts[@]}
+  for (( i=0; i<n-1; i++ )); do
+    cur="$cur/${parts[$i]}"
+    [ -L "$cur" ] && return 1
+  done
+  return 0
+}
+
 # ---- 対象パス検証・正規化 ----
 NORM_TARGETS=()
 for t in "${TARGETS[@]}"; do
@@ -151,9 +188,16 @@ for t in "${TARGETS[@]}"; do
   NORM_TARGETS+=("$rel")
 done
 
-# ---- 同期ファイル一覧の作成 ----
+# ---- ディレクトリを具体的ファイルへ展開（以降はすべてファイル単位）----
+declare -A FILE_SET=()
 FILES=()
 SKIPPED=()
+add_file() {
+  local rel="$1"
+  [ -n "${FILE_SET[$rel]:-}" ] && return 0
+  FILE_SET["$rel"]=1
+  FILES+=("$rel")
+}
 for rel in "${NORM_TARGETS[@]}"; do
   if [ -d "$SRC/$rel" ] && [ ! -L "$SRC/$rel" ]; then
     while IFS= read -r f; do
@@ -161,29 +205,68 @@ for rel in "${NORM_TARGETS[@]}"; do
       if is_excluded "$sub"; then
         SKIPPED+=("$sub")
       else
-        FILES+=("$sub")
+        add_file "$sub"
       fi
     done < <(find "$SRC/$rel" \( -type f -o -type l \) | sort)
   else
-    FILES+=("$rel")
+    add_file "$rel"
   fi
 done
 
 [ "${#FILES[@]}" -gt 0 ] || die "同期対象ファイルが0件です"
 
-# ---- prune 対象（ディレクトリ指定分のみ）----
+# ---- prune 対象（ディレクトリ指定分のみ / ファイル単位）----
+declare -A PRUNE_SET=()
 PRUNE_FILES=()
 if [ "$PRUNE" -eq 1 ]; then
   for rel in "${NORM_TARGETS[@]}"; do
     [ -d "$SRC/$rel" ] && [ ! -L "$SRC/$rel" ] || continue
-    [ -d "$DST/$rel" ] || continue
+    [ -d "$DST/$rel" ] && [ ! -L "$DST/$rel" ] || continue
     while IFS= read -r f; do
       sub="${f#"$DST"/}"
       is_excluded "$sub" && continue
-      [ -e "$SRC/$sub" ] || [ -L "$SRC/$sub" ] || PRUNE_FILES+=("$sub")
+      if [ ! -e "$SRC/$sub" ] && [ ! -L "$SRC/$sub" ]; then
+        [ -n "${PRUNE_SET[$sub]:-}" ] && continue
+        PRUNE_SET["$sub"]=1
+        PRUNE_FILES+=("$sub")
+      fi
     done < <(find "$DST/$rel" \( -type f -o -type l \) | sort)
   done
 fi
+
+# ---- 許可ファイル集合（この完全一致リスト以外の _src 変更は許容しない）----
+declare -A ALLOWED=()
+for f in "${FILES[@]}"; do ALLOWED["$f"]=1; done
+for f in "${PRUNE_FILES[@]}"; do ALLOWED["$f"]=1; done
+
+# ---- 書き込み前 validation（1件でも違反があれば何も変更せず停止）----
+violations=0
+for f in "${FILES[@]}"; do
+  # SRC: 中間親がsymlinkでないこと
+  if ! check_parent_chain "$SRC" "$f"; then
+    echo "  [違反] SRC の親ディレクトリがsymlink: $f" >&2; violations=1; continue
+  fi
+  # SRC: symlink自体のコピーは許可するが、解決先がSRC外なら拒否
+  if [ -L "$SRC/$f" ]; then
+    if ! sreal="$(readlink -f "$SRC/$f")"; then
+      echo "  [違反] symlinkを解決できません: $f" >&2; violations=1; continue
+    fi
+    case "$sreal" in
+      "$SRC"/*) : ;;
+      *) echo "  [違反] SRC外を指すsymlink: $f -> $sreal" >&2; violations=1; continue ;;
+    esac
+  fi
+  # DST: 中間親がsymlinkでDST外へ抜けないこと
+  if ! check_parent_chain "$DST" "$f"; then
+    echo "  [違反] DST の親ディレクトリがsymlink: $f" >&2; violations=1
+  fi
+done
+for f in "${PRUNE_FILES[@]}"; do
+  if ! check_parent_chain "$DST" "$f"; then
+    echo "  [違反] DST の親ディレクトリがsymlink（prune対象）: $f" >&2; violations=1
+  fi
+done
+[ "$violations" -eq 0 ] || die "パス検証に失敗しました。何も変更していません"
 
 echo "--- 同期対象 (${#FILES[@]}件) ---"
 printf '  %s\n' "${FILES[@]}"
@@ -196,7 +279,7 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   printf '  %s\n' "${SKIPPED[@]}"
 fi
 
-# ---- 想定外のGit変更チェック ----
+# ---- 想定外のGit変更チェック（ファイル単位の完全一致）----
 echo "--- 事前 git status チェック ---"
 unexpected=0
 while IFS= read -r line; do
@@ -204,20 +287,16 @@ while IFS= read -r line; do
   st="${line:0:2}"
   p="${line:3}"
   case "$st" in
-    R*|C*) echo "  [想定外] rename/copy 検出: $line"; unexpected=1; continue ;;
+    R*|C*) echo "  [想定外] rename/copy 検出: $line" >&2; unexpected=1; continue ;;
   esac
-  ok=0
-  for rel in "${NORM_TARGETS[@]}"; do
-    if [ "$p" = "$rel" ] || [ "${p#"$rel"/}" != "$p" ]; then ok=1; break; fi
-  done
-  if [ "$ok" -eq 0 ]; then
-    echo "  [想定外] $line"
+  if [ -z "${ALLOWED[$p]:-}" ]; then
+    echo "  [想定外] $line" >&2
     unexpected=1
   fi
 done < <(git -C "$DST" -c core.quotepath=false status --porcelain -uall)
 
 if [ "$unexpected" -eq 1 ]; then
-  die "同期対象外の変更が _src に存在します。人間が確認してください（本スクリプトは何も変更していません）"
+  die "同期対象ファイル以外の変更が _src に存在します。人間が確認してください（本スクリプトは何も変更していません）"
 fi
 info "想定外のGit変更なし"
 
@@ -235,7 +314,7 @@ for f in "${FILES[@]}"; do
 done
 info "同期完了: ${#FILES[@]}件"
 
-# ---- prune 実行 ----
+# ---- prune 実行（ファイル単位）----
 if [ "${#PRUNE_FILES[@]}" -gt 0 ]; then
   for f in "${PRUNE_FILES[@]}"; do
     if git -C "$DST" ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
@@ -245,39 +324,51 @@ if [ "${#PRUNE_FILES[@]}" -gt 0 ]; then
     fi
   done
   info "prune完了: ${#PRUNE_FILES[@]}件"
-  # 空になったディレクトリの掃除は prune 指定した対象ディレクトリ配下に限定する
   for rel in "${NORM_TARGETS[@]}"; do
-    [ -d "$DST/$rel" ] || continue
+    [ -d "$DST/$rel" ] && [ ! -L "$DST/$rel" ] || continue
     find "$DST/$rel" -mindepth 1 -type d -empty -delete 2>/dev/null || true
   done
 fi
 
-# ---- diff 確認 ----
+# ---- stage（具体的ファイルのみ。ディレクトリ / . / -A は使わない）----
+echo "--- git add (ファイル単位: ${#ALLOWED[@]}件) ---"
+STAGE_FILES=("${FILES[@]}")
+[ "${#PRUNE_FILES[@]}" -gt 0 ] && STAGE_FILES+=("${PRUNE_FILES[@]}")
+git -C "$DST" add -- "${STAGE_FILES[@]}"
+
+# ---- 内容確認 ----
 echo "--- git status ---"
 git -C "$DST" -c core.quotepath=false status --short
-echo "--- git add (対象限定) ---"
-git -C "$DST" add -- "${NORM_TARGETS[@]}"
 echo "--- git diff --cached --stat ---"
 git -C "$DST" diff --cached --stat
+echo "--- git diff --cached (先頭200行) ---"
+# head で打ち切ると SIGPIPE になるため pipefail の影響を打ち消す
+{ git -C "$DST" diff --cached || true; } | head -200 || true
 echo "--- git diff --check ---"
 git -C "$DST" diff --cached --check
 
-if git -C "$DST" diff --cached --quiet; then
-  info "コミット対象の差分がありません。終了します。"
-  exit 0
-fi
-
 # ---- commit ----
-if [ -z "$COMMIT_MSG" ]; then
-  COMMIT_MSG="Sync pipeline_ses_steps $(date '+%Y%m%d_%H%M%S')"
+if git -C "$DST" diff --cached --quiet; then
+  info "コミット対象の差分はありません"
+else
+  if [ -z "$COMMIT_MSG" ]; then
+    COMMIT_MSG="Sync pipeline_ses_steps $(date '+%Y%m%d_%H%M%S')"
+  fi
+  git -C "$DST" commit -m "$COMMIT_MSG"
+  info "commit: $(git -C "$DST" rev-parse --short HEAD)"
 fi
-git -C "$DST" commit -m "$COMMIT_MSG"
-info "commit: $(git -C "$DST" rev-parse --short HEAD)"
 
-# ---- push（通常pushのみ / force不可） ----
+# ---- push（通常pushのみ / force不可）----
 if [ "$NO_PUSH" -eq 1 ]; then
   info "--no-push 指定のため push しません"
   exit 0
 fi
+
+ahead="$(git -C "$DST" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)"
+if [ "$ahead" -eq 0 ]; then
+  info "push対象のcommitはありません"
+  exit 0
+fi
+info "未push commit: ${ahead}件"
 git -C "$DST" push
 info "push 完了"

@@ -31,7 +31,6 @@
       "Bash(pytest *)",
       "Bash(nohup python3 *)",
       "Bash(/home/ec2-user/bin/pipeline_sync_git.sh *)",
-      "Bash(tools/pipeline_sync_git.sh *)",
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git log *)",
@@ -42,10 +41,8 @@
       "Bash(git -C /home/ec2-user/pipeline_ses_steps_src log *)",
       "Bash(git -C /home/ec2-user/pipeline_ses_steps_src show *)",
       "Bash(git -C /home/ec2-user/pipeline_ses_steps_src ls-files *)",
-      "Bash(git -C /home/ec2-user/pipeline_ses_steps_src add *)",
       "Bash(git -C /home/ec2-user/pipeline_ses_steps_src commit *)",
       "Bash(git -C /home/ec2-user/pipeline_ses_steps_src push)",
-      "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git push)",
       "Bash(codex --help)",
@@ -65,6 +62,9 @@
       "Bash(crontab -e *)"
     ],
     "deny": [
+      "Bash(git add .)",
+      "Bash(git add -A *)",
+      "Bash(git add --all *)",
       "Bash(git push --force*)",
       "Bash(git push -f *)",
       "Bash(git reset --hard *)",

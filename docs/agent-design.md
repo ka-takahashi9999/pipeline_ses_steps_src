@@ -95,11 +95,13 @@ Claude / Codex で内容が分岐しないことを構造で保証する。
 - **allow（自走）**: workspace内 Read/Edit/Write、`python3` / `python`、`pytest`、
   `ls` / `cat` / `grep` / `find` / `head` / `tail` / `wc` / `diff` / `sha256sum`、`bash -n`、
   **可逆なファイル操作（`mkdir` / `touch` / `cp` / `mv`）**、`chmod +x` / `ln -s`、
-  `pipeline_sync_git.sh`、Git read-only（`status` / `diff` / `log` / `show` / `ls-files`）、
-  通常 `git add` / `git commit` / `git push`
+  `pipeline_sync_git.sh`（実行用コピー）、Git read-only（`status` / `diff` / `log` / `show` / `ls-files`）、
+  `git commit` / 通常 `git push`
+- 一般的な `Bash(git add *)` の allow は**置かない**。
+  `git add .` / `-A` まで無確認になるため、Git反映は正規スクリプトに一本化した
 - **ask**: `rm` / `rmdir`、`git checkout` / `restore` / `rebase`、`aws`、`systemctl`、`crontab -e`
-- **deny**: `git push --force*` / `git push -f`、`git reset --hard`、`git clean`、`sudo`、
-  `aws ssm get-parameter` / `put-parameter`
+- **deny**: `git add .` / `git add -A` / `git add --all`、`git push --force*` / `git push -f`、
+  `git reset --hard`、`git clean`、`sudo`、`aws ssm get-parameter` / `put-parameter`
 
 `mv` / `cp` は Autonomy First の観点で allow とした。
 Permissionパターンでは「workspace内か外か」を安全に判別できないため、
@@ -143,8 +145,12 @@ project scopeの `.rules` が読み込まれることは `codex exec --help` の
 ```
 prefix_rule(pattern=["/home/ec2-user/bin/pipeline_sync_git.sh"], decision="allow")
 prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "reset", "--hard"], decision="forbidden")
 ...
 ```
+
+`git -C <_src>` 形式でも force push / `reset --hard` / `clean` を forbidden にしている。
+`git -C ... status` / `diff` / 通常 `push` は対象外（rule未一致 → 通常の承認フロー）。
 
 - 有効な `decision` は **`allow` / `prompt` / `forbidden` の3種のみ**（`deny` / `ask` はparse error）。実測確認済み
 - 検証は `codex execpolicy check --rules .codex/rules/pipeline.rules <command...>` で行える
@@ -167,10 +173,10 @@ prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
 ### スクリプトの正本と実行用コピー
 
 ```
-pipeline_ses_steps/tools/pipeline_sync_git.sh   ← 正本（Git管理対象）
+pipeline_ses_steps/tools/pipeline_sync_git.sh   ← 正本（Git管理対象 / sandbox外allowしない）
         │ cp -p
         ▼
-/home/ec2-user/bin/pipeline_sync_git.sh          ← 実行用コピー（PATH上、Git管理外）
+/home/ec2-user/bin/pipeline_sync_git.sh          ← 実行用コピー（正規実行経路 / Codex rulesでallow）
         │ 正規同期経路
         ▼
 pipeline_ses_steps_src/tools/pipeline_sync_git.sh ← GitHubへpush
@@ -178,33 +184,46 @@ pipeline_ses_steps_src/tools/pipeline_sync_git.sh ← GitHubへpush
 
 - 修正は**必ず正本側**で行い、`cp -p` で実行用コピーへ反映する（本文は二重管理しない）
 - 一致確認: `pipeline_sync_git.sh --self-check`（sha256照合）
-- 通常実行時も不一致を検出したら警告を出す（実行自体は止めない）
+- **通常実行時も不一致なら fail-closed**。何もせず異常終了する（警告して続行はしない）
+- 正本は workspace 内にありAIが編集可能なため、**sandbox外allowの対象にしない**。
+  「正本を書き換えて無確認でsandbox外実行」という経路を作らないことが目的
 
 流れ:
 
+標準フローは **dry-run → 通常実行の2段階**。通常実行1回で push まで完結する。
+
 ```
-対象パスの明示
-→ 検証（絶対パス / .. / SRC外脱出 / 生成物 を拒否）
-→ 同期対象ファイル一覧の提示
-→ _src の想定外Git変更チェック（あれば停止・無変更で終了）
-→ 選択コピー
-→ git status / git diff --cached --stat / git diff --check
-→ 対象限定 git add
-→ git commit
-→ 通常 git push
+1. --dry-run で内容確認（何も変更しない）
+2. 通常実行:
+   checksum照合（不一致なら fail-closed で異常終了）
+   → 対象パスの明示・検証（絶対パス / .. / 生成物 を拒否）
+   → ディレクトリを具体的ファイルへ展開（以降すべてファイル単位）
+   → 全対象を書き込み前validation（SRC外/DST外へ抜けるsymlink経路を拒否）
+   → _src の変更チェック（許可ファイル集合と完全一致しなければ停止・無変更で終了）
+   → 選択コピー / prune
+   → 対象ファイルだけ git add
+   → git status / git diff --cached --stat / git diff --cached / git diff --check
+   → git commit
+   → 通常 git push
 ```
 
 安全設計:
 
 - **全同期をデフォルトにしない**（対象パス必須）
+- **checksum fail-closed**: 正本と実行用コピーが不一致なら、同期・commit・pushを一切開始せず異常終了
+- **すべてファイル単位**: 同期 / 既存変更の許容 / diff / add / commit / prune の判定単位は
+  最終的に確定した具体的ファイルリスト。ディレクトリは入力としてのみ受け付ける
+- 許可ファイル集合以外の変更・untrackedが `_src` に1件でもあれば停止（同一ディレクトリ内でも停止）
 - 生成物除外（`01_result/` `02_confirm/` `99_execution_time/` `__pycache__/`
   `*.jsonl` `*.json` `*.log` `nohup.out` `settings.local.json`）
 - 例外的にGit管理する設定は `INCLUDE_ALWAYS`（現在 `.claude/settings.json` のみ）で明示する
-- `..` / 絶対パス / SRC外を指すsymlinkを拒否
-- `_src` に想定外の変更があれば何も変更せず停止
-- `git add` は対象限定（`git add .` はしない）
+- `..` / 絶対パスを拒否
+- symlink: 自体のコピーは許可するが、解決先がSRC外のものは拒否。
+  DST側は中間の親ディレクトリがsymlinkでDST外へ抜ける経路を拒否
+- 書き込み前に全対象をvalidationし、1件でも違反があれば何も変更しない
+- `git add` は具体的ファイルのみ（`git add .` / `-A` / ディレクトリ指定はしない）
 - force push機能を持たない
-- `--dry-run` 対応
+- `--dry-run` 対応（冪等）
 
 既存の `pipeline_ses_steps_src/sync.sh` と `~/sync_and_push_pipeline_ses_steps_src.sh` は
 全同期 + `git add .` 前提のため、日常運用の既定経路からは外し、
