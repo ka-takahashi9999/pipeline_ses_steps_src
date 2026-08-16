@@ -49,6 +49,10 @@ AWS read-only のSES Pipeline調査では、raw な `aws` CLI ではなく
 `/home/ec2-user/bin/pipeline_aws_readonly.sh` を優先使用する。
 通常のread-only調査はこの経路で人間承認なしに進める。
 
+**ラッパーは直接呼び出す。** 外側に `for` / パイプ / `bash -lc` 等の複合Shellを組み合わせない
+（複合Shellにすると承認が発生する）。集計が必要な場合は
+`s3-07-error-summary` のような高レベルsubcommandを使い、複数URI・複数ARNは1回の実行でまとめて渡す。
+
 AWS変更操作・秘密情報取得（SSM Parameter Storeの値取得等）が必要な場合のみ、
 このラッパーを使わず通常の承認フローへ戻す。
 

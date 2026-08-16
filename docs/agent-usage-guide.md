@@ -114,11 +114,34 @@ raw な `aws` CLI は承認対象のままだが、このラッパー経由の r
 
 正本と実行用コピーが不一致なら fail-closed（実行禁止）。確認は `--self-check`。
 
+### 重要：ラッパーは直接呼び出す
+
+allowされるのは**ラッパーの直接実行だけ**。外側に複合Shellを組むと
+execpolicyのallow対象から外れ、Yes/No承認が発生する。
+
+```bash
+# NG（承認が出る）
+for d in 20260810 20260814; do pipeline_aws_readonly.sh s3-cat ... | rg ... | awk ...; done
+
+# OK（承認なし）
+pipeline_aws_readonly.sh s3-07-error-summary <URI1> <URI2>
+```
+
+集計は高レベルsubcommandへ寄せ、複数URI・複数ARNは**1回の実行でまとめて渡す**。
+
 提供する操作（allow list方式・未知subcommandは全拒否・region は `ap-northeast-1` 固定）:
 
 ```
 s3-cat <s3-uri>                       S3 → stdout のみ
 s3-ls  <s3-uri> [--recursive] [--human-readable] [--summarize]
+
+s3-07-error-summary <s3-uri> [<s3-uri> ...]
+    07-1 の error_type別件数とTOTAL（複数run一括）
+s3-07-error-samples <s3-uri> [...] [--max-per-type N]
+    07-1 の error_type別 代表行のみ（既定 N=1 / 1行240文字で打ち切り）
+
+sfn-execution-summary <execution-arn> [<execution-arn> ...]
+    name / status / startDate / stopDate と input・output要約のみ（history全文は出さない）
 sfn-list-executions [--max-items N] [--status-filter STATUS]
 sfn-describe-execution <execution-arn>
 sfn-get-execution-history <execution-arn> [--max-items N] [--reverse-order]
@@ -134,12 +157,34 @@ State Machineのみ。**変更操作（start/stop/rm/put/IAM等）とSSM Paramet
 使用例:
 
 ```bash
+# ログの所在を確認
 /home/ec2-user/bin/pipeline_aws_readonly.sh \
   s3-ls s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/ --recursive
 
-/home/ec2-user/bin/pipeline_aws_readonly.sh \
-  s3-cat s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/sfn-xxxx/pipeline.log
+# 複数runの 07-1 error_type を1回で集計
+/home/ec2-user/bin/pipeline_aws_readonly.sh s3-07-error-summary \
+  s3://technoverse/pipeline_ses_steps/pipeline-logs/20260810/sfn-xxxx/pipeline.log \
+  s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/sfn-yyyy/pipeline.log
+
+# 代表errorだけ確認
+/home/ec2-user/bin/pipeline_aws_readonly.sh s3-07-error-samples \
+  s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/sfn-yyyy/pipeline.log --max-per-type 1
+
+# 直近runの run_date / run_id / status をまとめて確認
+/home/ec2-user/bin/pipeline_aws_readonly.sh sfn-list-executions --max-items 3
+/home/ec2-user/bin/pipeline_aws_readonly.sh sfn-execution-summary <ARN> <ARN> <ARN>
 ```
+
+出力例（`s3-07-error-summary`）:
+
+```
+RUN s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/sfn-yyyy/pipeline.log
+missing_resource_skillsheet 86
+TOTAL 86
+```
+
+新しい集計軸（08-1 merged件数など）が必要になったら、外側で複合Shellを組まず
+**ラッパー内部に高レベルsubcommandを追加**する。汎用shell実行機能は追加しない。
 
 ### 大量ログの扱い（Lean Context）
 

@@ -49,10 +49,18 @@ S3（s3://technoverse/pipeline_ses_steps/ 配下のみ）:
   s3-cat <s3-uri>                       S3オブジェクトを stdout へ出力（ファイル出力・アップロード不可）
   s3-ls  <s3-uri> [--recursive] [--human-readable] [--summarize]
 
+Pipeline集計（外側で複合Shellを組まずに済む高レベルsubcommand）:
+  s3-07-error-summary <s3-uri> [<s3-uri> ...]
+                                        07-1 の error_type別件数とTOTALを集計（複数run一括可）
+  s3-07-error-samples <s3-uri> [<s3-uri> ...] [--max-per-type N]
+                                        07-1 の error_type別 代表行のみ出力（既定 N=1）
+
 Step Functions（SES Pipeline の State Machine のみ / read-only）:
   sfn-list-executions [--max-items N] [--status-filter STATUS]
   sfn-describe-execution <execution-arn>
   sfn-get-execution-history <execution-arn> [--max-items N] [--reverse-order]
+  sfn-execution-summary <execution-arn> [<execution-arn> ...]
+                                        name/status/startDate/stopDate とinput/output要約のみ（複数一括可）
 
 EC2（read-only）:
   ec2-describe-instances [i-xxxx ...]
@@ -69,8 +77,22 @@ CloudTrail（read-only）:
   pipeline_aws_readonly.sh s3-ls s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/
   pipeline_aws_readonly.sh s3-cat s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/xxx/pipeline.log
 
-大量ログはモデルへ直接流さず、ローカルで rg / awk / python3 により集計してから扱うこと。
+大量ログはモデルへ直接流さず、集計subcommandを使うこと。
+ラッパーの外側に for / パイプ / bash -lc 等の複合Shellを組まない
+（複合Shellはexecpolicyのallow対象から外れ、人間承認が発生する）。
 EOF
+}
+
+# 07-1 のエラー行: "[07-1_xxx] ... ERR type=<error_type>"
+STEP07_TAG='\[07-1_[A-Za-z0-9_]+\]'
+
+# S3オブジェクトを一時ファイルへ取得（stdoutへは出さない）
+FETCH_TMP=""
+cleanup_tmp() { [ -n "$FETCH_TMP" ] && rm -f "$FETCH_TMP" || true; }
+fetch_to_tmp() {
+  local uri="$1"
+  FETCH_TMP="$(mktemp /tmp/pipeline_aws_readonly_XXXXXX)"
+  "$AWS_BIN" s3 cp "$uri" - --region "$REGION" > "$FETCH_TMP"
 }
 
 # ---- 正本と実行用コピーの checksum 照合 ----
@@ -169,6 +191,99 @@ case "$CMD" in
       esac
     done
     exec "$AWS_BIN" "${args[@]}"
+    ;;
+
+  s3-07-error-summary)
+    [ $# -ge 1 ] || die "usage: s3-07-error-summary <s3-uri> [<s3-uri> ...]"
+    uris=()
+    while [ $# -gt 0 ]; do
+      require_s3_uri "$1"
+      case "$1" in */) die "ディレクトリ相当のURIは指定できません: $1" ;; esac
+      uris+=("$1"); shift
+    done
+    trap cleanup_tmp EXIT
+    for uri in "${uris[@]}"; do
+      echo "RUN $uri"
+      fetch_to_tmp "$uri"
+      { grep -E "$STEP07_TAG" "$FETCH_TMP" || true; } \
+        | { grep -oE "ERR type=[A-Za-z0-9_]+" || true; } \
+        | sed 's/^ERR type=//' \
+        | sort | uniq -c | sort -rn \
+        | awk '{ print $2, $1; t += $1 } END { print "TOTAL", t+0 }'
+      cleanup_tmp
+    done
+    exit 0
+    ;;
+
+  s3-07-error-samples)
+    max_per_type=1
+    uris=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --max-per-type) [ $# -ge 2 ] || die "--max-per-type に値がありません"; require_num "$2"; max_per_type="$2"; shift 2 ;;
+        -*) die "s3-07-error-samples で許可されていないオプションです: $1" ;;
+        *) require_s3_uri "$1"
+           case "$1" in */) die "ディレクトリ相当のURIは指定できません: $1" ;; esac
+           uris+=("$1"); shift ;;
+      esac
+    done
+    [ "${#uris[@]}" -ge 1 ] || die "usage: s3-07-error-samples <s3-uri> [...] [--max-per-type N]"
+    trap cleanup_tmp EXIT
+    for uri in "${uris[@]}"; do
+      echo "RUN $uri"
+      fetch_to_tmp "$uri"
+      # error_type ごとに先頭 N 行のみ。1行は240文字で打ち切り、ログ本文を大量に出さない
+      { grep -E "$STEP07_TAG" "$FETCH_TMP" || true; } \
+        | { grep -E "ERR type=[A-Za-z0-9_]+" || true; } \
+        | awk -v m="$max_per_type" '{
+            if (match($0, /ERR type=[A-Za-z0-9_]+/)) {
+              t = substr($0, RSTART + 9, RLENGTH - 9)
+              if (c[t]++ < m) print substr($0, 1, 240)
+            }
+          }'
+      cleanup_tmp
+    done
+    exit 0
+    ;;
+
+  sfn-execution-summary)
+    [ $# -ge 1 ] || die "usage: sfn-execution-summary <execution-arn> [<execution-arn> ...]"
+    arns=()
+    while [ $# -gt 0 ]; do
+      require_execution_arn "$1"
+      arns+=("$1"); shift
+    done
+    # 固定のPythonコードで要約のみ出力（ユーザー引数はコードへ渡さない）
+    SUMMARY_PY='
+import json, sys
+d = json.load(sys.stdin)
+for k in ("name", "status", "startDate", "stopDate"):
+    if k in d:
+        print(k, d[k])
+for side in ("input", "output"):
+    raw = d.get(side)
+    if not raw:
+        continue
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        print(side, str(raw)[:200])
+        continue
+    if isinstance(obj, dict):
+        for k, v in list(obj.items())[:20]:
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                print("%s.%s" % (side, k), str(v)[:200])
+            else:
+                print("%s.%s" % (side, k), "<%s len=%d>" % (type(v).__name__, len(v)))
+    else:
+        print(side, str(obj)[:200])
+'
+    for arn in "${arns[@]}"; do
+      echo "EXECUTION $arn"
+      "$AWS_BIN" stepfunctions describe-execution --execution-arn "$arn" --region "$REGION" \
+        | python3 -c "$SUMMARY_PY"
+    done
+    exit 0
     ;;
 
   sfn-list-executions)
