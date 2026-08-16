@@ -211,16 +211,31 @@ def upsert_success_cache(
 
     - 既存の今回未更新entryは保持する
     - 同一キーに今回の成功結果がある場合だけ評価結果 / source_message_ids を差し替える
+    - new_entries 内に同一 comparison_key が複数ある場合は last-write-wins にせず停止する
     - 更新に失敗した場合は旧cacheを残す（例外を送出する）
     """
     path = Path(cache_path)
+
+    # cacheファイルへ触れる前に new_entries を全件検証する（同一キー重複は明示エラー）
+    new_keys: List[ComparisonKey] = []
+    seen_new_keys: Dict[ComparisonKey, int] = {}
+    for index, entry in enumerate(new_entries):
+        key = validate_cache_entry(entry, f"upsert対象[{index}]")
+        if key in seen_new_keys:
+            raise SuccessCacheError(
+                "同一upsert内にcomparison_keyが複数存在する "
+                f"(upsert対象[{seen_new_keys[key]}] と upsert対象[{index}]): "
+                f"{format_comparison_key(key)}"
+            )
+        seen_new_keys[key] = index
+        new_keys.append(key)
+
     cache = load_success_cache(str(path))
     before_count = len(cache)
 
     updated = 0
     inserted = 0
-    for index, entry in enumerate(new_entries):
-        key = validate_cache_entry(entry, f"upsert対象[{index}]")
+    for key, entry in zip(new_keys, new_entries):
         if key in cache:
             updated += 1
         else:

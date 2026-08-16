@@ -5,6 +5,19 @@ Success Cache方式の focused test（06-80 / 08-1）
 06-80 と 08-1 の main() を実行して検証する。
 LLM呼び出し・full Pipeline実行は行わない。
 
+【20260814データを使ったreplayの位置づけ】
+実施済みのreplayは「Cache MISS 979件のうち893件が07-1で成功した場合」を仮定した
+08-1ロジック検証であり、実際に893件をLLM再評価した結果ではない。
+そこで得られた merged=2,566 は本番期待値ではない。
+
+次回本番runの正しい期待値（S=07-1 success / E=07-1 error）:
+    run前 Success Cache      : 1,673
+    06-80                    : HIT=1,673 / MISS=979
+    07-1                     : input=979 / success=S / error=E / S+E=979
+    08-1                     : cache restore=1,673 / new success=S /
+                               merged=1,673+S / error=E
+    run後 Success Cache      : 1,673+S
+
 実行:
   python3 08-1_restore_and_merge_requirement_skill_ai_matching/00_tool/test_success_cache_flow.py
 """
@@ -13,6 +26,7 @@ import importlib.util
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -417,6 +431,43 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         self.assertEqual(merged_keys | error_keys, set(diff_key_map.values()))
 
 
+    def test_9_empty_comparison_key_fails_fast_in_06_80(self):
+        """A. comparison_keyの1項目が空 → 06-80でfail-fast / 07-1入力へ入らない"""
+        self.setup_inputs(
+            [
+                mail("P0", "p0@x.com", "案件0"),
+                mail("R0", "r0@y.com", "要員0"),
+                mail("P1", "p1@x.com", "案件1"),
+                mail("R1", "r1@y.com", ""),  # resource_subject が空
+            ],
+            [pair("P0", "R0"), pair("P1", "R1")],
+        )
+
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_06_80()
+        self.assertEqual(ctx.exception.code, 1)
+
+        # 07-1入力（新規出力）も diff_file も書き進めない
+        self.assertFalse(self.new_file.exists())
+        self.assertFalse(self.duplicate_file.exists())
+        self.assertFalse(self.diff_file.exists())
+
+        # ロジック単体: 空keyは同一identity扱いしない
+        self.assertFalse(
+            dup_mod.is_complete_comparison_key(build_comparison_key("p", "s", "r", ""))
+        )
+        incomplete = dup_mod.find_incomplete_comparison_keys(
+            [
+                {
+                    "project_info": {"message_id": "P1", "from": "p1@x.com", "subject": "案件1"},
+                    "resource_info": {"message_id": "R1", "from": "r1@y.com", "subject": ""},
+                }
+            ]
+        )
+        self.assertEqual(len(incomplete), 1)
+        self.assertEqual(incomplete[0]["empty_fields"], ["resource_subject"])
+
+
 class SuccessCacheValidationTestCase(unittest.TestCase):
     """cache不整合はCache MISSにせず明示的エラーで停止する。"""
 
@@ -486,6 +537,97 @@ class SuccessCacheValidationTestCase(unittest.TestCase):
         )
         self.assertEqual(cache[key2]["required_skills"], skills("keep"))
         self.assertEqual(list(self.tmp.glob("*.tmp")), [])
+
+    def test_duplicate_new_entries_raises_and_keeps_cache_unchanged(self):
+        """B. 同一comparison_keyを2件upsert → SuccessCacheError / cacheファイル無変更"""
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(self.key, "AAA", "BBB", skills("old"), [], {})],
+        )
+        before = self.cache_file.read_text(encoding="utf-8")
+
+        with self.assertRaises(SuccessCacheError):
+            upsert_success_cache(
+                str(self.cache_file),
+                [
+                    build_cache_entry(self.key, "CCC", "DDD", skills("new1"), [], {}),
+                    build_cache_entry(self.key, "EEE", "FFF", skills("new2"), [], {}),
+                ],
+            )
+
+        self.assertEqual(self.cache_file.read_text(encoding="utf-8"), before)
+        self.assertEqual(list(self.tmp.glob("*.tmp")), [])
+
+    def test_upsert_stats_match_unique_keys(self):
+        """inserted / updated が一意キー単位の実数と一致する"""
+        key2 = build_comparison_key("p2@x.com", "案件C", "r2@y.com", "要員D")
+        key3 = build_comparison_key("p3@x.com", "案件E", "r3@y.com", "要員F")
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(self.key, "AAA", "BBB", skills("old"), [], {})],
+        )
+        stats = upsert_success_cache(
+            str(self.cache_file),
+            [
+                build_cache_entry(self.key, "CCC", "DDD", skills("new"), [], {}),
+                build_cache_entry(key2, "EEE", "FFF", skills("new"), [], {}),
+                build_cache_entry(key3, "GGG", "HHH", skills("new"), [], {}),
+            ],
+        )
+        self.assertEqual(stats, {"before_count": 1, "after_count": 3, "inserted": 2, "updated": 1})
+        self.assertEqual(len(load_success_cache(str(self.cache_file))), 3)
+
+
+class ConfirmScriptGitSyncTestCase(unittest.TestCase):
+    """C. confirmスクリプトだけが正規sync経路の対象になること。"""
+
+    SYNC_SCRIPT = PROJECT_ROOT / "tools/pipeline_sync_git.sh"
+    CONFIRM_TARGETS = (
+        "06-80_duplicate_proposal_check/02_confirm/confirm_duplicate_proposal_check.py",
+        "07-1_requirement_skill_ai_matching/02_confirm/confirm_requirement_skill_ai_matching.py",
+        "08-1_restore_and_merge_requirement_skill_ai_matching/02_confirm"
+        "/confirm_restore_and_merge_requirement_skill_ai_matching.py",
+    )
+    EXCLUDED_TARGETS = (
+        "06-80_duplicate_proposal_check/02_confirm/confirm_result_duplicate_proposal_check.txt",
+        "08-1_restore_and_merge_requirement_skill_ai_matching/02_confirm"
+        "/diagnostics_restore_and_merge_requirement_skill_ai_matching.txt",
+        "07-1_requirement_skill_ai_matching/01_result/run_metadata.json",
+        "08-1_restore_and_merge_requirement_skill_ai_matching/01_result"
+        "/merged_requirement_skill_ai_matching.jsonl",
+    )
+
+    def run_dry_run(self, target: str):
+        return subprocess.run(
+            ["bash", str(self.SYNC_SCRIPT), "--dry-run", target],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+        )
+
+    def test_confirm_scripts_are_sync_targets(self):
+        for target in self.CONFIRM_TARGETS:
+            if not (PROJECT_ROOT / target).exists():
+                self.skipTest(f"対象が存在しない: {target}")
+            out = self.run_dry_run(target).stdout.decode("utf-8", errors="replace")
+            self.assertIn("--- 同期対象 (1件) ---", out, msg=target)
+            self.assertIn(target, out, msg=target)
+            self.assertNotIn("同期対象外", out, msg=target)
+
+    def test_generated_files_are_not_sync_targets(self):
+        for target in self.EXCLUDED_TARGETS:
+            if not (PROJECT_ROOT / target).exists():
+                continue
+            proc = self.run_dry_run(target)
+            out = proc.stdout.decode("utf-8", errors="replace")
+            self.assertNotEqual(proc.returncode, 0, msg=target)
+            self.assertIn("同期対象外", out, msg=target)
+
+    def test_02_confirm_directory_itself_is_not_a_sync_target(self):
+        proc = self.run_dry_run("06-80_duplicate_proposal_check/02_confirm")
+        out = proc.stdout.decode("utf-8", errors="replace")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("同期対象外", out)
 
 
 if __name__ == "__main__":

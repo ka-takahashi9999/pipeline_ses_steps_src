@@ -19,6 +19,7 @@ from common.file_utils import ensure_result_dirs, write_error_log, write_executi
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from common.success_cache import (
+    COMPARISON_KEY_FIELDS,
     SUCCESS_CACHE_PATH,
     comparison_key_from_diff_record,
     is_complete_comparison_key,
@@ -68,12 +69,56 @@ def build_compare_key(diff_record: dict) -> Tuple[str, str, str, str]:
     return comparison_key_from_diff_record(diff_record)
 
 
+def find_incomplete_comparison_keys(diff_records: List[dict]) -> List[dict]:
+    """comparison_keyの4項目に空値があるレコードを抽出する（空key同士を同一identityにしない）。"""
+    incomplete: List[dict] = []
+    for diff_record in diff_records:
+        key = build_compare_key(diff_record)
+        if is_complete_comparison_key(key):
+            continue
+        empty_fields = [
+            field
+            for field, value in zip(COMPARISON_KEY_FIELDS, key)
+            if not (isinstance(value, str) and value.strip())
+        ]
+        incomplete.append(
+            {
+                "project_message_id": diff_record.get("project_info", {}).get("message_id", ""),
+                "resource_message_id": diff_record.get("resource_info", {}).get("message_id", ""),
+                "empty_fields": empty_fields,
+            }
+        )
+    return incomplete
+
+
 def main() -> None:
     logger = get_logger(STEP_NAME)
     dirs = ensure_result_dirs(str(STEP_DIR))
     start_time = time.time()
 
     try:
+        pairs = read_jsonl_as_list(str(INPUT_PAIRS))
+        mail_master = read_jsonl_as_dict(str(INPUT_MAIL_MASTER), key="message_id")
+        logger.info(f"入力ペア数={len(pairs)} メールマスタ件数={len(mail_master)}")
+
+        diff_records = [build_compare_key_record(pair, mail_master) for pair in pairs]
+
+        # 空comparison_keyは遅延失敗（07-1評価 → 08-1 upsert時のSuccessCacheError）を招くため、
+        # 出力・diff_fileローテーションを行う前にfail-fastする。
+        incomplete_items = find_incomplete_comparison_keys(diff_records)
+        if incomplete_items:
+            for item in incomplete_items[:3]:
+                logger.error(
+                    "comparison_key空値: "
+                    f"message_id_pair={item['project_message_id']} / {item['resource_message_id']} "
+                    f"empty_fields={','.join(item['empty_fields'])}"
+                )
+            raise RuntimeError(
+                "comparison_keyに空値があるため停止します（07-1へは流しません）: "
+                f"{len(incomplete_items)}件 / 入力{len(pairs)}件。"
+                "01-1メールマスタのfrom/subject欠落を確認してください"
+            )
+
         if OUTPUT_DIFF_FILE.exists():
             shutil.move(str(OUTPUT_DIFF_FILE), str(OUTPUT_BK_DIFF_FILE))
             logger.info("前回 diff_file を bk_diff_file に退避（監査用途のみ）")
@@ -82,11 +127,6 @@ def main() -> None:
             OUTPUT_BK_DIFF_FILE.write_text("", encoding="utf-8")
             logger.info("初回実行: 空の bk_diff_file を作成")
 
-        pairs = read_jsonl_as_list(str(INPUT_PAIRS))
-        mail_master = read_jsonl_as_dict(str(INPUT_MAIL_MASTER), key="message_id")
-        logger.info(f"入力ペア数={len(pairs)} メールマスタ件数={len(mail_master)}")
-
-        diff_records = [build_compare_key_record(pair, mail_master) for pair in pairs]
         write_jsonl(str(OUTPUT_DIFF_FILE), diff_records)
         logger.info(f"今回 diff_file 出力={len(diff_records)}件")
 
@@ -106,16 +146,11 @@ def main() -> None:
 
         new_records: List[dict] = []
         duplicate_records: List[dict] = []
-        incomplete_key_count = 0
         previous_diff_overlap_count = 0
 
         for pair, diff_record in zip(pairs, diff_records):
             record = dict(pair)
             comparison_key = build_compare_key(diff_record)
-
-            if not is_complete_comparison_key(comparison_key):
-                # 空値を含むキーはcacheに存在し得ないため必ずCache MISS。件数のみ記録して新規扱い。
-                incomplete_key_count += 1
 
             if comparison_key in previous_key_set:
                 previous_diff_overlap_count += 1
@@ -134,7 +169,7 @@ def main() -> None:
         logger.info(
             "判定内訳: "
             f"Cache HIT(重複)={len(duplicate_records)} Cache MISS(新規)={len(new_records)} "
-            f"comparison_key空値あり={incomplete_key_count} "
+            "comparison_key空値=0（空値ありは事前にfail-fast） "
             f"前回diffにも存在={previous_diff_overlap_count}（監査用途 / 判定未使用）"
         )
 

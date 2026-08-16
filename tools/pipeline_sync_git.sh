@@ -47,6 +47,11 @@ EXCLUDE_GLOBS=('*.jsonl' '*.json' '*.log' '*.pyc' '*.zip' '*.gz' 'nohup.out' 'se
 # 除外パターンに該当しても同期する例外（相対パス完全一致）
 INCLUDE_ALWAYS=('.claude/settings.json')
 
+# 除外ディレクトリ配下でも同期する例外（相対パスのglob一致）
+#   02_confirm は生成物置き場のため除外を維持しつつ、confirmスクリプト本体だけを許可する。
+#   confirm_result_*.txt / diagnostics* / *.json / *.jsonl / *.log / __pycache__ は除外のまま。
+INCLUDE_GLOBS=('*/02_confirm/confirm_*.py')
+
 usage() {
   cat <<'EOF'
 usage: pipeline_sync_git.sh [--dry-run] [--no-push] [--prune] [-m "message"] <相対パス>...
@@ -128,6 +133,10 @@ is_excluded() {
   local rel="$1" seg name inc
   for inc in "${INCLUDE_ALWAYS[@]}"; do
     [ "$rel" = "$inc" ] && return 1
+  done
+  for inc in "${INCLUDE_GLOBS[@]}"; do
+    # shellcheck disable=SC2053
+    [[ "$rel" == $inc ]] && return 1
   done
   name="$(basename "$rel")"
   local IFS='/'
