@@ -1,6 +1,9 @@
 """
 06-80_duplicate_proposal_check
-06-30 通過ペアを前回比較キーと照合し、新規/重複に仕分けする。
+06-30 通過ペアの comparison_key を Success Cache と照合し、新規(Cache MISS)/重複(Cache HIT)に仕分けする。
+
+重複判定の正本は Success Cache（再利用可能な07-1成功評価結果）であり、前回diffではない。
+前回diff（bk_diff_file）は監査・確認用途としてのみ残す。
 """
 
 import shutil
@@ -15,6 +18,12 @@ sys.path.insert(0, str(project_root))
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.success_cache import (
+    SUCCESS_CACHE_PATH,
+    comparison_key_from_diff_record,
+    is_complete_comparison_key,
+    load_success_cache,
+)
 
 STEP_NAME = "06-80_duplicate_proposal_check"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -26,6 +35,7 @@ INPUT_PAIRS = (
 INPUT_MAIL_MASTER = (
     project_root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
 )
+INPUT_SUCCESS_CACHE = SUCCESS_CACHE_PATH
 
 OUTPUT_NEW = STEP_DIR / "01_result/duplicate_proposal_check.jsonl"
 OUTPUT_DUPLICATE = STEP_DIR / "01_result/99_duplicate_duplicate_proposal_check.jsonl"
@@ -55,12 +65,7 @@ def build_compare_key_record(pair: dict, mail_master: Dict[str, dict]) -> dict:
 
 
 def build_compare_key(diff_record: dict) -> Tuple[str, str, str, str]:
-    return (
-        diff_record.get("project_info", {}).get("from", ""),
-        diff_record.get("project_info", {}).get("subject", ""),
-        diff_record.get("resource_info", {}).get("from", ""),
-        diff_record.get("resource_info", {}).get("subject", ""),
-    )
+    return comparison_key_from_diff_record(diff_record)
 
 
 def main() -> None:
@@ -71,7 +76,7 @@ def main() -> None:
     try:
         if OUTPUT_DIFF_FILE.exists():
             shutil.move(str(OUTPUT_DIFF_FILE), str(OUTPUT_BK_DIFF_FILE))
-            logger.info("前回 diff_file を bk_diff_file に退避")
+            logger.info("前回 diff_file を bk_diff_file に退避（監査用途のみ）")
         else:
             OUTPUT_BK_DIFF_FILE.parent.mkdir(parents=True, exist_ok=True)
             OUTPUT_BK_DIFF_FILE.write_text("", encoding="utf-8")
@@ -85,16 +90,37 @@ def main() -> None:
         write_jsonl(str(OUTPUT_DIFF_FILE), diff_records)
         logger.info(f"今回 diff_file 出力={len(diff_records)}件")
 
+        # 重複判定の正本: Success Cache（read-only）
+        success_cache = load_success_cache(str(INPUT_SUCCESS_CACHE))
+        if not success_cache:
+            logger.warn(
+                f"Success Cacheが空または未存在のため全件をCache MISSとして扱う: {INPUT_SUCCESS_CACHE}"
+            )
+        else:
+            logger.info(f"Success Cache件数={len(success_cache)}")
+
+        # 監査用途: 前回diffとの重なり件数（判定には使用しない）
         previous_diff_records = read_jsonl_as_list(str(OUTPUT_BK_DIFF_FILE))
         previous_key_set = {build_compare_key(record) for record in previous_diff_records}
-        logger.info(f"前回 bk_diff_file 件数={len(previous_diff_records)}")
+        logger.info(f"前回 bk_diff_file 件数={len(previous_diff_records)}（監査用途）")
 
         new_records: List[dict] = []
         duplicate_records: List[dict] = []
+        incomplete_key_count = 0
+        previous_diff_overlap_count = 0
 
         for pair, diff_record in zip(pairs, diff_records):
             record = dict(pair)
-            is_duplicate = build_compare_key(diff_record) in previous_key_set
+            comparison_key = build_compare_key(diff_record)
+
+            if not is_complete_comparison_key(comparison_key):
+                # 空値を含むキーはcacheに存在し得ないため必ずCache MISS。件数のみ記録して新規扱い。
+                incomplete_key_count += 1
+
+            if comparison_key in previous_key_set:
+                previous_diff_overlap_count += 1
+
+            is_duplicate = comparison_key in success_cache
             record["duplicate_proposal_check"] = is_duplicate
 
             if is_duplicate:
@@ -104,6 +130,13 @@ def main() -> None:
 
         write_jsonl(str(OUTPUT_NEW), new_records)
         write_jsonl(str(OUTPUT_DUPLICATE), duplicate_records)
+
+        logger.info(
+            "判定内訳: "
+            f"Cache HIT(重複)={len(duplicate_records)} Cache MISS(新規)={len(new_records)} "
+            f"comparison_key空値あり={incomplete_key_count} "
+            f"前回diffにも存在={previous_diff_overlap_count}（監査用途 / 判定未使用）"
+        )
 
         elapsed = time.time() - start_time
         write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, len(pairs))

@@ -1,9 +1,12 @@
 """
 08-1_restore_and_merge_requirement_skill_ai_matching
-重複ペアを前回完成版から復元し、07-1 の新規評価結果とマージして全件完成版を作る。
+Cache HIT分は Success Cache から評価結果を復元して今回message_idへrebindし、
+Cache MISS分は今回07-1正常結果を採用して、今回diff順にmergeする。
+処理後、今回07-1正常結果だけを Success Cache へ upsert する（部分errorでも成功分は反映）。
+
+旧 bk_merged_requirement_skill_ai_matching.jsonl は legacy HOLD（read/更新/削除しない）。
 """
 
-import shutil
 import sys
 import time
 from collections import defaultdict
@@ -14,8 +17,17 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
-from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
+from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.success_cache import (
+    SUCCESS_CACHE_PATH,
+    build_cache_entry,
+    comparison_key_from_diff_record,
+    comparison_key_to_dict,
+    format_comparison_key,
+    load_success_cache,
+    upsert_success_cache,
+)
 
 STEP_NAME = "08-1_restore_and_merge_requirement_skill_ai_matching"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -35,68 +47,34 @@ INPUT_NEW_AI_RESULT = (
     project_root
     / "07-1_requirement_skill_ai_matching/01_result/requirement_skill_ai_matching.jsonl"
 )
-INPUT_MAIL_MASTER = (
-    project_root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
-)
-BACKUP_COMPLETED_RESULT = (
-    STEP_DIR / "01_result/bk_merged_requirement_skill_ai_matching.jsonl"
-)
+SUCCESS_CACHE_FILE = SUCCESS_CACHE_PATH
 
 OUTPUT_RESTORED = STEP_DIR / "01_result/restored_requirement_skill_ai_matching.jsonl"
 OUTPUT_MERGED = STEP_DIR / "01_result/merged_requirement_skill_ai_matching.jsonl"
 OUTPUT_ERROR = STEP_DIR / "01_result/99_error_restore_requirement_skill_ai_matching.jsonl"
-DIAGNOSTICS_OUTPUT = STEP_DIR / "02_confirm/confirm_result_restore_and_merge_requirement_skill_ai_matching.txt"
+DIAGNOSTICS_OUTPUT = (
+    STEP_DIR / "02_confirm/diagnostics_restore_and_merge_requirement_skill_ai_matching.txt"
+)
+
+MessageIdPair = Tuple[str, str]
+ComparisonKey = Tuple[str, str, str, str]
 
 
-def build_compare_key_from_diff_record(record: dict) -> Tuple[str, str, str, str]:
-    return (
-        record.get("project_info", {}).get("from", ""),
-        record.get("project_info", {}).get("subject", ""),
-        record.get("resource_info", {}).get("from", ""),
-        record.get("resource_info", {}).get("subject", ""),
-    )
-
-
-def build_compare_key_from_message_ids(
-    project_message_id: str,
-    resource_message_id: str,
-    mail_master: Dict[str, dict],
-) -> Tuple[str, str, str, str]:
-    project_mail = mail_master.get(project_message_id, {})
-    resource_mail = mail_master.get(resource_message_id, {})
-    return (
-        project_mail.get("from", ""),
-        project_mail.get("subject", ""),
-        resource_mail.get("from", ""),
-        resource_mail.get("subject", ""),
-    )
-
-
-def build_compare_key_from_pair(pair: dict, mail_master: Dict[str, dict]) -> Tuple[str, str, str, str]:
-    return build_compare_key_from_message_ids(
-        pair.get("project_info", {}).get("message_id", ""),
-        pair.get("resource_info", {}).get("message_id", ""),
-        mail_master,
-    )
-
-
-def build_message_id_key(record: dict) -> Tuple[str, str]:
+def build_message_id_key(record: dict) -> MessageIdPair:
     return (
         record.get("project_info", {}).get("message_id", ""),
         record.get("resource_info", {}).get("message_id", ""),
     )
 
 
-def normalize_completed_record(
-    record: dict,
-    duplicate_flag: bool,
-) -> Tuple[dict, List[str]]:
+def normalize_new_ai_result(record: dict) -> Tuple[dict, List[str]]:
+    """07-1正常結果を merged スキーマへ正規化する。"""
     project_info = record.get("project_info") or {}
     resource_info = record.get("resource_info") or {}
     project_message_id = project_info.get("message_id", "")
     resource_message_id = resource_info.get("message_id", "")
-    required_skills = project_info.get("required_skills", record.get("required_skills"))
-    optional_skills = project_info.get("optional_skills", record.get("optional_skills"))
+    required_skills = record.get("required_skills", project_info.get("required_skills"))
+    optional_skills = record.get("optional_skills", project_info.get("optional_skills"))
 
     errors: List[str] = []
     if not project_message_id:
@@ -117,112 +95,89 @@ def normalize_completed_record(
         "resource_info": {
             "message_id": resource_message_id,
         },
-        "duplicate_proposal_check": duplicate_flag,
+        "duplicate_proposal_check": False,
     }
-
     if "evaluation_meta" in record:
         normalized["evaluation_meta"] = record["evaluation_meta"]
 
     return normalized, errors
 
 
-def build_error_record(
-    pair: dict,
-    error_type: str,
-    error_message: str,
-    compare_key: Tuple[str, str, str, str],
-) -> dict:
-    return {
+def build_restored_record(cache_entry: dict, message_key: MessageIdPair) -> dict:
+    """Cache HIT の評価結果を今回runのmessage_idへrebindしたmergedレコードを作る。"""
+    record = {
         "project_info": {
-            "message_id": pair.get("project_info", {}).get("message_id", ""),
+            "message_id": message_key[0],
+            "required_skills": cache_entry.get("required_skills", []),
+            "optional_skills": cache_entry.get("optional_skills", []),
         },
         "resource_info": {
-            "message_id": pair.get("resource_info", {}).get("message_id", ""),
+            "message_id": message_key[1],
         },
-        "duplicate_proposal_check": pair.get("duplicate_proposal_check"),
-        "compare_key": {
-            "project_from": compare_key[0],
-            "project_subject": compare_key[1],
-            "resource_from": compare_key[2],
-            "resource_subject": compare_key[3],
-        },
+        "duplicate_proposal_check": True,
+    }
+    if "evaluation_meta" in cache_entry:
+        record["evaluation_meta"] = cache_entry["evaluation_meta"]
+    return record
+
+
+def build_error_record(
+    project_message_id: str,
+    resource_message_id: str,
+    duplicate_flag,
+    error_type: str,
+    error_message: str,
+    compare_key: ComparisonKey,
+) -> dict:
+    return {
+        "project_info": {"message_id": project_message_id},
+        "resource_info": {"message_id": resource_message_id},
+        "duplicate_proposal_check": duplicate_flag,
+        "compare_key": comparison_key_to_dict(compare_key),
         "error_type": error_type,
         "error_message": error_message,
     }
 
 
-def append_queue(
-    queue_map: DefaultDict[Tuple[str, str, str, str], List[dict]],
-    key: Tuple[str, str, str, str],
-    record: dict,
-) -> None:
-    queue_map[key].append(record)
-
-
-def append_message_queue(
-    queue_map: DefaultDict[Tuple[str, str], List[dict]],
-    key: Tuple[str, str],
-    record: dict,
-) -> None:
-    queue_map[key].append(record)
-
-
-def update_backup_safely(merged_file: Path, backup_file: Path, logger) -> None:
-    tmp_file = backup_file.with_suffix(".jsonl.tmp")
-    shutil.copy2(str(merged_file), str(tmp_file))
-    tmp_file.replace(backup_file)
-    logger.info("次回用バックアップを merged 完成版で更新")
-
-
-def format_compare_key(compare_key: Tuple[str, str, str, str]) -> str:
-    return (
-        f"project_from={compare_key[0]} / project_subject={compare_key[1]} / "
-        f"resource_from={compare_key[2]} / resource_subject={compare_key[3]}"
-    )
-
-
 def write_restore_diagnostics(
-    duplicate_pairs: List[dict],
-    restored_records: List[dict],
-    errors: List[dict],
-    backup_record_count: int,
-    duplicate_message_key_hit_count: int,
-    duplicate_compare_key_hit_count: int,
-    unresolved_restore_items: List[dict],
+    diff_total: int,
+    hit_pair_count: int,
+    miss_pair_count: int,
+    restored_count: int,
+    new_used_count: int,
+    merged_count: int,
+    diff_error_count: int,
+    other_error_count: int,
+    cache_count_before: int,
+    cache_stats: Dict[str, int],
+    unresolved_items: List[dict],
 ) -> None:
-    restore_source_not_found_count = sum(
-        1 for error in errors if error.get("error_type") == "restore_source_not_found"
-    )
-    if len(duplicate_pairs) == len(restored_records):
-        verdict = "復元対象はすべて復元済みです。"
-    elif duplicate_message_key_hit_count == 0 and duplicate_compare_key_hit_count == 0:
-        verdict = "復元元バックアップに対象キーが存在しないため復元不可です。"
-    else:
-        verdict = "復元元バックアップに一部キーが存在します。未復元分は99_errorの具体理由を確認してください。"
-
     lines = [
         "=== 08-1_restore_and_merge_requirement_skill_ai_matching diagnostics ===",
         "",
-        f"duplicate_pairs 件数: {len(duplicate_pairs)}",
-        f"restored_records 件数: {len(restored_records)}",
-        f"restore_source_not_found 件数: {restore_source_not_found_count}",
-        f"bk_merged_requirement_skill_ai_matching.jsonl 件数: {backup_record_count}",
-        f"duplicate_pairs の message_id_pair が bk_merged に存在した件数: {duplicate_message_key_hit_count}",
-        f"duplicate_pairs の from/subject compare_key が bk_merged に存在した件数: {duplicate_compare_key_hit_count}",
-        f"判定: {verdict}",
+        f"今回 diff_file 件数              : {diff_total}",
+        f"Cache HIT(06-80重複) 件数        : {hit_pair_count}",
+        f"Cache MISS(06-80新規) 件数       : {miss_pair_count}",
+        f"Success Cacheから復元した件数    : {restored_count}",
+        f"07-1正常結果を採用した件数       : {new_used_count}",
+        f"merged 件数                      : {merged_count}",
+        f"diff由来 error 件数              : {diff_error_count}",
+        f"その他 error 件数                : {other_error_count}",
+        f"merged + diff由来error           : {merged_count + diff_error_count}",
+        f"実行前 Success Cache 件数        : {cache_count_before}",
+        f"upsert後 Success Cache 件数      : {cache_stats.get('after_count', cache_count_before)}",
+        f"upsert 追加 / 更新               : "
+        f"{cache_stats.get('inserted', 0)} / {cache_stats.get('updated', 0)}",
         "",
-        "復元できなかった先頭10件:",
+        "解決できなかった先頭10件:",
     ]
-    if not unresolved_restore_items:
+    if not unresolved_items:
         lines.append("- なし")
-    for item in unresolved_restore_items[:10]:
-        message_key = item["message_key"]
-        compare_key = item["compare_key"]
+    for item in unresolved_items[:10]:
         lines.append(
-            f"- message_id_pair={message_key[0]} / {message_key[1]} | "
-            f"message_id_pair_in_bk={item['message_key_exists']} | "
-            f"compare_key_in_bk={item['compare_key_exists']} | "
-            f"{format_compare_key(compare_key)}"
+            f"- error_type={item['error_type']} | "
+            f"message_id_pair={item['message_key'][0]} / {item['message_key'][1]} | "
+            f"{format_comparison_key(item['compare_key'])}"
         )
 
     DIAGNOSTICS_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +194,6 @@ def main() -> None:
         new_pairs = read_jsonl_as_list(str(INPUT_NEW_PAIRS))
         new_ai_results = read_jsonl_as_list(str(INPUT_NEW_AI_RESULT))
         diff_records = read_jsonl_as_list(str(INPUT_DIFF_FILE))
-        mail_master = read_jsonl_as_dict(str(INPUT_MAIL_MASTER), key="message_id")
 
         logger.info(
             "入力件数: "
@@ -247,236 +201,221 @@ def main() -> None:
             f"07-1新規結果={len(new_ai_results)} diff_file={len(diff_records)}"
         )
 
-        errors: List[dict] = []
-        restored_records: List[dict] = []
+        # Success Cache（不整合時は例外で停止）
+        success_cache = load_success_cache(str(SUCCESS_CACHE_FILE))
+        cache_count_before = len(success_cache)
+        logger.info(f"Success Cache件数={cache_count_before}")
 
-        new_result_queues: DefaultDict[Tuple[str, str, str, str], List[dict]] = defaultdict(list)
+        errors: List[dict] = []
+        unresolved_items: List[dict] = []
+
+        # 06-80の仕分け結果（HIT/MISS）を message_id ペアで引く
+        hit_message_keys = {build_message_id_key(pair) for pair in duplicate_pairs}
+        miss_message_keys = {build_message_id_key(pair) for pair in new_pairs}
+
+        # 07-1正常結果を message_id ペアで引けるようにする
+        new_result_queues: DefaultDict[MessageIdPair, List[dict]] = defaultdict(list)
         for record in new_ai_results:
-            normalized, normalize_errors = normalize_completed_record(record, duplicate_flag=False)
-            key = build_compare_key_from_message_ids(
-                normalized["project_info"]["message_id"],
-                normalized["resource_info"]["message_id"],
-                mail_master,
-            )
+            normalized, normalize_errors = normalize_new_ai_result(record)
+            message_key = build_message_id_key(normalized)
             if normalize_errors:
                 errors.append(
                     build_error_record(
-                        normalized,
+                        message_key[0],
+                        message_key[1],
+                        False,
                         "invalid_new_ai_result",
                         " / ".join(normalize_errors),
-                        key,
+                        ("", "", "", ""),
                     )
                 )
                 continue
-            append_queue(new_result_queues, key, normalized)
-
-        previous_completed_queues: DefaultDict[Tuple[str, str, str, str], List[dict]] = defaultdict(list)
-        previous_completed_message_queues: DefaultDict[Tuple[str, str], List[dict]] = defaultdict(list)
-        previous_completed_message_keys = set()
-        previous_completed_compare_keys = set()
-        previous_completed_records_count = 0
-        if BACKUP_COMPLETED_RESULT.exists():
-            previous_completed_records = read_jsonl_as_list(str(BACKUP_COMPLETED_RESULT))
-            previous_completed_records_count = len(previous_completed_records)
-            logger.info(f"前回完成版バックアップ件数={len(previous_completed_records)}")
-            for record in previous_completed_records:
-                normalized, normalize_errors = normalize_completed_record(record, duplicate_flag=True)
-                message_key = build_message_id_key(normalized)
-                key = build_compare_key_from_message_ids(
-                    normalized["project_info"]["message_id"],
-                    normalized["resource_info"]["message_id"],
-                    mail_master,
-                )
-                if normalize_errors:
-                    errors.append(
-                        build_error_record(
-                            normalized,
-                            "invalid_backup_completed_record",
-                            " / ".join(normalize_errors),
-                            key,
-                        )
-                    )
-                    continue
-                append_queue(previous_completed_queues, key, normalized)
-                append_message_queue(previous_completed_message_queues, message_key, normalized)
-                previous_completed_message_keys.add(message_key)
-                previous_completed_compare_keys.add(key)
-        else:
-            logger.warn("前回完成版バックアップが存在しません")
-
-        duplicate_message_key_hit_count = 0
-        duplicate_compare_key_hit_count = 0
-        unresolved_restore_items: List[dict] = []
-        for pair in duplicate_pairs:
-            message_key = build_message_id_key(pair)
-            compare_key = build_compare_key_from_pair(pair, mail_master)
-            message_key_exists = message_key in previous_completed_message_keys
-            compare_key_exists = compare_key in previous_completed_compare_keys
-            if message_key_exists:
-                duplicate_message_key_hit_count += 1
-            if compare_key_exists:
-                duplicate_compare_key_hit_count += 1
-            queue = previous_completed_message_queues.get(message_key, [])
-            restore_key_type = "message_id_pair"
-            if not queue:
-                queue = previous_completed_queues.get(compare_key, [])
-                restore_key_type = "from_subject_compare_key"
-            if not queue:
-                reason = (
-                    "前回完成版バックアップに一致キーが存在しない "
-                    f"(message_id_pair={message_key[0]} / {message_key[1]} は"
-                    f"{'存在' if message_key in previous_completed_message_keys else '未存在'}, "
-                    "from/subject比較キーも未一致)"
-                )
-                if not BACKUP_COMPLETED_RESULT.exists():
-                    reason = "前回完成版バックアップが存在しないため復元不可"
-                unresolved_restore_items.append(
-                    {
-                        "message_key": message_key,
-                        "compare_key": compare_key,
-                        "message_key_exists": message_key_exists,
-                        "compare_key_exists": compare_key_exists,
-                    }
-                )
-                errors.append(
-                    build_error_record(
-                        pair,
-                        "restore_source_not_found",
-                        reason,
-                        compare_key,
-                    )
-                )
-                continue
-
-            restored = dict(queue.pop(0))
-            if restore_key_type == "message_id_pair":
-                compare_queue = previous_completed_queues.get(compare_key, [])
-                for index, candidate in enumerate(compare_queue):
-                    if build_message_id_key(candidate) == message_key:
-                        compare_queue.pop(index)
-                        break
-            restored["duplicate_proposal_check"] = True
-            restored["restore_key_type"] = restore_key_type
-            restored_records.append(restored)
+            new_result_queues[message_key].append(normalized)
 
         merged_records: List[dict] = []
-        restored_queue_for_merge: DefaultDict[Tuple[str, str, str, str], List[dict]] = defaultdict(list)
-        for record in restored_records:
-            append_queue(
-                restored_queue_for_merge,
-                build_compare_key_from_message_ids(
-                    record["project_info"]["message_id"],
-                    record["resource_info"]["message_id"],
-                    mail_master,
-                ),
-                record,
-            )
+        restored_records: List[dict] = []
+        cache_upsert_entries: List[dict] = []
+        diff_error_count = 0
+        new_used_count = 0
 
         for diff_record in diff_records:
-            key = build_compare_key_from_diff_record(diff_record)
+            message_key = build_message_id_key(diff_record)
+            comparison_key = comparison_key_from_diff_record(diff_record)
 
-            if restored_queue_for_merge.get(key):
-                merged_records.append(restored_queue_for_merge[key].pop(0))
+            if message_key in hit_message_keys:
+                cache_entry = success_cache.get(comparison_key)
+                if cache_entry is None:
+                    diff_error_count += 1
+                    errors.append(
+                        build_error_record(
+                            message_key[0],
+                            message_key[1],
+                            True,
+                            "cache_hit_source_not_found",
+                            "06-80が重複判定したがSuccess Cacheに該当comparison_keyがない",
+                            comparison_key,
+                        )
+                    )
+                    unresolved_items.append(
+                        {
+                            "error_type": "cache_hit_source_not_found",
+                            "message_key": message_key,
+                            "compare_key": comparison_key,
+                        }
+                    )
+                    continue
+
+                restored = build_restored_record(cache_entry, message_key)
+                merged_records.append(restored)
+
+                audit_record = dict(restored)
+                audit_record["restore_key_type"] = "success_cache_comparison_key"
+                audit_record["restore_source_message_ids"] = cache_entry.get(
+                    "source_message_ids", {}
+                )
+                restored_records.append(audit_record)
                 continue
 
-            if new_result_queues.get(key):
-                merged_records.append(new_result_queues[key].pop(0))
+            if message_key not in miss_message_keys:
+                diff_error_count += 1
+                errors.append(
+                    build_error_record(
+                        message_key[0],
+                        message_key[1],
+                        None,
+                        "pair_route_unknown",
+                        "diff_fileのペアが06-80の新規/重複どちらにも存在しない",
+                        comparison_key,
+                    )
+                )
+                unresolved_items.append(
+                    {
+                        "error_type": "pair_route_unknown",
+                        "message_key": message_key,
+                        "compare_key": comparison_key,
+                    }
+                )
                 continue
 
-            errors.append(
-                build_error_record(
-                    diff_record,
-                    "merge_source_not_found",
-                    "今回 diff_file のキーに対応する新規結果/復元結果が存在しない",
-                    key,
+            queue = new_result_queues.get(message_key)
+            if not queue:
+                diff_error_count += 1
+                errors.append(
+                    build_error_record(
+                        message_key[0],
+                        message_key[1],
+                        False,
+                        "new_ai_result_not_found",
+                        "Cache MISSペアに対応する07-1正常結果が存在しない（07-1 error等）",
+                        comparison_key,
+                    )
+                )
+                unresolved_items.append(
+                    {
+                        "error_type": "new_ai_result_not_found",
+                        "message_key": message_key,
+                        "compare_key": comparison_key,
+                    }
+                )
+                continue
+
+            normalized = queue.pop(0)
+            merged_records.append(normalized)
+            new_used_count += 1
+
+            cache_upsert_entries.append(
+                build_cache_entry(
+                    comparison_key,
+                    message_key[0],
+                    message_key[1],
+                    normalized["project_info"]["required_skills"],
+                    normalized["project_info"]["optional_skills"],
+                    normalized.get("evaluation_meta", {}),
                 )
             )
 
-        for key, queue in new_result_queues.items():
-            for record in queue:
+        for message_key, queue in new_result_queues.items():
+            for _ in queue:
                 errors.append(
                     build_error_record(
-                        record,
+                        message_key[0],
+                        message_key[1],
+                        False,
                         "unused_new_ai_result",
-                        "07-1 新規結果が diff_file に対応付けできなかった",
-                        key,
-                    )
-                )
-
-        for key, queue in restored_queue_for_merge.items():
-            for record in queue:
-                errors.append(
-                    build_error_record(
-                        record,
-                        "unused_restored_result",
-                        "復元結果が diff_file に対応付けできなかった",
-                        key,
+                        "07-1 正常結果が今回diff_fileに対応付けできなかった",
+                        ("", "", "", ""),
                     )
                 )
 
         write_jsonl(str(OUTPUT_RESTORED), restored_records)
         write_jsonl(str(OUTPUT_MERGED), merged_records)
         write_jsonl(str(OUTPUT_ERROR), errors)
-        write_restore_diagnostics(
-            duplicate_pairs,
-            restored_records,
-            errors,
-            previous_completed_records_count,
-            duplicate_message_key_hit_count,
-            duplicate_compare_key_hit_count,
-            unresolved_restore_items,
-        )
 
-        expected_total = len(new_pairs) + len(duplicate_pairs)
         diff_total = len(diff_records)
         merged_total = len(merged_records)
         restored_total = len(restored_records)
         error_total = len(errors)
-        diff_gap = diff_total - merged_total
+        other_error_count = error_total - diff_error_count
 
         logger.info(
             "集計: "
-            f"新規結果件数={len(new_ai_results)} "
-            f"復元件数={restored_total} "
-            f"merged件数={merged_total} "
-            f"error件数={error_total} "
-            f"diff_file総件数={diff_total} "
-            f"差分件数={diff_gap}"
+            f"復元={restored_total} 07-1採用={new_used_count} merged={merged_total} "
+            f"error={error_total}（うちdiff由来={diff_error_count}） diff_file総件数={diff_total}"
         )
 
         if merged_total <= 0:
             raise RuntimeError(
                 "全件完成版の整合性エラー: merged が 0 件のため後続stepへ渡せません "
-                f"(期待件数={expected_total} diff_file総件数={diff_total} errors={error_total})"
+                f"(diff_file総件数={diff_total} errors={error_total})"
             )
 
-        if diff_gap != 0 and error_total == 0:
+        if merged_total + diff_error_count != diff_total:
             raise RuntimeError(
-                "全件完成版の整合性エラー: diff_file総件数との差分があるのに error が 0 件です "
-                f"(期待件数={expected_total} diff_file総件数={diff_total} "
-                f"merged={merged_total} restored={restored_total} errors={error_total})"
+                "全件完成版の整合性エラー: merged + diff由来error が diff_file総件数と一致しません "
+                f"(merged={merged_total} diff由来error={diff_error_count} diff_file総件数={diff_total})"
             )
 
         if error_total > 0:
             logger.warn(
                 "一部エラーを 99_error に退避して続行: "
-                f"merged件数={merged_total} error件数={error_total} 差分件数={diff_gap}"
+                f"merged件数={merged_total} error件数={error_total}"
             )
 
-        if merged_total > 0 and error_total == 0:
-            update_backup_safely(OUTPUT_MERGED, BACKUP_COMPLETED_RESULT, logger)
-        elif error_total > 0:
-            logger.warn("error が存在するため次回用バックアップ更新をスキップ")
+        # 部分errorでも今回07-1正常結果だけはSuccess Cacheへupsertする（自己回復型）
+        cache_stats: Dict[str, int] = {}
+        if cache_upsert_entries:
+            cache_stats = upsert_success_cache(
+                str(SUCCESS_CACHE_FILE), cache_upsert_entries
+            )
+            logger.info(
+                "Success Cache upsert: "
+                f"対象={len(cache_upsert_entries)} 追加={cache_stats['inserted']} "
+                f"更新={cache_stats['updated']} "
+                f"件数 {cache_stats['before_count']} -> {cache_stats['after_count']}"
+            )
         else:
-            logger.warn("merged_requirement_skill_ai_matching.jsonl が 0 件のためバックアップ更新をスキップ")
+            logger.warn("今回07-1正常結果が0件のためSuccess Cache upsertをスキップ")
+
+        write_restore_diagnostics(
+            diff_total,
+            len(hit_message_keys),
+            len(miss_message_keys),
+            restored_total,
+            new_used_count,
+            merged_total,
+            diff_error_count,
+            other_error_count,
+            cache_count_before,
+            cache_stats,
+            unresolved_items,
+        )
 
         elapsed = time.time() - start_time
         write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, merged_total)
         logger.ok(
             "処理完了: "
-            f"新規結果={len(new_ai_results)} 復元={restored_total} "
-            f"merged={merged_total} errors={error_total} "
-            f"diff_file総件数={diff_total} 差分件数={diff_gap}"
+            f"復元={restored_total} 07-1採用={new_used_count} merged={merged_total} "
+            f"errors={error_total} diff_file総件数={diff_total}"
         )
 
     except Exception as e:
