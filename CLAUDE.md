@@ -30,11 +30,16 @@ Skill実体は `.agents/skills/`。`.claude/skills/` はそこへのsymlink。
 
 ## Permission
 
-`.claude/settings.local.json` で制御する。
+| ファイル | 役割 |
+|---|---|
+| `.claude/settings.json` | Pipeline共通のPermission（allow / ask / deny / additionalDirectories） |
+| `.claude/settings.local.json` | 個人・環境依存（model / defaultMode など）のみ |
 
-- **自走してよい**: workspace内の調査・編集、Python実行、focused test、pytest、confirm、
-  正規sync/git処理、Git read-only、通常commit/push
-- **人間確認 / 禁止**: force push、reset --hard、git clean等の大量削除、
+共通Permissionを `settings.local.json` に書かない（二重管理禁止）。
+
+- **自走してよい**: workspace内の調査・編集、可逆なファイル操作（mkdir / touch / cp / mv）、
+  Python実行、focused test、pytest、confirm、正規sync/git処理、Git read-only、通常commit/push
+- **人間確認 / 禁止**: rm系、force push、reset --hard、git clean、
   AWS変更操作、production設定変更、秘密情報取得、復旧困難な操作
 
 ---

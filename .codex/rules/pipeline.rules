@@ -1,0 +1,24 @@
+# Codex execpolicy rules (project scope) — Codex CLI 0.147.0
+#
+# 目的:
+#   - 正規sync/gitスクリプトだけを無確認で自走可能にする
+#   - 破壊的なGit操作を禁止する
+#
+# 有効な decision は allow / prompt / forbidden の3種のみ（0.147.0で実測確認済み）。
+# 本ファイルは `codex execpolicy check --rules <path> <command...>` で検証できる。
+#
+# 制約（既知）:
+#   prefix_rule は argv の先頭一致で判定するため、
+#   `bash -lc "git push --force"` のようにシェル経由で包まれた場合は一致しない。
+#   最終的な破壊操作の防止は「スクリプトにforce push機能を持たせない」設計側で担保する。
+
+# --- 正規sync/git経路のみ自走を許可 ---
+prefix_rule(pattern=["/home/ec2-user/bin/pipeline_sync_git.sh"], decision="allow")
+prefix_rule(pattern=["/home/ec2-user/pipeline_ses_steps/tools/pipeline_sync_git.sh"], decision="allow")
+
+# --- 破壊的Git操作は禁止 ---
+prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "--force-with-lease"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "-f"], decision="forbidden")
+prefix_rule(pattern=["git", "reset", "--hard"], decision="forbidden")
+prefix_rule(pattern=["git", "clean"], decision="forbidden")

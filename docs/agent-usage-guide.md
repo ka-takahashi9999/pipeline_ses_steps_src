@@ -99,7 +99,20 @@ default・`*_source` / 副作用 / 冪等性 / 再実行耐性 / 将来事故 �
 
 # ファイル削除も反映する（指定ディレクトリ配下限定）
 /home/ec2-user/bin/pipeline_sync_git.sh --prune -m "Reorganize skills" .agents/skills
+
+# 正本と実行用コピーの一致確認
+/home/ec2-user/bin/pipeline_sync_git.sh --self-check
 ```
+
+スクリプトの配置:
+
+| 役割 | パス |
+|---|---|
+| 正本（Git管理対象） | `pipeline_ses_steps/tools/pipeline_sync_git.sh` |
+| 実行用コピー | `/home/ec2-user/bin/pipeline_sync_git.sh` |
+
+スクリプトを直したいときは**正本を編集** → `cp -p` で実行用へ反映 → `--self-check` で確認 →
+正規経路で `tools` を `_src` へ同期、の順で行う。
 
 - 対象パスの明示が必須（全同期はしない）
 - 生成物（`01_result/` `02_confirm/` `99_execution_time/` `*.jsonl` 等）は自動除外
@@ -125,6 +138,7 @@ default・`*_source` / 副作用 / 冪等性 / 再実行耐性 / 将来事故 �
 
 Agentは以下を自走しない。依頼者が判断する。
 
+- `rm` などの削除操作（`mkdir` / `touch` / `cp` / `mv` のような可逆操作は自走する）
 - force push / `reset --hard` / `git clean` などの破壊操作
 - AWS変更操作、production設定変更
 - 秘密情報の取得

@@ -10,4 +10,8 @@ approval_policy = "on-request"
 [shell_environment_policy]
 include_only = ["PATH", "HOME"]
 
+# execpolicy rules: .codex/rules/pipeline.rules
+#   正規sync/gitスクリプトのみ allow、破壊的Git操作は forbidden
+#   検証: codex execpolicy check --rules .codex/rules/pipeline.rules <command...>
+#
 # TODO: approvals_reviewer = "auto_review" は 0.147.0 で有効か未確認のため未採用

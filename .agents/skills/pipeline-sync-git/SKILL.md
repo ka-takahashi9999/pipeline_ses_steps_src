@@ -15,13 +15,23 @@ Git管理リポジトリ `/home/ec2-user/pipeline_ses_steps_src` へ反映する
 ## 正規経路
 
 ```bash
-/home/ec2-user/bin/pipeline_sync_git.sh [--dry-run] [--no-push] [-m "message"] <対象パス>...
+/home/ec2-user/bin/pipeline_sync_git.sh [--dry-run] [--no-push] [--prune] [-m "message"] <対象パス>...
 ```
 
+スクリプトの配置:
+
+| 役割 | パス |
+|---|---|
+| 正本（Git管理対象） | `pipeline_ses_steps/tools/pipeline_sync_git.sh` |
+| 実行用コピー | `/home/ec2-user/bin/pipeline_sync_git.sh` |
+
+- スクリプトを修正するときは**正本を編集**し、`cp -p` で実行用コピーへ反映する
+- 一致確認: `/home/ec2-user/bin/pipeline_sync_git.sh --self-check`
 - 対象パスは `pipeline_ses_steps` からの相対パスで**明示列挙**する
 - 全同期はデフォルトにしない
 - `..` / 絶対パス / シンボリックリンク越えは拒否される
 - 生成物（`01_result/` `02_confirm/` `99_execution_time/` `*.jsonl` `nohup.out` 等）は除外される
+- `--prune` は指定した**ディレクトリ配下限定**で、SRCに無いファイルを `_src` から削除する
 
 ## 手順
 

@@ -85,15 +85,29 @@ Claude / Codex で内容が分岐しないことを構造で保証する。
 
 ### Claude Code
 
-`.claude/settings.local.json` で制御。
+設定は shared / local に分離する。**Permissionを二重管理しない。**
+
+| ファイル | 役割 | 内容 |
+|---|---|---|
+| `.claude/settings.json` | Pipeline共通（Git管理） | `allow` / `ask` / `deny` / `additionalDirectories` |
+| `.claude/settings.local.json` | 個人・環境依存（Git管理外） | `model` / `defaultMode` などのローカル差分のみ |
 
 - **allow（自走）**: workspace内 Read/Edit/Write、`python3` / `python`、`pytest`、
-  `python3 -m py_compile`、`ls` / `cat` / `grep` / `find` / `head` / `tail` / `wc` / `diff`、
-  `bash -n`、confirmスクリプト実行、`/home/ec2-user/bin/pipeline_sync_git.sh`、
-  Git read-only（`git status` / `git diff` / `git log` / `git show` / `git ls-files`）、
+  `ls` / `cat` / `grep` / `find` / `head` / `tail` / `wc` / `diff` / `sha256sum`、`bash -n`、
+  **可逆なファイル操作（`mkdir` / `touch` / `cp` / `mv`）**、`chmod +x` / `ln -s`、
+  `pipeline_sync_git.sh`、Git read-only（`status` / `diff` / `log` / `show` / `ls-files`）、
   通常 `git add` / `git commit` / `git push`
-- **ask / deny**: `git push --force*`、`git reset --hard`、`git clean`、`rm -rf`、
-  `aws` 変更操作、SSMからの秘密情報取得、`sudo`
+- **ask**: `rm` / `rmdir`、`git checkout` / `restore` / `rebase`、`aws`、`systemctl`、`crontab -e`
+- **deny**: `git push --force*` / `git push -f`、`git reset --hard`、`git clean`、`sudo`、
+  `aws ssm get-parameter` / `put-parameter`
+
+`mv` / `cp` は Autonomy First の観点で allow とした。
+Permissionパターンでは「workspace内か外か」を安全に判別できないため、
+そこに複雑なルールは足さず、**不可逆な操作（`rm` 系・force push・reset --hard・clean）を
+ask / deny で押さえる**方針で担保する。
+
+`additionalDirectories` は実行用スクリプトのある `/home/ec2-user/bin` のみ。
+`_src` は `Read(//home/ec2-user/**)` による読取と、正規経路経由のGit操作のみとする。
 
 `defaultMode` は `acceptEdits`。Claude `auto` mode / Claude Sandbox は今回は導入しない（Phase 2）。
 
@@ -120,6 +134,25 @@ approval_policy = "on-request"
 `_src` への直接書込がsandboxレベルでblockされることは、
 「_src で直接実装しない」という設計と一致する。同期はsandbox外の正規経路で行う。
 
+#### execpolicy rules（採用）
+
+`.codex/rules/pipeline.rules` を追加した。
+project scopeの `.rules` が読み込まれることは `codex exec --help` の
+`--ignore-rules: Do not load user or project execpolicy .rules files` で確認済み。
+
+```
+prefix_rule(pattern=["/home/ec2-user/bin/pipeline_sync_git.sh"], decision="allow")
+prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
+...
+```
+
+- 有効な `decision` は **`allow` / `prompt` / `forbidden` の3種のみ**（`deny` / `ask` はparse error）。実測確認済み
+- 検証は `codex execpolicy check --rules .codex/rules/pipeline.rules <command...>` で行える
+- 許可するのは**正規sync/gitスクリプトのみ**。`git push` 単体などは rule 未一致 →
+  通常の `approval_policy = "on-request"` に従う
+- 既知の限界: `prefix_rule` は argv 先頭一致のため、`bash -lc "git push --force"` のように
+  シェルで包まれた場合は一致しない。最終的な担保はスクリプト側（force push機能を持たない）で行う
+
 ---
 
 ## 5. 正規sync/git経路
@@ -131,8 +164,21 @@ approval_policy = "on-request"
 `--prune` は**指定したディレクトリ配下に限り**、SRC側に存在しないファイルを `_src` から削除する
 （ファイル削除・リネームを反映したい場合のみ使う。指定しなければ削除は一切行わない）。
 
-本スクリプトは `~/bin` 配下にあり、Git管理対象外。
-バックアップが必要な場合は別途保全すること（Phase 2で管理方法を検討）。
+### スクリプトの正本と実行用コピー
+
+```
+pipeline_ses_steps/tools/pipeline_sync_git.sh   ← 正本（Git管理対象）
+        │ cp -p
+        ▼
+/home/ec2-user/bin/pipeline_sync_git.sh          ← 実行用コピー（PATH上、Git管理外）
+        │ 正規同期経路
+        ▼
+pipeline_ses_steps_src/tools/pipeline_sync_git.sh ← GitHubへpush
+```
+
+- 修正は**必ず正本側**で行い、`cp -p` で実行用コピーへ反映する（本文は二重管理しない）
+- 一致確認: `pipeline_sync_git.sh --self-check`（sha256照合）
+- 通常実行時も不一致を検出したら警告を出す（実行自体は止めない）
 
 流れ:
 
@@ -153,6 +199,7 @@ approval_policy = "on-request"
 - **全同期をデフォルトにしない**（対象パス必須）
 - 生成物除外（`01_result/` `02_confirm/` `99_execution_time/` `__pycache__/`
   `*.jsonl` `*.json` `*.log` `nohup.out` `settings.local.json`）
+- 例外的にGit管理する設定は `INCLUDE_ALWAYS`（現在 `.claude/settings.json` のみ）で明示する
 - `..` / 絶対パス / SRC外を指すsymlinkを拒否
 - `_src` に想定外の変更があれば何も変更せず停止
 - `git add` は対象限定（`git add .` はしない）
@@ -171,6 +218,7 @@ approval_policy = "on-request"
 |---|---|
 | Claude `auto` mode | 今回未導入。自走範囲を運用で確認してから検討 |
 | Claude Sandbox | 今回未導入。workspace限定実行の追加防御として検討 |
-| Codex `approvals_reviewer = "auto_review"` | **未確認 / 今回は採用しない**。`codex --help` では確認できず、公式仕様が確認できた場合のみ採用 |
+| Codex `approvals_reviewer = "auto_review"` | **未確認 / 今回は採用しない**。キー自体は `~/.codex/config.toml` に `approvals_reviewer = "user"` として実在するが、`auto_review` という値が0.147.0で有効かは軽量な方法では判定できなかった（`-c` 上書きは不正値でもエラーにならず、検証にならない） |
 | Hooks（PostToolUse 等） | 未導入。編集後の自動 `py_compile` / JSONL検証などが候補 |
-| `.codex/rules` 相当の分割 | 未導入。AGENTS.md が肥大化した場合に検討 |
+| `pipeline_sync_git.sh` の自動配布 | 未導入。現状は正本編集 → `cp -p` → `--self-check` の手動手順 |
+| execpolicy rules の拡張 | `bash -lc` 経由コマンドへの対応、confirm/pytest等の自走allow追加は運用を見てから検討 |

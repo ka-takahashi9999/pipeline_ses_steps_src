@@ -35,7 +35,13 @@ Gmail取得 → 分類 → 属性抽出 → マッチング → 出力 の順に
 
 **禁止（人間確認が必要）**: `git push --force` / `git reset --hard` / `git clean` / `git add .` などの一括add・破壊操作。
 
-正規経路: `/home/ec2-user/bin/pipeline_sync_git.sh`（詳細は `.agents/skills/pipeline-sync-git/SKILL.md`）
+正規経路:
+
+- 正本（Git管理）: `tools/pipeline_sync_git.sh`
+- 実行用コピー: `/home/ec2-user/bin/pipeline_sync_git.sh`
+- 一致確認: `pipeline_sync_git.sh --self-check`
+
+詳細は `.agents/skills/pipeline-sync-git/SKILL.md`。
 
 生成物（`01_result/` `02_confirm/` `99_execution_time/` `*.json` `*.jsonl` `nohup.out`）はgit管理しない。
 
@@ -51,6 +57,7 @@ Gmail取得 → 分類 → 属性抽出 → マッチング → 出力 の順に
 - **後続stepから前stepを逆参照する設計は禁止**
 - `message_id` をキーとして後続stepへ受け渡す
 - `common/` を必ずimportして使う（独自ユーティリティの新設禁止）
+- `tools/` は運用スクリプトの正本置き場（Pipeline業務ロジックは置かない）
 
 ---
 
