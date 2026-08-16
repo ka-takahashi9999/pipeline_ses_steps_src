@@ -82,6 +82,80 @@ default・`*_source` / 副作用 / 冪等性 / 再実行耐性 / 将来事故 �
 
 ---
 
+## 3.5 CodexでのPipeline調査
+
+### 基本方針
+
+大量ログ解析・複数run比較・横断調査など、**Claude Code と Codex で機能差がない作業は Codex を優先**する。
+Claude Code は実装 / Claude固有設定 / 必要時のセカンドレビューへ寄せる。
+ただしClaude Codeでしかできない作業を無理にCodexへ移さない。
+
+### 依頼のしかた
+
+利用者は自然文で依頼するだけでよい。スクリプト名を指定する必要はない。
+
+```
+直近3runを比較して、
+07-1のerror_type別件数と08-1 merged件数を確認してください。
+read-only調査のみ。
+```
+
+Codex側が内部で `/home/ec2-user/bin/pipeline_aws_readonly.sh` を選択して調査する。
+
+### AWS read-only ラッパー
+
+raw な `aws` CLI は承認対象のままだが、このラッパー経由の read-only 調査は
+**人間のYes/No承認なしで最後まで自走**できる。
+
+| 役割 | パス |
+|---|---|
+| 正本（Git管理対象 / 実行経路にしない） | `pipeline_ses_steps/tools/pipeline_aws_readonly.sh` |
+| 実行用コピー（Codex rulesでallow） | `/home/ec2-user/bin/pipeline_aws_readonly.sh` |
+
+正本と実行用コピーが不一致なら fail-closed（実行禁止）。確認は `--self-check`。
+
+提供する操作（allow list方式・未知subcommandは全拒否・region は `ap-northeast-1` 固定）:
+
+```
+s3-cat <s3-uri>                       S3 → stdout のみ
+s3-ls  <s3-uri> [--recursive] [--human-readable] [--summarize]
+sfn-list-executions [--max-items N] [--status-filter STATUS]
+sfn-describe-execution <execution-arn>
+sfn-get-execution-history <execution-arn> [--max-items N] [--reverse-order]
+ec2-describe-instances [i-xxxx ...]
+ec2-describe-instance-status [i-xxxx ...]
+cloudtrail-lookup-events [--start-time T] [--end-time T] [--max-items N] [--event-name NAME]
+```
+
+S3は `s3://technoverse/pipeline_ses_steps/` 配下のみ。Step Functions はSES Pipelineの
+State Machineのみ。**変更操作（start/stop/rm/put/IAM等）とSSM Parameter Storeの値取得は
+一切実装していない**。これらが必要なときはラッパーを使わず通常の承認フローへ戻す。
+
+使用例:
+
+```bash
+/home/ec2-user/bin/pipeline_aws_readonly.sh \
+  s3-ls s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/ --recursive
+
+/home/ec2-user/bin/pipeline_aws_readonly.sh \
+  s3-cat s3://technoverse/pipeline_ses_steps/pipeline-logs/20260814/sfn-xxxx/pipeline.log
+```
+
+### 大量ログの扱い（Lean Context）
+
+S3ログをそのままモデルcontextへ流し込まない。
+
+```
+S3ログ取得
+→ shell / Python / rg / awk でローカル集計
+→ 件数・分布
+→ 必要な代表例だけモデルへ
+```
+
+pipeline.log は100MB級になることがある。必ずローカルで集計してから扱う。
+
+---
+
 ## 4. 同期 / commit / push
 
 作業は `/home/ec2-user/pipeline_ses_steps` で行い、

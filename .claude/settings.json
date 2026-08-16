@@ -31,6 +31,7 @@
       "Bash(pytest *)",
       "Bash(nohup python3 *)",
       "Bash(/home/ec2-user/bin/pipeline_sync_git.sh *)",
+      "Bash(/home/ec2-user/bin/pipeline_aws_readonly.sh *)",
       "Bash(git status *)",
       "Bash(git diff *)",
       "Bash(git log *)",

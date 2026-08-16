@@ -136,6 +136,23 @@ approval_policy = "on-request"
 `_src` への直接書込がsandboxレベルでblockされることは、
 「_src で直接実装しない」という設計と一致する。同期はsandbox外の正規経路で行う。
 
+#### AWS read-only ラッパー
+
+raw な `aws *` を allow せず、`network_access = true` によるworkspace全体のネットワーク開放も採らない。
+代わりに allow list 方式の read-only ラッパー `tools/pipeline_aws_readonly.sh` を1本用意し、
+**実行用コピー `/home/ec2-user/bin/pipeline_aws_readonly.sh` だけ**を Codex rules で allow する
+（`pipeline_sync_git.sh` と同じ思想：正本はworkspace内で編集可能なため allow しない）。
+
+- allow list方式。未知subcommandは全拒否（fail-closed）
+- ユーザー引数を `eval` / `bash -c` / `sh -c` へ渡さない
+- S3は `s3://technoverse/pipeline_ses_steps/` 配下のみ、`s3-cat` は stdout のみ
+- region は `ap-northeast-1` 固定
+- 変更操作（s3 rm/sync、EC2 start/stop/reboot、SFN start/stop-execution、IAM）と
+  SSM Parameter Store の値取得は**実装しない**
+- 正本と実行用コピーの sha256 不一致時は fail-closed
+
+操作一覧と利用例は `docs/agent-usage-guide.md`。
+
 #### execpolicy rules（採用）
 
 `.codex/rules/pipeline.rules` を追加した。

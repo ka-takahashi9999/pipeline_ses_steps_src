@@ -43,6 +43,17 @@ Gmail取得 → 分類 → 属性抽出 → マッチング → 出力 の順に
 
 詳細は `.agents/skills/pipeline-sync-git/SKILL.md`。
 
+### AWS read-only 調査
+
+AWS read-only のSES Pipeline調査では、raw な `aws` CLI ではなく
+`/home/ec2-user/bin/pipeline_aws_readonly.sh` を優先使用する。
+通常のread-only調査はこの経路で人間承認なしに進める。
+
+AWS変更操作・秘密情報取得（SSM Parameter Storeの値取得等）が必要な場合のみ、
+このラッパーを使わず通常の承認フローへ戻す。
+
+詳細は `docs/agent-usage-guide.md`。
+
 生成物（`01_result/` `02_confirm/` `99_execution_time/` `*.json` `*.jsonl` `nohup.out`）はgit管理しない。
 
 ---

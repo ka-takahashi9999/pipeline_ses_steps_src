@@ -17,6 +17,11 @@
 # 「正本を書き換えて sandbox 外で無確認実行」という経路を作らないこと。
 prefix_rule(pattern=["/home/ec2-user/bin/pipeline_sync_git.sh"], decision="allow")
 
+# --- AWS read-only 調査経路（実行用コピーのみ）---
+# allow list方式のラッパー。変更操作・秘密情報取得は未実装。
+# raw な aws / /usr/bin/aws は allow しない。
+prefix_rule(pattern=["/home/ec2-user/bin/pipeline_aws_readonly.sh"], decision="allow")
+
 # --- 破壊的Git操作は禁止 ---
 prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
 prefix_rule(pattern=["git", "push", "--force-with-lease"], decision="forbidden")
