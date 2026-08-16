@@ -229,7 +229,9 @@ fi
 # ---- 選択同期 ----
 for f in "${FILES[@]}"; do
   mkdir -p "$DST/$(dirname "$f")"
-  cp -Pf "$SRC/$f" "$DST/$f"
+  # 宛先が既存symlink（特にディレクトリへのsymlink）だと cp がその中へ書き込むため、先に外す
+  [ -L "$DST/$f" ] && rm -f "$DST/$f"
+  cp -PfT "$SRC/$f" "$DST/$f"
 done
 info "同期完了: ${#FILES[@]}件"
 
