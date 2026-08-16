@@ -145,21 +145,27 @@ run_step "06-12_filter_required_skills_noise" "$ROOT/06-12_filter_required_skill
 run_step "06-30_match_contract_type" "$ROOT/06-30_match_contract_type/00_tool/match_contract_type.py"
 
 # ──────────────────────────────────────────────────────────────────────
-# 【同じメール集合で 06-80 を再実行する場合】（例: コード修正後の reprocess）
-# 06-80 は前回の diff_file を bk_diff にローテートして重複判定に使う。
-# そのため同一メール集合で再実行すると全ペアが duplicate 扱いになり、
-# 08-1 が bk_merged から旧結果を復元するため、コード変更が反映されない。
-# 下記 2 ファイルを退避してから 06-80 を動かすと、全ペアを新規ルートで流せる。
+# 【06-80 / 07-1 / 08-1 は Success Cache 方式で連携する】
+#   06-80: Success Cache を正本として Cache HIT / MISS を判定する
+#          （前回 diff_file は監査用途のみで、重複判定には使わない）
+#   07-1 : Cache MISS のみ AI評価する
+#   08-1 : Cache HIT 分は Success Cache の評価結果を今回 message_id へ rebind し、
+#          Cache MISS 分は 07-1 の新規成功結果を採用して merge する。
+#          その後、今回の 07-1 正常結果だけを Success Cache へ upsert する
+#          （部分 error でも成功分は反映され、失敗分は次回 Cache MISS で再評価される）。
 #
-# DIFF_FILE="$ROOT/06-80_duplicate_proposal_check/01_result/duplicate_proposal_check_diff_file.jsonl"
-# [ -f "$DIFF_FILE" ] && mv "$DIFF_FILE" "${DIFF_FILE}.bak_$(date +%Y%m%d)"
-# # bk_merged は 08-1 側が最後に上書きするので通常は退避不要。必要なら以下も退避:
-# # BK_MERGED="$ROOT/08-1_restore_and_merge_requirement_skill_ai_matching/01_result/bk_merged_requirement_skill_ai_matching.jsonl"
-# # [ -f "$BK_MERGED" ] && mv "$BK_MERGED" "${BK_MERGED}.bak_$(date +%Y%m%d)"
+# 【同じメール集合で 06-80 を再実行する場合】（例: コード修正後の reprocess）
+# 判定の正本は Success Cache のため、同一メール集合で再実行すると
+# 評価済みペアは Cache HIT となり 07-1 では再評価されない。
+# コード変更を全ペアへ反映したい場合は、下記を退避してから 06-80 を動かす。
+#
+# SUCCESS_CACHE="$ROOT/08-1_restore_and_merge_requirement_skill_ai_matching/01_result/success_cache_requirement_skill_ai_matching.jsonl"
+# [ -f "$SUCCESS_CACHE" ] && mv "$SUCCESS_CACHE" "${SUCCESS_CACHE}.bak_$(date +%Y%m%d)"
+# # bk_merged_requirement_skill_ai_matching.jsonl は legacy HOLD（新処理では read しない）。
 # ──────────────────────────────────────────────────────────────────────
 run_step "06-80_duplicate_proposal_check" "$ROOT/06-80_duplicate_proposal_check/00_tool/duplicate_proposal_check.py"
 
-# 07-1 は LLM使用step。06-80で仕分けた新規ペアのみを処理する。
+# 07-1 は LLM使用step。06-80 で仕分けた Cache MISS（新規）ペアのみを処理する。
 # 07-1 raw版を使う場合はこちら
 #run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" #新規のみ全件
 #run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" --limit 2000 #件数指定(100件を例)

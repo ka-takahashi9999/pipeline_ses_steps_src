@@ -45,6 +45,9 @@ ALLOWED_ERROR_TYPES = {
     "llm_call_error",
     "llm_parse_error",
     "invalid_output_schema",
+    # P0で正式導入済みの失敗系（仕様どおり分類・記録されたerrorとして受理する）
+    "project_skill_count_exceeded",  # スキル40件超skip
+    "llm_output_truncated",  # finish_reason=length 検知
 }
 
 

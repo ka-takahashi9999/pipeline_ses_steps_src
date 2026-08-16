@@ -5,18 +5,20 @@ Success Cache方式の focused test（06-80 / 08-1）
 06-80 と 08-1 の main() を実行して検証する。
 LLM呼び出し・full Pipeline実行は行わない。
 
-【20260814データを使ったreplayの位置づけ】
-実施済みのreplayは「Cache MISS 979件のうち893件が07-1で成功した場合」を仮定した
-08-1ロジック検証であり、実際に893件をLLM再評価した結果ではない。
-そこで得られた merged=2,566 は本番期待値ではない。
+【本番runの期待値（一般式）】
+    run前 Success Cache : C
+    06-80               : HIT = H / MISS = M
+    07-1                : input = M / success = S / error = E   (S + E = M)
+    08-1                : cache restore = H / new success = S /
+                          merged = H + S / error = E
+    run後 Success Cache : C + S(新規キー分)
 
-次回本番runの正しい期待値（S=07-1 success / E=07-1 error）:
-    run前 Success Cache      : 1,673
-    06-80                    : HIT=1,673 / MISS=979
-    07-1                     : input=979 / success=S / error=E / S+E=979
-    08-1                     : cache restore=1,673 / new success=S /
-                               merged=1,673+S / error=E
-    run後 Success Cache      : 1,673+S
+【20260814データを使ったreplayの位置づけ】
+実施済みのreplayは、20260814の入力集合を再利用し、かつ
+「Cache MISSのうち特定件数が07-1で成功した」と仮定した場合の一例にすぎない
+（C=1,673 / H=1,673 / M=979 / S=893・E=86 を仮定 → merged=2,566）。
+実際に893件をLLM再評価した結果ではないため、この数値は本番期待値ではない。
+本番runでは S / E は実際の07-1実行結果に従い、上記一般式で検証すること。
 
 実行:
   python3 08-1_restore_and_merge_requirement_skill_ai_matching/00_tool/test_success_cache_flow.py
