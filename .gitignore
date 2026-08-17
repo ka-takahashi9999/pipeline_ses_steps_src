@@ -1,0 +1,3 @@
+# Python bytecode（sourceから再生成される生成物のためGit管理しない）
+__pycache__/
+*.pyc
