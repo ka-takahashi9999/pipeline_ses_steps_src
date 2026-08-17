@@ -32,6 +32,9 @@ STEP_NAME = "07-1_requirement_skill_ai_matching"
 STEP_DIR = Path(__file__).resolve().parents[1]
 LLM_MODEL = "gpt-4o-mini"
 
+# 表示用note（09-1のメール表示に使う判定根拠）の上限文字数
+NOTE_MAX_CHARS = 30
+
 INPUT_PAIRS = (
     project_root
     / "06-80_duplicate_proposal_check/01_result/duplicate_proposal_check.jsonl"
@@ -151,6 +154,28 @@ def _build_user_prompt(
     )
 
 
+def _normalize_note_lengths(result: List[Any]) -> int:
+    """表示用noteの文字数超過だけを上限文字数へ切り詰める。切り詰めた件数を返す。
+
+    補正対象は「非空の文字列だが NOTE_MAX_CHARS を超えた note」のみ。
+    null / 空文字 / 非文字列 は補正せず、_validate_skills でerrorとして扱う
+    （schema validationは緩めない）。
+    """
+    truncated = 0
+    if not isinstance(result, list):
+        return truncated
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        note = item.get("note")
+        if not isinstance(note, str) or not note.strip():
+            continue
+        if len(note) > NOTE_MAX_CHARS:
+            item["note"] = note[:NOTE_MAX_CHARS]
+            truncated += 1
+    return truncated
+
+
 def _validate_skills(
     original: List[Dict[str, Any]],
     result: List[Any],
@@ -176,8 +201,11 @@ def _validate_skills(
         note = res.get("note")
         if not isinstance(note, str) or not note.strip():
             return f"{field}[{i}]のnoteが空またはnull"
-        if len(note) > 30:
-            return f"{field}[{i}]のnoteが30文字超: {len(note)}文字 '{note}'"
+        if len(note) > NOTE_MAX_CHARS:
+            return (
+                f"{field}[{i}]のnoteが{NOTE_MAX_CHARS}文字超: "
+                f"{len(note)}文字 '{note}'"
+            )
     return None
 
 
@@ -226,10 +254,13 @@ def process_pair(
     project_skills_map: Dict[str, Any],
     skillsheet_map: Dict[str, Any],
     logger: Any,
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     1ペアを処理。
     Returns: (result_record, error_record) — どちらか一方がNoneでない。
+
+    stats を渡すと note_truncated_count（表示用note切り詰め件数）を加算する。
     """
     p_mid = pair.get("project_info", {}).get("message_id", "")
     r_mid = pair.get("resource_info", {}).get("message_id", "")
@@ -295,6 +326,20 @@ def process_pair(
         return None, _make_error(
             p_mid, r_mid, "llm_parse_error",
             "レスポンスにrequired_skills/optional_skillsキーなし",
+        )
+
+    # 表示用noteの文字数超過のみ検証前に正規化（schema検証自体は緩めない）
+    note_truncated = _normalize_note_lengths(res_required)
+    note_truncated += _normalize_note_lengths(res_optional)
+    if note_truncated:
+        if stats is not None:
+            stats["note_truncated_count"] = (
+                stats.get("note_truncated_count", 0) + note_truncated
+            )
+        logger.warn(
+            f"noteが{NOTE_MAX_CHARS}文字超のため切り詰め: {note_truncated}件 "
+            f"p={p_mid} r={r_mid}",
+            message_id=p_mid,
         )
 
     # required_skills 検証
@@ -383,6 +428,7 @@ def main() -> None:
 
     ok_count = 0
     err_count = 0
+    run_stats: Dict[str, int] = {"note_truncated_count": 0}
     start_time = time.time()
 
     for i, pair in enumerate(read_jsonl(str(INPUT_PAIRS))):
@@ -393,7 +439,9 @@ def main() -> None:
         r_mid = pair.get("resource_info", {}).get("message_id", f"idx{i}")
 
         try:
-            result, error = process_pair(pair, project_skills_map, skillsheet_map, logger)
+            result, error = process_pair(
+                pair, project_skills_map, skillsheet_map, logger, run_stats
+            )
         except Exception as e:
             logger.error(f"予期しないエラー pair={i}: {e}", message_id=p_mid)
             error = _make_error(p_mid, r_mid, "llm_call_error", str(e)[:1000])
@@ -422,13 +470,17 @@ def main() -> None:
         "processed_count": total,
         "limit": args.limit,
         "is_limited_run": args.limit is not None,
+        # 表示用note切り詰め件数（run単位の観測用。result JSONLスキーマは変更しない）
+        "note_truncated_count": run_stats["note_truncated_count"],
     }
     with open(OUTPUT_RUN_METADATA, "w", encoding="utf-8") as f:
         json.dump(run_metadata, f, ensure_ascii=False, indent=2)
 
     write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, total)
     logger.info(
-        f"完了 total={total} ok={ok_count} err={err_count} elapsed={elapsed:.1f}s"
+        f"完了 total={total} ok={ok_count} err={err_count} "
+        f"note_truncated_count={run_stats['note_truncated_count']} "
+        f"elapsed={elapsed:.1f}s"
     )
 
 

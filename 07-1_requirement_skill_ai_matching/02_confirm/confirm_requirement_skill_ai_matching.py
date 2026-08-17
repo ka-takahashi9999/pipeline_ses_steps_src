@@ -181,8 +181,25 @@ def main() -> None:
             f"processed_count  : {processed_count}",
             f"limit            : {limit}",
             f"is_limited_run   : {is_limited_run}",
-            "",
         ]
+
+        # note切り詰め件数はrun単位の観測用（旧runのmetadataには無いためoptional扱い）
+        if "note_truncated_count" in run_metadata:
+            note_truncated_count = run_metadata.get("note_truncated_count")
+            lines.append(f"note_truncated   : {note_truncated_count}")
+            if (
+                not isinstance(note_truncated_count, int)
+                or isinstance(note_truncated_count, bool)
+                or note_truncated_count < 0
+            ):
+                msg = (
+                    "[NG] run_metadata.note_truncated_count が0以上のintでない: "
+                    f"{note_truncated_count!r}"
+                )
+                lines.append(msg)
+                errors.append(msg)
+
+        lines.append("")
 
         if meta_input_count != input_count:
             msg = (
