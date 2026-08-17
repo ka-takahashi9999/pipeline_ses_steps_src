@@ -204,6 +204,17 @@ log "=== START run_suggest_and_cleanup ==="
 bash "$ROOT/00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh" 2>&1 | tee -a "$LOG"
 log "=== DONE run_suggest_and_cleanup ==="
 
+# ──────────────────────────────────────────────────────────────────────
+# 09系のローカル保持整理 → Portal同期対象prepare → Portal S3 sync。
+# いずれかが失敗した場合は run_step が非0で exit し、Pipeline FAILED として
+# 既存の StopEC2AfterFailure へ流れる（warningで握りつぶさない）。
+# ──────────────────────────────────────────────────────────────────────
+run_step "80-7_manage_09_result_retention(RUN_DATE=$RUN_DATE)" "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" --apply --run-date "$RUN_DATE"
+
+run_step "80-8_portal_s3_prepare" "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py"
+
+run_step "80-9_portal_s3_sync" "$ROOT/80-9_portal_s3_sync/00_tool/portal_s3_sync.py"
+
 log "########## pipeline end ##########"
 
 ####
