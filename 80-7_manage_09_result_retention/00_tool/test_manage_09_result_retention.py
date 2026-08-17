@@ -94,7 +94,7 @@ class _FakePaginator:
             yield {"Contents": []}
 
 
-def status_document(run_date, run_id, status="SUCCEEDED", exit_code=0, **overrides):
+def status_document(run_date, run_id, status="SUCCEEDED", exit_code=0, overrides=None):
     document = {
         "schema_version": "1.0",
         "run_id": run_id,
@@ -110,7 +110,7 @@ def status_document(run_date, run_id, status="SUCCEEDED", exit_code=0, **overrid
         "log_s3_uri": "s3://x/y",
         "updated_at": f"2026-{run_date[4:6]}-{run_date[6:8]}T12:00:01Z",
     }
-    document.update(overrides)
+    document.update(overrides or {})
     return document
 
 
@@ -122,7 +122,7 @@ def status_objects(entries):
     """entries: [(run_date, run_id, status, exit_code, overrides)]"""
     objects = {}
     for run_date, run_id, status, exit_code, overrides in entries:
-        document = status_document(run_date, run_id, status, exit_code, **overrides)
+        document = status_document(run_date, run_id, status, exit_code, overrides)
         objects[status_key(run_date, run_id)] = json.dumps(document).encode("utf-8")
     return objects
 
@@ -388,6 +388,201 @@ class TestScanValidation(RetentionTestBase):
             / "error_20260418_145453.log"
         )
         self.assertTrue(hold.is_file())
+
+
+class TestStatusSchemaValidation(RetentionTestBase):
+    """
+    99-9_publish_pipeline_status が書く schema_version 1.0 の契約に合わせた検証。
+    1項目でも不正なら成功runとして採用せず、削除もしない。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.build_fixture()
+
+    def assert_rejected(self, objects):
+        self.set_s3(objects)
+        before = self.present_run_dates(self.root, "20260817")
+        with self.assertRaises(target.RetentionError):
+            target.run(self.make_args(self.root, "20260817", apply_mode=True), self.logger)
+        self.assertEqual(self.present_run_dates(self.root, "20260817"), before)
+
+    def test_valid_status_is_adopted(self):
+        self.set_s3(status_objects([("20260814", "sfn-ok", "SUCCEEDED", 0, {})]))
+        summary = target.run(self.make_args(self.root, "20260817"), self.logger)
+        self.assertEqual(summary["previous_successful_run_date"], "20260814")
+
+    def test_null_run_id_is_rejected(self):
+        self.assert_rejected(status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {"run_id": None})]))
+
+    def test_empty_run_id_is_rejected(self):
+        self.assert_rejected(status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {"run_id": "   "})]))
+
+    def test_run_id_mismatch_with_key_is_rejected(self):
+        self.assert_rejected(
+            status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {"run_id": "sfn-other"})])
+        )
+
+    def test_run_date_mismatch_with_key_is_rejected(self):
+        self.assert_rejected(
+            status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {"run_date": "20260813"})])
+        )
+
+    def test_impossible_calendar_date_is_rejected(self):
+        # key側も document側も 20260230（実在しない日付）
+        document = status_document("20260814", "sfn-a")
+        document["run_date"] = "20260230"
+        self.assert_rejected(
+            {status_key("20260230", "sfn-a"): json.dumps(document).encode("utf-8")}
+        )
+
+    def test_unsupported_schema_version_is_rejected(self):
+        self.assert_rejected(
+            status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {"schema_version": "2.0"})])
+        )
+
+    def test_missing_schema_version_is_rejected(self):
+        document = status_document("20260814", "sfn-a")
+        del document["schema_version"]
+        self.assert_rejected({status_key("20260814", "sfn-a"): json.dumps(document).encode("utf-8")})
+
+    def test_failed_status_is_not_adopted(self):
+        self.set_s3(
+            status_objects(
+                [("20260814", "sfn-a", "FAILED", 5, {}), ("20260813", "sfn-b", "SUCCEEDED", 0, {})]
+            )
+        )
+        summary = target.run(self.make_args(self.root, "20260817"), self.logger)
+        self.assertEqual(summary["previous_successful_run_date"], "20260813")
+
+    def test_non_zero_exit_code_is_not_adopted(self):
+        # SUCCEEDED + exit_code != 0 は正本schemaの契約違反なのでFAILさせる
+        self.assert_rejected(status_objects([("20260814", "sfn-a", "SUCCEEDED", 9, {})]))
+
+    def test_malformed_status_key_is_rejected(self):
+        self.assert_rejected(
+            {f"{STATUS_PREFIX}/20260814/a/b/status.json": json.dumps(
+                status_document("20260814", "a")
+            ).encode("utf-8")}
+        )
+
+
+class TestWalkFailClosed(RetentionTestBase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.build_fixture()
+        self.set_s3(status_objects([("20260814", "sfn-a", "SUCCEEDED", 0, {})]))
+        self.locked = []
+
+    def tearDown(self):
+        for path in self.locked:
+            try:
+                path.chmod(0o755)
+            except OSError:
+                pass
+        super().tearDown()
+
+    def _lock(self, path):
+        path.chmod(0o000)
+        self.locked.append(path)
+
+    def test_unreadable_result_dir_fails_without_deleting(self):
+        result_dir = self.root / "09-1_mail_display_format" / "01_result"
+        self._lock(result_dir)
+        with self.assertRaises(target.RetentionError):
+            target.run(self.make_args(self.root, "20260817", apply_mode=True), self.logger)
+        result_dir.chmod(0o755)
+        # 他stepの成果物も1件も削除されていない
+        self.assertEqual(self.present_run_dates(self.root, "20260817"), ALL_RUN_DATES)
+
+    def test_unreadable_subdir_in_delete_candidate_fails_without_deleting(self):
+        sub = (
+            self.root
+            / "09-1_mail_display_format"
+            / "01_result"
+            / "mail_display_format_20260418"
+            / "sub"
+        )
+        self._lock(sub)
+        with self.assertRaises(target.RetentionError):
+            target.run(self.make_args(self.root, "20260817", apply_mode=True), self.logger)
+        sub.chmod(0o755)
+        self.assertEqual(self.present_run_dates(self.root, "20260817"), ALL_RUN_DATES)
+        self.assertTrue((sub / "b.txt").is_file())
+
+
+class TestCurrentRunDateProtection(RetentionTestBase):
+    """current / previous successful の成果物がapplyで一切変化しないこと。"""
+
+    CURRENT = "20260817"
+    PREVIOUS = "20260814"
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.build_fixture(run_dates=ALL_RUN_DATES + [self.CURRENT])
+        self.set_s3(status_objects([(rd, f"sfn-{rd}", "SUCCEEDED", 0, {}) for rd in ALL_RUN_DATES]))
+
+    def snapshot(self, run_dates):
+        """保持対象RUN_DATEの全path・sizeを収集する。"""
+        artifacts, _holds = target.scan_artifacts(self.root, self.CURRENT, self.logger)
+        snapshot = {}
+        for artifact in artifacts:
+            if artifact["run_date"] not in run_dates:
+                continue
+            path = artifact["path"]
+            if artifact["kind"] == "file":
+                snapshot[str(path.relative_to(self.root))] = path.stat().st_size
+            else:
+                for child in sorted(path.rglob("*")):
+                    if child.is_file():
+                        snapshot[str(child.relative_to(self.root))] = child.stat().st_size
+        return snapshot
+
+    def test_current_and_previous_are_untouched_after_apply(self):
+        keep = {self.CURRENT, self.PREVIOUS}
+        before = self.snapshot(keep)
+        self.assertTrue(before)
+
+        summary = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        self.assertEqual(summary["keep_run_dates"], [self.PREVIOUS, self.CURRENT])
+
+        after = self.snapshot(keep)
+        self.assertEqual(before, after)
+        self.assertEqual(
+            self.present_run_dates(self.root, self.CURRENT), sorted(keep)
+        )
+
+    def test_rerun_after_partial_delete_failure_keeps_current_and_previous(self):
+        keep = {self.CURRENT, self.PREVIOUS}
+        before = self.snapshot(keep)
+
+        original_unlink = Path.unlink
+        state = {"count": 0}
+
+        def flaky_unlink(self_path, *unlink_args, **unlink_kwargs):
+            state["count"] += 1
+            if state["count"] > 50:
+                raise OSError("simulated I/O error during unlink")
+            return original_unlink(self_path, *unlink_args, **unlink_kwargs)
+
+        Path.unlink = flaky_unlink
+        try:
+            with self.assertRaises(OSError):
+                target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        finally:
+            Path.unlink = original_unlink
+
+        # 途中失敗後も保持対象は無傷
+        self.assertEqual(self.snapshot(keep), before)
+
+        # 再実行で残った古い対象だけが削除される
+        summary = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        self.assertGreater(summary["deleted_files"], 0)
+        self.assertEqual(self.snapshot(keep), before)
+        self.assertEqual(self.present_run_dates(self.root, self.CURRENT), sorted(keep))
+
+        again = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        self.assertEqual(again["deleted_files"], 0)
 
 
 class TestDryRunAndIdempotency(RetentionTestBase):

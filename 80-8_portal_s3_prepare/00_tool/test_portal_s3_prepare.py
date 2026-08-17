@@ -205,6 +205,36 @@ class TestFailureCases(PrepareTestBase):
         with self.assertRaises(target.PrepareError):
             target.recheck_stable(entries)
 
+    def test_unreadable_subdir_fails_and_writes_no_manifest(self):
+        """走査失敗を握りつぶして不完全manifestを正常生成しないこと。"""
+        locked = self.root / "09-1_mail_display_format" / "01_result" / "mail_display_format_20260814"
+        locked.chmod(0o000)
+        try:
+            with self.assertRaises(target.PrepareError):
+                target.run(self.make_args(), self.logger)
+            self.assertEqual(self.run_main(), 1)
+        finally:
+            locked.chmod(0o755)
+        manifest = self.step_dir / "01_result" / target.MANIFEST_FILENAME
+        self.assertFalse(manifest.exists(), msg="走査失敗時にmanifestを出力してはいけない")
+
+    def test_unreadable_result_dir_fails(self):
+        locked = self.root / "03-10_extract_project_location" / "01_result"
+        locked.chmod(0o000)
+        try:
+            with self.assertRaises(target.PrepareError):
+                target.run(self.make_args(), self.logger)
+        finally:
+            locked.chmod(0o755)
+
+    def test_unreadable_pipeline_root_fails(self):
+        self.root.chmod(0o000)
+        try:
+            with self.assertRaises(target.PrepareError):
+                target.run(self.make_args(), self.logger)
+        finally:
+            self.root.chmod(0o755)
+
     def test_stat_failure_is_reported(self):
         entries = [
             {

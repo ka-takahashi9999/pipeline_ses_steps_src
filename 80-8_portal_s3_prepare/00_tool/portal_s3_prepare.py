@@ -83,10 +83,22 @@ class PrepareError(Exception):
     """manifestを作らずに異常終了すべき状態。"""
 
 
+def walk_error(exc: OSError) -> None:
+    """
+    os.walk の走査失敗を握りつぶさない。
+    1ディレクトリでも走査できなければ、不完全なmanifestを正常生成せず即FAILさせる。
+    """
+    raise PrepareError(f"01_result の走査に失敗しました（manifestを生成しません）: {exc}")
+
+
 def select_step_dirs(root: Path) -> List[str]:
     """positive selection: XX-X_ 形式かつ 01_result を持つstepディレクトリ名を返す。"""
     selected: List[str] = []
-    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise PrepareError(f"pipeline rootの走査に失敗しました: {root} ({exc})") from exc
+    for entry in entries:
         if entry.is_symlink() or not entry.is_dir():
             continue
         if not STEP_DIR_RE.match(entry.name):
@@ -138,7 +150,9 @@ def collect_entries(root: Path, step_dirs: List[str], logger) -> Tuple[List[Dict
 
     for step in step_dirs:
         result_dir = root / step / RESULT_DIR_NAME
-        for dirpath, dirnames, filenames in os.walk(str(result_dir), followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(
+            str(result_dir), followlinks=False, onerror=walk_error
+        ):
             current = Path(dirpath)
             for name in sorted(dirnames):
                 if (current / name).is_symlink():

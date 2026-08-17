@@ -45,6 +45,11 @@ SUMMARY_FILENAME = "manage_09_result_retention_summary.json"
 RUN_DATE_RE = re.compile(r"^\d{8}$")
 VALID_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED")
 
+# status.json の正本: 99-9_publish_pipeline_status/00_tool/publish_pipeline_status.py
+SUPPORTED_SCHEMA_VERSIONS = ("1.0",)
+RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+STATUS_OBJECT_NAME = "status.json"
+
 # 削除対象（RUN_DATE付き成果物）。kind は dir / file のいずれか。
 RETENTION_TARGETS: Tuple[Tuple[str, str, str], ...] = (
     ("09-1_mail_display_format", "dir", r"^mail_display_format_(\d{8})$"),
@@ -106,15 +111,37 @@ def _parse_timestamp(name: str, value: Any) -> datetime:
     return parsed
 
 
-def validate_status_document(document: Any, expected_run_date: str, s3_uri: str) -> Dict[str, Any]:
-    """status.json のschemaを検証する。不正ならRetentionErrorを送出する。"""
+def validate_status_document(
+    document: Any, expected_run_date: str, expected_run_id: str, s3_uri: str
+) -> Dict[str, Any]:
+    """
+    status.json のschemaを検証する。不正ならRetentionErrorを送出する。
+
+    正本は 99-9_publish_pipeline_status/00_tool/publish_pipeline_status.py が書く
+    schema_version 1.0 の成功statusであり、その契約に合わせて検証する。
+    """
     if not isinstance(document, dict):
         raise RetentionError(f"status.json がJSON objectではありません: {s3_uri}")
 
-    required_keys = ("run_id", "run_date", "status", "started_at", "finished_at", "exit_code")
+    required_keys = (
+        "schema_version",
+        "run_id",
+        "run_date",
+        "status",
+        "started_at",
+        "finished_at",
+        "exit_code",
+    )
     missing = [key for key in required_keys if key not in document]
     if missing:
         raise RetentionError(f"status.json に必須キーがありません {missing}: {s3_uri}")
+
+    schema_version = document["schema_version"]
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise RetentionError(
+            f"status.json のschema_versionが未対応です: {schema_version!r} "
+            f"(対応={list(SUPPORTED_SCHEMA_VERSIONS)}) ({s3_uri})"
+        )
 
     status = document["status"]
     if status not in VALID_STATUSES:
@@ -123,9 +150,21 @@ def validate_status_document(document: Any, expected_run_date: str, s3_uri: str)
     run_date = document["run_date"]
     if not isinstance(run_date, str) or not RUN_DATE_RE.match(run_date):
         raise RetentionError(f"status.json のrun_dateが不正です: {run_date!r} ({s3_uri})")
+    if not _is_valid_calendar_date(run_date):
+        raise RetentionError(f"status.json のrun_dateが実在日付ではありません: {run_date} ({s3_uri})")
     if run_date != expected_run_date:
         raise RetentionError(
-            f"status.json のrun_dateがS3 prefixと不一致です: {run_date} != {expected_run_date} ({s3_uri})"
+            f"status.json のrun_dateがS3 keyと不一致です: {run_date} != {expected_run_date} ({s3_uri})"
+        )
+
+    run_id = document["run_id"]
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise RetentionError(f"status.json のrun_idが空です: {run_id!r} ({s3_uri})")
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise RetentionError(f"status.json のrun_idが不正です: {run_id!r} ({s3_uri})")
+    if run_id != expected_run_id:
+        raise RetentionError(
+            f"status.json のrun_idがS3 keyと不一致です: {run_id} != {expected_run_id} ({s3_uri})"
         )
 
     _parse_timestamp("started_at", document["started_at"])
@@ -166,6 +205,19 @@ def list_status_run_dates(s3_client, bucket: str, status_prefix: str) -> List[st
     return sorted(set(run_dates))
 
 
+def parse_status_key(key: str, status_prefix: str, run_date: str) -> str:
+    """
+    S3 key `<status_prefix>/<RUN_DATE>/<RUN_ID>/status.json` からRUN_IDを取り出す。
+    構造が想定と異なる場合はRetentionErrorを送出する。
+    """
+    prefix = f"{status_prefix}/{run_date}/"
+    rest = key[len(prefix) :]
+    parts = rest.split("/")
+    if len(parts) != 2 or parts[1] != STATUS_OBJECT_NAME or not parts[0]:
+        raise RetentionError(f"status.json のS3 key構造が不正です: {key}")
+    return parts[0]
+
+
 def has_successful_run(s3_client, bucket: str, status_prefix: str, run_date: str, logger) -> bool:
     """指定RUN_DATEに正常終了runが1件以上あるか判定する。"""
     prefix = f"{status_prefix}/{run_date}/"
@@ -175,7 +227,7 @@ def has_successful_run(s3_client, bucket: str, status_prefix: str, run_date: str
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents") or []:
                 key = obj.get("Key", "")
-                if key.endswith("/status.json"):
+                if key.endswith(f"/{STATUS_OBJECT_NAME}"):
                     keys.append(key)
     except Exception as exc:  # noqa: BLE001
         raise RetentionError(f"S3 status のLISTに失敗しました ({prefix}): {exc}") from exc
@@ -183,6 +235,7 @@ def has_successful_run(s3_client, bucket: str, status_prefix: str, run_date: str
     found = False
     for key in sorted(keys):
         s3_uri = f"s3://{bucket}/{key}"
+        key_run_id = parse_status_key(key, status_prefix, run_date)
         try:
             body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
         except Exception as exc:  # noqa: BLE001
@@ -191,7 +244,7 @@ def has_successful_run(s3_client, bucket: str, status_prefix: str, run_date: str
             document = json.loads(body.decode("utf-8"))
         except Exception as exc:  # noqa: BLE001
             raise RetentionError(f"status.json をJSONとして解析できません ({s3_uri}): {exc}") from exc
-        document = validate_status_document(document, run_date, s3_uri)
+        document = validate_status_document(document, run_date, key_run_id, s3_uri)
         if document["status"] == "SUCCEEDED" and document["exit_code"] == 0:
             logger.info(f"正常終了run検出: {s3_uri}")
             found = True
@@ -209,6 +262,10 @@ def resolve_previous_successful_run_date(
     )
     for run_date in sorted(candidates, reverse=True):
         if has_successful_run(s3_client, bucket, status_prefix, run_date, logger):
+            if run_date >= current_run_date:
+                raise RetentionError(
+                    f"直前の正常終了RUN_DATEが現在RUN_DATE以降です: {run_date} >= {current_run_date}"
+                )
             return run_date
     return None
 
@@ -250,7 +307,13 @@ def scan_artifacts(root: Path, current_run_date: str, logger) -> Tuple[List[Dict
             if target_step == step
         ]
 
-        for entry in sorted(result_dir.iterdir(), key=lambda p: p.name):
+        # 走査に失敗したら対象が黙って欠落しないよう即FAILさせる
+        try:
+            entries = sorted(result_dir.iterdir(), key=lambda p: p.name)
+        except OSError as exc:
+            raise RetentionError(f"01_result の走査に失敗しました: {result_dir} ({exc})") from exc
+
+        for entry in entries:
             rel = f"{step}/01_result/{entry.name}"
             if entry.is_symlink():
                 raise RetentionError(f"symlinkを検出しました（削除しません）: {rel}")
@@ -318,7 +381,14 @@ def collect_regular_files(artifact: Dict[str, Any]) -> Tuple[List[Path], List[Pa
         total_bytes += path.stat().st_size
         return [path], [], total_bytes
 
-    for dirpath, dirnames, filenames in os.walk(str(path), followlinks=False):
+    def _walk_error(exc: OSError) -> None:
+        # permission denied / I/O error 等で対象が黙って欠落しないよう即FAILさせる
+        raise RetentionError(
+            f"削除候補の走査に失敗しました（1ファイルも削除しません）: "
+            f"{artifact['relative_path']} ({exc})"
+        )
+
+    for dirpath, dirnames, filenames in os.walk(str(path), followlinks=False, onerror=_walk_error):
         current = Path(dirpath)
         dirs.append(current)
         for name in sorted(dirnames):

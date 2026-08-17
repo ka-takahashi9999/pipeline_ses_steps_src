@@ -5,13 +5,19 @@
 80-8 が作成した manifest と同じ集合を、Portal専用prefixへ同期する。
 
   ローカル : <pipeline root>/XX-X_<step名>/01_result/**
-  S3      : s3://<bucket>/<PORTAL_S3_PREFIX>/XX-X_<step名>/01_result/**
+  S3      : s3://technoverse/pipeline_ses_steps/pipeline_ses_steps/XX-X_<step名>/01_result/**
 
 方式:
-- `aws s3 sync --delete` （prefix全削除→全uploadはしない）
+- destination安全ロック: bucket / base prefix / portal prefix / 完全URI を期待値と
+  完全一致比較し、1つでも異なれば sync開始前にFAILする（startswith判定はしない）。
+  設定値の書き換えで `--delete` の範囲を上位prefixへ広げられない構造にする。
+- staging tree方式: 80-8 manifestに載っているファイルだけで一時staging treeを構築し、
+  AWS CLIのinclude/excludeフィルタを使わずに `aws s3 sync --delete` する。
+  staging集合 = manifest集合 = S3に存在すべき集合 を保証する。
 - AWS CLI は argv 配列で subprocess 実行する（eval / bash -c / sh -c は使わない）
 - sync成功後 PORTAL_S3_VERIFY_WAIT_SEC 秒待ってから完全性verifyを行う
-- verify は manifest を期待値とし、S3を全ページLISTして path集合とsizeを比較する
+- verify は manifest を期待値とし、S3を全ページLISTして path集合とsizeを比較する。
+  directory markerを含め、prefix自身を除く全objectをactual集合に含める。
 - missing / extra / size mismatch / LIST失敗 はすべて異常終了
 
 pipeline-logs / pipeline-status / 既存S3直下ZIP はPortal専用prefix外のため一切触らない。
@@ -22,12 +28,15 @@ usage:
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
@@ -48,21 +57,61 @@ SYNC_SUMMARY_FILENAME = "portal_s3_sync_summary.json"
 AWS_BIN = "/usr/bin/aws"
 RESULT_DIR_NAME = "01_result"
 
-# 80-8 の明示除外と同じ集合になるようCLI filterを構成する
-EXCLUDE_FILTERS: Tuple[str, ...] = (
-    "*/01_result/.gitkeep",
-    "*.bak_*",
-    "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl",
-    "80-7_manage_09_result_retention/*",
-    "80-8_portal_s3_prepare/*",
-    "80-9_portal_s3_sync/*",
-)
+# ---- destination安全ロック（唯一許可する同期先） ----------------------------
+# ここを設定ファイル・環境変数で上書きできてはならない。
+EXPECTED_BUCKET = "technoverse"
+EXPECTED_BASE_PREFIX = "pipeline_ses_steps"
+EXPECTED_PORTAL_LEAF = "pipeline_ses_steps"
+EXPECTED_PORTAL_PREFIX = f"{EXPECTED_BASE_PREFIX}/{EXPECTED_PORTAL_LEAF}"
+EXPECTED_DESTINATION_URI = f"s3://{EXPECTED_BUCKET}/{EXPECTED_PORTAL_PREFIX}/"
+
+STAGE_DIR_PREFIX = ".portal_s3_stage_"
 
 SAMPLE_LIMIT = 3
 
 
 class SyncError(Exception):
     """S3を変更しない / verify不成立で異常終了すべき状態。"""
+
+
+# ---------------------------------------------------------------------------
+# destination安全ロック
+# ---------------------------------------------------------------------------
+
+
+def lock_destination(bucket: Any, base_prefix: Any, portal_prefix: Any) -> str:
+    """
+    bucket / base prefix / portal prefix / 完全URI を期待値と完全一致比較する。
+    1項目でも一致しなければ SyncError を送出する（sync開始前にFAILさせる）。
+
+    生の設定値をそのまま比較するため、末尾スラッシュ・空文字・上位prefix・`..` は
+    すべて不一致として拒否される。startswith判定は使わない。
+    """
+    for name, value, expected in (
+        ("PIPELINE_S3_BUCKET", bucket, EXPECTED_BUCKET),
+        ("PIPELINE_S3_BASE_PREFIX", base_prefix, EXPECTED_BASE_PREFIX),
+        ("PORTAL_S3_PREFIX", portal_prefix, EXPECTED_PORTAL_PREFIX),
+    ):
+        if not isinstance(value, str) or value != expected:
+            raise SyncError(
+                f"destination安全ロック違反: {name} が期待値と一致しません "
+                f"(actual={value!r} / expected={expected!r})"
+            )
+
+    # 期待値定数そのものが壊れていないかも構造として検証する
+    components = portal_prefix.split("/")
+    if components != [EXPECTED_BASE_PREFIX, EXPECTED_PORTAL_LEAF]:
+        raise SyncError(f"destination安全ロック違反: portal prefixの構造が不正です: {portal_prefix!r}")
+    if any(component in ("", ".", "..") for component in components):
+        raise SyncError(f"destination安全ロック違反: portal prefixに不正componentがあります: {portal_prefix!r}")
+
+    destination_uri = f"s3://{bucket}/{portal_prefix}/"
+    if destination_uri != EXPECTED_DESTINATION_URI:
+        raise SyncError(
+            f"destination安全ロック違反: 同期先URIが期待値と一致しません "
+            f"(actual={destination_uri!r} / expected={EXPECTED_DESTINATION_URI!r})"
+        )
+    return destination_uri
 
 
 def parse_wait_seconds(raw: Any) -> int:
@@ -73,11 +122,19 @@ def parse_wait_seconds(raw: Any) -> int:
     return int(text)
 
 
-def normalize_prefix(value: str) -> str:
-    normalized = value.strip().strip("/")
-    if not normalized or any(part in ("", ".", "..") for part in normalized.split("/")):
-        raise SyncError(f"PORTAL_S3_PREFIX が不正です: {value!r}")
-    return normalized
+# ---------------------------------------------------------------------------
+# manifest
+# ---------------------------------------------------------------------------
+
+
+def validate_relative_path(relative_path: Any) -> None:
+    if not isinstance(relative_path, str) or not relative_path:
+        raise SyncError(f"relative_pathが不正です: {relative_path!r}")
+    if relative_path.startswith("/") or os.path.isabs(relative_path):
+        raise SyncError(f"absolute pathは許可しません: {relative_path}")
+    components = relative_path.split("/")
+    if any(component in ("", ".", "..") for component in components):
+        raise SyncError(f"不正なpath componentを検出しました: {relative_path}")
 
 
 def load_manifest(manifest_path: Path) -> Dict[str, int]:
@@ -87,8 +144,7 @@ def load_manifest(manifest_path: Path) -> Dict[str, int]:
     for record in read_jsonl_as_list(str(manifest_path)):
         relative_path = record.get("relative_path")
         size = record.get("size")
-        if not isinstance(relative_path, str) or not relative_path:
-            raise SyncError(f"manifestのrelative_pathが不正です: {record!r}")
+        validate_relative_path(relative_path)
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise SyncError(f"manifestのsizeが不正です: {record!r}")
         if relative_path in expected:
@@ -100,7 +156,7 @@ def load_manifest(manifest_path: Path) -> Dict[str, int]:
 
 
 def load_selected_step_dirs(summary_path: Path) -> List[str]:
-    """sync対象prefixを80-8 summaryの選定結果から取得する（選定ロジックを二重管理しない）。"""
+    """80-8が選定したstep一覧（summary記録用）。"""
     if not summary_path.is_file():
         raise SyncError(f"80-8 summaryが存在しません: {summary_path}")
     with open(summary_path, "r", encoding="utf-8") as f:
@@ -114,34 +170,160 @@ def load_selected_step_dirs(summary_path: Path) -> List[str]:
     return list(step_dirs)
 
 
-def build_sync_argv(
-    root: Path, bucket: str, portal_prefix: str, region: str, step_dirs: List[str], dry_run: bool
-) -> List[str]:
-    """aws s3 sync の argv を組み立てる（shell文字列は使わない）。"""
-    argv: List[str] = [
+# ---------------------------------------------------------------------------
+# staging tree
+# ---------------------------------------------------------------------------
+
+
+def create_staging_root(step_dir: Path) -> Path:
+    """step配下に一時staging rootを作成する（同一filesystemでhard linkできるようにする）。"""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=STAGE_DIR_PREFIX, dir=str(step_dir)))
+
+
+def _assert_inside(child: Path, parent: Path, label: str) -> None:
+    try:
+        Path(os.path.realpath(str(child))).relative_to(Path(os.path.realpath(str(parent))))
+    except ValueError as exc:
+        raise SyncError(f"{label}の外を指しています: {child}") from exc
+
+
+def build_staging_tree(
+    root: Path, expected: Dict[str, int], stage_root: Path, logger
+) -> Dict[str, Any]:
+    """
+    manifestに載っているファイルだけでstaging treeを構築する。
+    1件でも検証に失敗したら SyncError を送出し、S3 syncへ進ませない。
+    """
+    staged = 0
+    staged_bytes = 0
+    linked = 0
+    copied = 0
+    seen = set()
+
+    for relative_path in sorted(expected):
+        size = expected[relative_path]
+        validate_relative_path(relative_path)
+        if relative_path in seen:
+            raise SyncError(f"staging対象のpathが重複しています: {relative_path}")
+        seen.add(relative_path)
+
+        source = root / relative_path
+        if source.is_symlink():
+            raise SyncError(f"symlinkはstagingへ入れません: {relative_path}")
+        if not source.is_file():
+            raise SyncError(f"regular fileではありません: {relative_path}")
+        _assert_inside(source, root, "source root")
+
+        actual_size = source.stat().st_size
+        if actual_size != size:
+            raise SyncError(
+                f"manifestとsourceのsizeが一致しません: {relative_path} "
+                f"(manifest={size} / source={actual_size})"
+            )
+
+        destination = stage_root / relative_path
+        if destination.exists() or destination.is_symlink():
+            raise SyncError(f"staging先が既に存在します: {relative_path}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _assert_inside(destination.parent, stage_root, "staging root")
+
+        try:
+            os.link(str(source), str(destination))
+            linked += 1
+        except OSError:
+            # 別filesystem等でhard linkできない場合はcopyへfallbackする
+            shutil.copy2(str(source), str(destination))
+            copied += 1
+
+        if destination.is_symlink() or not destination.is_file():
+            raise SyncError(f"staging結果がregular fileではありません: {relative_path}")
+        if destination.stat().st_size != size:
+            raise SyncError(f"staging結果のsizeが一致しません: {relative_path}")
+
+        staged += 1
+        staged_bytes += size
+
+    if staged != len(expected):
+        raise SyncError(f"staging件数がmanifestと一致しません: {staged} != {len(expected)}")
+
+    verify_staging_tree(stage_root, expected)
+    logger.info(f"staging構築: files={staged} / bytes={staged_bytes} (link={linked} / copy={copied})")
+    return {"file_count": staged, "total_bytes": staged_bytes, "linked": linked, "copied": copied}
+
+
+def _walk_error(exc: OSError) -> None:
+    raise SyncError(f"staging treeの走査に失敗しました: {exc}")
+
+
+def verify_staging_tree(stage_root: Path, expected: Dict[str, int]) -> None:
+    """staging treeの実体がmanifestと完全一致することを確認する。"""
+    actual: Dict[str, int] = {}
+    for dirpath, dirnames, filenames in os.walk(str(stage_root), followlinks=False, onerror=_walk_error):
+        current = Path(dirpath)
+        for name in dirnames:
+            if (current / name).is_symlink():
+                raise SyncError(f"staging treeにsymlinkディレクトリがあります: {current / name}")
+        for name in filenames:
+            child = current / name
+            if child.is_symlink() or not child.is_file():
+                raise SyncError(f"staging treeにregular file以外があります: {child}")
+            actual[str(child.relative_to(stage_root))] = child.stat().st_size
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))[:SAMPLE_LIMIT]
+        extra = sorted(set(actual) - set(expected))[:SAMPLE_LIMIT]
+        raise SyncError(f"staging treeがmanifestと一致しません (missing={missing} / extra={extra})")
+
+
+def cleanup_staging(stage_root: Optional[Path], logger) -> None:
+    """staging treeを削除する（hard linkのため元ファイルは消えない）。"""
+    if stage_root is None:
+        return
+    path = Path(stage_root)
+    if path.is_symlink() or not path.is_dir() or not path.name.startswith(STAGE_DIR_PREFIX):
+        logger.warn(f"staging rootとして認識できないためcleanupしません: {path}")
+        return
+    shutil.rmtree(str(path), ignore_errors=True)
+    if path.exists():
+        logger.warn(f"staging cleanupが完了しませんでした: {path}")
+    else:
+        logger.info(f"staging cleanup完了: {path}")
+
+
+# ---------------------------------------------------------------------------
+# aws s3 sync
+# ---------------------------------------------------------------------------
+
+
+def build_sync_argv(stage_root: Path, destination_uri: str, region: str, dry_run: bool) -> List[str]:
+    """
+    aws s3 sync の argv を組み立てる（shell文字列は使わない）。
+    staging tree方式のため include / exclude フィルタは一切使わない。
+    """
+    if destination_uri != EXPECTED_DESTINATION_URI:
+        raise SyncError(f"destination安全ロック違反: {destination_uri!r}")
+    argv = [
         AWS_BIN,
         "s3",
         "sync",
-        str(root),
-        f"s3://{bucket}/{portal_prefix}/",
+        str(stage_root),
+        destination_uri,
         "--delete",
         "--no-follow-symlinks",
         "--only-show-errors",
         "--region",
         region,
-        "--exclude",
-        "*",
     ]
-    for step in step_dirs:
-        argv.extend(["--include", f"{step}/{RESULT_DIR_NAME}/*"])
-    for pattern in EXCLUDE_FILTERS:
-        argv.extend(["--exclude", pattern])
     if dry_run:
         argv.append("--dryrun")
     return argv
 
 
 def run_sync(argv: List[str], logger) -> None:
+    if argv[4] != EXPECTED_DESTINATION_URI:
+        raise SyncError(f"destination安全ロック違反: {argv[4]!r}")
+    if "--include" in argv or "--exclude" in argv:
+        raise SyncError("staging tree方式ではinclude/excludeフィルタを使いません")
     logger.info(f"aws s3 sync 実行: {len(argv)} args / dest={argv[4]}")
     completed = subprocess.run(  # noqa: S603 - argv配列固定・shell未使用
         argv,
@@ -159,6 +341,11 @@ def run_sync(argv: List[str], logger) -> None:
     logger.ok("aws s3 sync 成功")
 
 
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+
+
 def build_s3_client(region: str):
     """boto3 S3クライアントを生成する（テストから差し替え可能にするため関数化）。"""
     import boto3
@@ -167,7 +354,10 @@ def build_s3_client(region: str):
 
 
 def list_portal_objects(s3_client, bucket: str, portal_prefix: str) -> Dict[str, int]:
-    """Portal専用prefixを全ページLISTし、{relative_path: size} を返す。"""
+    """
+    Portal専用prefixを全ページLISTし、{relative_path: size} を返す。
+    prefix自身のobjectを除き、directory markerを含む全objectをactual集合に含める。
+    """
     actual: Dict[str, int] = {}
     prefix = f"{portal_prefix}/"
     try:
@@ -180,7 +370,8 @@ def list_portal_objects(s3_client, bucket: str, portal_prefix: str) -> Dict[str,
                 if not key.startswith(prefix):
                     raise SyncError(f"prefix外のkeyが返却されました: {key}")
                 relative_path = key[len(prefix) :]
-                if not relative_path or relative_path.endswith("/"):
+                if not relative_path:
+                    # prefix自身のobjectのみ除外する（directory markerは除外しない）
                     continue
                 size = obj.get("Size")
                 if not isinstance(size, int):
@@ -234,6 +425,11 @@ def verify(expected: Dict[str, int], actual: Dict[str, int], logger) -> Dict[str
     return result
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -258,33 +454,50 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 
     config = load_pipeline_s3_config()
     bucket = get_config_value(config, "PIPELINE_S3_BUCKET")
+    base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
+    portal_prefix = get_config_value(config, "PORTAL_S3_PREFIX")
     region = get_config_value(config, "PIPELINE_AWS_REGION")
-    portal_prefix = normalize_prefix(get_config_value(config, "PORTAL_S3_PREFIX"))
+
+    # sync開始前に destination を完全固定する
+    destination_uri = lock_destination(bucket, base_prefix, portal_prefix)
     wait_seconds = parse_wait_seconds(get_config_value(config, "PORTAL_S3_VERIFY_WAIT_SEC"))
 
     expected = load_manifest(manifest_path)
     step_dirs = load_selected_step_dirs(prepare_summary_path)
 
-    logger.info(f"同期先: s3://{bucket}/{portal_prefix}/ (region={region})")
+    logger.info(f"同期先(lock済): {destination_uri} (region={region})")
     logger.info(f"expected files={len(expected)} / bytes={sum(expected.values())}")
     logger.info(f"PORTAL_S3_VERIFY_WAIT_SEC={wait_seconds}")
-
-    argv = build_sync_argv(root, bucket, portal_prefix, region, step_dirs, args.dry_run)
-    run_sync(argv, logger)
 
     summary: Dict[str, Any] = {
         "step": STEP_NAME,
         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": "dry-run" if args.dry_run else "apply",
         "pipeline_root": str(root),
-        "s3_destination": f"s3://{bucket}/{portal_prefix}/",
-        "sync_method": "aws s3 sync --delete",
+        "s3_destination": destination_uri,
+        "s3_destination_locked": True,
+        "sync_method": "staging tree + aws s3 sync --delete (no CLI filters)",
         "sync_status": "SUCCEEDED",
         "verify_wait_sec": wait_seconds,
         "wait_performed": False,
         "selected_step_dir_count": len(step_dirs),
         "manifest_path": str(manifest_path),
     }
+
+    stage_root = None
+    try:
+        stage_root = create_staging_root(Path(args.step_dir))
+        staging = build_staging_tree(root, expected, stage_root, logger)
+        summary["staging"] = {
+            "file_count": staging["file_count"],
+            "total_bytes": staging["total_bytes"],
+            "hard_linked": staging["linked"],
+            "copied": staging["copied"],
+        }
+        argv = build_sync_argv(stage_root, destination_uri, region, args.dry_run)
+        run_sync(argv, logger)
+    finally:
+        cleanup_staging(stage_root, logger)
 
     if args.dry_run:
         logger.warn("dry-runのため wait / verify は実施しません（S3未変更）")
