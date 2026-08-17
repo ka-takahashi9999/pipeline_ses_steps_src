@@ -196,8 +196,10 @@ def _validate_skills(
                 f"{field}[{i}]のskillが変更された: "
                 f"元='{orig['skill']}' 結果='{res.get('skill')}'"
             )
-        if res.get("match") not in (True, False):
-            return f"{field}[{i}]のmatchがtrue/false以外: {res.get('match')!r}"
+        match = res.get("match")
+        if not isinstance(match, bool):
+            # 1 / 0 は Python上 True / False と等価比較されるため型で判定する
+            return f"{field}[{i}]のmatchがtrue/false以外: {match!r}"
         note = res.get("note")
         if not isinstance(note, str) or not note.strip():
             return f"{field}[{i}]のnoteが空またはnull"
@@ -227,17 +229,6 @@ def _apply_soft_skill_auto_true(skills: List[Dict[str, Any]]) -> int:
             skill["match"] = True
             skill["note"] = AUTO_TRUE_NOTE
     return count
-
-
-def _classify_validation_error(err_msg: str) -> str:
-    parse_like_markers = [
-        "リストでない",
-        "dictでない",
-        "不正なキー構成",
-    ]
-    if any(marker in err_msg for marker in parse_like_markers):
-        return "llm_parse_error"
-    return "invalid_output_schema"
 
 
 def _make_error(p_mid: str, r_mid: str, etype: str, emsg: str) -> Dict[str, Any]:
@@ -322,9 +313,10 @@ def process_pair(
     res_required = llm_resp.get("required_skills")
     res_optional = llm_resp.get("optional_skills")
 
+    # JSON parseは成功しているためschema不正として扱う（llm_parse_errorはparse失敗のみ）
     if res_required is None or res_optional is None:
         return None, _make_error(
-            p_mid, r_mid, "llm_parse_error",
+            p_mid, r_mid, "invalid_output_schema",
             "レスポンスにrequired_skills/optional_skillsキーなし",
         )
 
@@ -342,19 +334,15 @@ def process_pair(
             message_id=p_mid,
         )
 
-    # required_skills 検証
+    # required_skills 検証（parse成功後のschema不正は invalid_output_schema）
     err_msg = _validate_skills(required_skills, res_required, "required_skills")
     if err_msg:
-        return None, _make_error(
-            p_mid, r_mid, _classify_validation_error(err_msg), err_msg
-        )
+        return None, _make_error(p_mid, r_mid, "invalid_output_schema", err_msg)
 
     # optional_skills 検証
     err_msg = _validate_skills(optional_skills, res_optional, "optional_skills")
     if err_msg:
-        return None, _make_error(
-            p_mid, r_mid, _classify_validation_error(err_msg), err_msg
-        )
+        return None, _make_error(p_mid, r_mid, "invalid_output_schema", err_msg)
 
     soft_count = _apply_soft_skill_auto_true(res_required)
     soft_count += _apply_soft_skill_auto_true(res_optional)

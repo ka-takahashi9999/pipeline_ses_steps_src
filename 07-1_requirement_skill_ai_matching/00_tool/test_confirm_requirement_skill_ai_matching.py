@@ -21,7 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -63,7 +63,9 @@ def error_record(error_type: str, index: int) -> dict:
     }
 
 
-class Confirm07_1ErrorTypeTestCase(unittest.TestCase):
+class Confirm07_1FixtureMixin:
+    """一時ディレクトリ上にconfirm入出力fixtureを用意する共通処理。"""
+
     def setUp(self) -> None:
         logging.disable(logging.CRITICAL)
         self.tmp = Path(tempfile.mkdtemp(prefix="confirm_07_1_test_"))
@@ -111,7 +113,9 @@ class Confirm07_1ErrorTypeTestCase(unittest.TestCase):
         logging.disable(logging.NOTSET)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def setup_errors(self, error_types: List[str]) -> None:
+    def setup_errors(
+        self, error_types: List[str], metadata_extra: Optional[dict] = None
+    ) -> None:
         errors = [error_record(etype, i + 2) for i, etype in enumerate(error_types)]
         write_jsonl(self.error_file, errors)
         # 入力ペア数 = 正常系 + 失敗系
@@ -128,16 +132,16 @@ class Confirm07_1ErrorTypeTestCase(unittest.TestCase):
             for e in errors
         ]
         write_jsonl(self.pairs_file, pairs)
+        run_metadata = {
+            "input_count": len(pairs),
+            "processed_count": len(pairs),
+            "limit": None,
+            "is_limited_run": False,
+        }
+        if metadata_extra:
+            run_metadata.update(metadata_extra)
         self.run_metadata_file.write_text(
-            json.dumps(
-                {
-                    "input_count": len(pairs),
-                    "processed_count": len(pairs),
-                    "limit": None,
-                    "is_limited_run": False,
-                }
-            ),
-            encoding="utf-8",
+            json.dumps(run_metadata), encoding="utf-8"
         )
 
     def run_confirm(self) -> int:
@@ -150,6 +154,7 @@ class Confirm07_1ErrorTypeTestCase(unittest.TestCase):
     def result_text(self) -> str:
         return self.confirm_result_file.read_text(encoding="utf-8")
 
+class Confirm07_1ErrorTypeTestCase(Confirm07_1FixtureMixin, unittest.TestCase):
     def test_project_skill_count_exceeded_is_accepted(self):
         """project_skill_count_exceeded → confirm上、未知error扱いにならない"""
         self.setup_errors(["project_skill_count_exceeded"])
@@ -195,6 +200,89 @@ class Confirm07_1ErrorTypeTestCase(unittest.TestCase):
         self.assertIn("project_skill_count_exceeded", confirm_mod.ALLOWED_ERROR_TYPES)
         self.assertIn("llm_output_truncated", confirm_mod.ALLOWED_ERROR_TYPES)
         self.assertNotIn("some_unknown_error_type", confirm_mod.ALLOWED_ERROR_TYPES)
+
+
+class ConfirmNoteTruncatedCountTestCase(Confirm07_1FixtureMixin, unittest.TestCase):
+    """run_metadata.note_truncated_count のoptional検証（regression）"""
+
+    def test_missing_key_is_ok_for_past_runs(self):
+        """keyなし（過去run互換）→ OK"""
+        self.setup_errors(["missing_resource_skillsheet"])
+        self.assertEqual(self.run_confirm(), 0)
+        text = self.result_text()
+        self.assertNotIn("note_truncated", text)
+        self.assertIn("【結果】OK", text)
+
+    def test_zero_is_ok(self):
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": 0}
+        )
+        self.assertEqual(self.run_confirm(), 0)
+        text = self.result_text()
+        self.assertIn("note_truncated   : 0", text)
+        self.assertIn("【結果】OK", text)
+
+    def test_positive_int_is_ok(self):
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": 7}
+        )
+        self.assertEqual(self.run_confirm(), 0)
+        text = self.result_text()
+        self.assertIn("note_truncated   : 7", text)
+        self.assertIn("【結果】OK", text)
+
+    def test_negative_is_ng(self):
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": -1}
+        )
+        self.assertEqual(self.run_confirm(), 1)
+        text = self.result_text()
+        self.assertIn("note_truncated_count が0以上のintでない", text)
+        self.assertIn("【結果】NG", text)
+
+    def test_bool_true_is_ng(self):
+        """boolはintのsubclassだが明示的に拒否する"""
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": True}
+        )
+        self.assertEqual(self.run_confirm(), 1)
+        text = self.result_text()
+        self.assertIn("note_truncated_count が0以上のintでない", text)
+        self.assertIn("【結果】NG", text)
+
+    def test_string_is_ng(self):
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": "3"}
+        )
+        self.assertEqual(self.run_confirm(), 1)
+        self.assertIn("【結果】NG", self.result_text())
+
+    def test_none_is_ng(self):
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": None}
+        )
+        self.assertEqual(self.run_confirm(), 1)
+        self.assertIn("【結果】NG", self.result_text())
+
+    def test_count_checks_are_not_weakened(self):
+        """件数整合・スキーマチェックが従来どおり効いていること"""
+        self.setup_errors(
+            ["missing_resource_skillsheet"], {"note_truncated_count": 2}
+        )
+        # 入力ペア数だけ増やすと従来どおり件数不一致でNGになる
+        with open(self.pairs_file, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "project_info": {"message_id": "P9999"},
+                        "resource_info": {"message_id": "R9999"},
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        self.assertEqual(self.run_confirm(), 1)
+        self.assertIn("【結果】NG", self.result_text())
 
 
 if __name__ == "__main__":

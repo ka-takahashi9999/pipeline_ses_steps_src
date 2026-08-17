@@ -95,9 +95,10 @@ def _check_skill_list(
                 issues.append(
                     f"{prefix}skill変更検出: 元='{expected_skill}' 結果='{item.get('skill')}'"
                 )
-        # match チェック
-        if item.get("match") not in (True, False):
-            issues.append(f"{prefix}matchがtrue/false以外: {item.get('match')!r}")
+        # match チェック（1 / 0 は True / False と等価比較されるため型で判定する）
+        match = item.get("match")
+        if not isinstance(match, bool):
+            issues.append(f"{prefix}matchがtrue/false以外: {match!r}")
         # note チェック
         note = item.get("note")
         if not isinstance(note, str) or not note.strip():
