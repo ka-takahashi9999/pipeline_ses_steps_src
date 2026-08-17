@@ -584,6 +584,91 @@ class TestCurrentRunDateProtection(RetentionTestBase):
         again = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
         self.assertEqual(again["deleted_files"], 0)
 
+    def run_main_apply(self):
+        """main() 経由でapplyし、終了コードを返す（非正常終了を直接確認するため）。"""
+        sys_argv = sys.argv
+        sys.argv = [
+            "manage_09_result_retention.py",
+            "--apply",
+            "--run-date",
+            self.CURRENT,
+            "--pipeline-root",
+            str(self.root),
+            "--bucket",
+            BUCKET,
+            "--status-prefix",
+            STATUS_PREFIX,
+            "--region",
+            "ap-northeast-1",
+        ]
+        try:
+            return target.main()
+        finally:
+            sys.argv = sys_argv
+
+    def test_rerun_after_rmdir_failure_keeps_current_and_previous(self):
+        """
+        Path.rmdir() が途中で1回失敗しても、
+        current / previous successful を壊さず、再実行で残ったold成果物だけを削除できること。
+        """
+        keep = {self.CURRENT, self.PREVIOUS}
+        before = self.snapshot(keep)
+        self.assertTrue(before)
+        old_run_dates_before = [
+            d for d in self.present_run_dates(self.root, self.CURRENT) if d not in keep
+        ]
+        self.assertTrue(old_run_dates_before)
+        old_files_before = self.snapshot(old_run_dates_before)
+        self.assertTrue(old_files_before)
+
+        original_rmdir = Path.rmdir
+        state = {"count": 0}
+
+        def flaky_rmdir(self_path, *rmdir_args, **rmdir_kwargs):
+            # 何件かのold成果物を削除し終えた「途中」で1回だけ失敗させる
+            state["count"] += 1
+            if state["count"] == 3:
+                raise OSError("simulated I/O error during rmdir")
+            return original_rmdir(self_path, *rmdir_args, **rmdir_kwargs)
+
+        # 1回目: rmdir途中失敗 → 非正常終了(exit=1)
+        Path.rmdir = flaky_rmdir
+        try:
+            self.assertEqual(self.run_main_apply(), 1)
+        finally:
+            Path.rmdir = original_rmdir
+        self.assertEqual(state["count"], 3, msg="rmdirは失敗地点で停止すること")
+
+        # 「例外が出ただけ」ではなく、実際に部分削除された状態であること
+        old_files_after_failure = self.snapshot(old_run_dates_before)
+        self.assertLess(
+            len(old_files_after_failure),
+            len(old_files_before),
+            msg="rmdir失敗前にold成果物が一部削除されている（部分削除状態）こと",
+        )
+        self.assertTrue(
+            [d for d in self.present_run_dates(self.root, self.CURRENT) if d not in keep],
+            msg="再実行で削除すべきold成果物が残っていること",
+        )
+
+        # 失敗後も current / previous の全path・sizeは不変
+        self.assertEqual(self.snapshot(keep), before)
+
+        # 2回目: 通常applyで残ったold成果物だけが削除される
+        summary = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        self.assertGreater(summary["removed_dirs"], 0)
+        self.assertEqual(self.snapshot(keep), before)
+        self.assertEqual(self.present_run_dates(self.root, self.CURRENT), sorted(keep))
+        for run_date in old_run_dates_before:
+            self.assertNotIn(run_date, self.present_run_dates(self.root, self.CURRENT))
+
+        # 3回目: 削除対象0件で正常終了（冪等）
+        again = target.run(self.make_args(self.root, self.CURRENT, apply_mode=True), self.logger)
+        self.assertEqual(again["planned_delete_files"], 0)
+        self.assertEqual(again["deleted_files"], 0)
+        self.assertEqual(again["removed_dirs"], 0)
+        self.assertEqual(self.snapshot(keep), before)
+
 
 class TestDryRunAndIdempotency(RetentionTestBase):
     def test_dry_run_deletes_nothing_then_apply_then_rerun_is_zero(self):
