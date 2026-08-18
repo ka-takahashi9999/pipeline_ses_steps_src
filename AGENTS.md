@@ -153,6 +153,7 @@ LLMを使用してよいstepは以下のみ:
 02-1補助
 03-50
 07-1
+08-5
 10_assistance_tool
 ```
 
@@ -160,6 +161,9 @@ LLMを使用してよいstepは以下のみ:
 - LLMはOpenAIを使用する（anthropicライブラリの使用禁止）
 - これらのstepは夜間自動Pipelineでも実行される。
   手動で単発実行する場合はコスト・実行時間に留意し、必要なら件数を絞る
+- 本一覧は**利用を許可するstep**であり、**現在実際に呼んでいるstepの一覧ではない**。
+  02-1 / 03-50 は実装ありだが feature flag OFF のため現在は呼ばない（§11参照）。
+  現在の実使用状況は `PIPELINE_OVERVIEW.md` の「LLM利用マトリクス」を正とする
 
 ---
 
@@ -170,6 +174,9 @@ LLMを使用してよいstepは以下のみ:
   - Gmail: `/gmail/credentials` / OpenAI: `/openai/api_key`
 - S3: `s3://technoverse/pipeline_ses_steps/`
 - feature flag: 03-8 / 05-8 / 06-8 / 03-9 / 05-9 / 06-9 は設定ファイルで有効/無効切替
+- LLM系 feature flag（いずれも現在OFF。ONにする場合は関連docsのLLM使用表記も更新する）
+  - `USE_LLM_CLASSIFY=False`（`02-1_classify_type_project_resource/00_tool/config.py`）→ 02-1 のLLM分類補助を無効化
+  - `USE_LLM_FALLBACK=False`（`03-50_extract_project_required_skills/00_tool/config.py`）→ 03-50 のLLMフォールバック抽出を無効化
 
 ---
 

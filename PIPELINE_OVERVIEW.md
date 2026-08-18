@@ -15,9 +15,24 @@
 
 - `AGENTS.md` の「LLM利用制限」は**利用を許可するstepの一覧**であり、実際に使用しているstepの一覧ではない。
   「許可されている」≠「現在使用している」。
-- 本表記は各stepの `00_tool`（= runnerが実行するコード）を対象とする。
-  `10_assistance_tool/` の手動補助ツールは本番Pipelineの実行対象外のため、この表記には含めない。
+- 各step節の `LLM使用` 表記は、そのstepの `00_tool`（= runnerがstepとして実行するコード）を対象とする。
+  `10_assistance_tool/` は step本体とは別枠だが、**一部のツールは夜間Pipelineから自動実行される**
+  （`run_full_pipeline*.sh` → `00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh`）。
+  「全て手動」「本番対象外」ではないため、下記マトリクスの別枠行で扱う。
 - feature flagをONにする場合は、当該stepの記述と本ドキュメントのLLM使用表記も併せて更新すること。
+
+### LLM利用マトリクス（見取り図）
+
+役割分担: 許可ポリシーは `AGENTS.md` §10、step内部の使い方は各stepの `explain_*.md`、
+review観点は `99_reference/review_points/`（runtimeのsource of truthではない）。本表は現状の見取り図のみ。
+
+| 対象 | 現在の状態 | feature flag | model | 備考 |
+|---|---|---|---|---|
+| 02-1 | 実装あり / 現在未使用 | `USE_LLM_CLASSIFY=False` | `gpt-4o-mini` | ON時のみ。`ambiguous`/`unknown` の分類補助 |
+| 03-50 | 実装あり / 現在未使用 | `USE_LLM_FALLBACK=False` | `gpt-4o-mini` | ON時のみ。ルール抽出が空の場合のfallback |
+| 07-1 | 使用中 | なし | `gpt-4o-mini` | step本体。Cache MISSペアの適合判定 |
+| 08-5 | 使用中 | なし | `gpt-4o` | step本体。高スコア帯の必須スキル再判定 |
+| 10_assistance_tool | 一部を夜間自動実行 | 各toolによる（現状flagなし） | 主に `gpt-4o-mini`（`call_llm` 既定値） | step本体とは別枠。自動実行は `suggest_*_dictionary.py` 6本（03-8 / 03-9 / 03-10 / 05-8 / 05-9 / 05-10）。`check_*` / `investigate_*` 系は手動専用 |
 
 ## 01-1_fetch_gmail
 - **目的**：Step 01-1: Gmail取得スクリプト
