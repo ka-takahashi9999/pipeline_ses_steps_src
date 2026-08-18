@@ -1,5 +1,24 @@
 # PIPELINE_OVERVIEW
 
+## 「LLM使用」表記の凡例
+
+判定は常に active implementation（現行runner `00_pipeline/00_tool/run_full_pipeline*.sh` から実行されるコードと
+その `config.py`）を正本とする。本ドキュメントの記述を根拠に判定しないこと。
+
+| 表記 | 意味 |
+|---|---|
+| `LLM使用：有` | 現行の本番実行で実際にLLM APIを呼ぶ |
+| `LLM使用：無（実装あり / feature flag OFF）` | LLM呼び出し実装は存在するが、feature flagが `False` のため本番では呼ばれない |
+| `LLM使用：無` | 当該stepの `00_tool` にLLM呼び出し実装が存在しない |
+
+注意点:
+
+- `AGENTS.md` の「LLM利用制限」は**利用を許可するstepの一覧**であり、実際に使用しているstepの一覧ではない。
+  「許可されている」≠「現在使用している」。
+- 本表記は各stepの `00_tool`（= runnerが実行するコード）を対象とする。
+  `10_assistance_tool/` の手動補助ツールは本番Pipelineの実行対象外のため、この表記には含めない。
+- feature flagをONにする場合は、当該stepの記述と本ドキュメントのLLM使用表記も併せて更新すること。
+
 ## 01-1_fetch_gmail
 - **目的**：Step 01-1: Gmail取得スクリプト
 - **入力**：主入力なし
@@ -32,7 +51,10 @@
 - **目的**：Step 02-1: メール種別分類スクリプト（案件 / 要員 / あいまい / 不明）
 - **入力**：`01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl`, `01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl`, `01-3_remove_individual_email/01_result/remove_individual_emails_raw.jsonl`
 - **出力**：`classify_types_project_resource.jsonl`, `99_no_classify_types_project_resource.jsonl`
-- **LLM使用**：無
+- **LLM使用**：無（実装あり / feature flag OFF）
+  - `llm_classify` 内に `common.llm_client.call_llm_with_fallback` の呼び出しがあるが、`config.py` の `USE_LLM_CLASSIFY=False` のため本番では呼ばれない
+  - flag ON時のみ、ルール判定が `ambiguous` / `unknown` のメールに対して model `gpt-4o-mini` で分類補助する
+  - flagをONにする場合は本ドキュメントのLLM使用表記も更新すること
 - **備考**：JSONL前提の後続処理との整合に注意が必要です。 / `message_id` を主キーとする処理との整合が必要です。
 
 ## 02-2_classify_output_file_project_resource
@@ -123,7 +145,10 @@
 - **目的**：Step 03-50: 案件メールから必須スキル・尚可スキルをルールベースで抽出 （LLMはフォールバック限定）
 - **入力**：`01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl`, `02-2_classify_output_file_project_resource/01_result/projects.jsonl`
 - **出力**：`extract_project_required_skills.jsonl`, `99_skill_null_extract_project_required_skills.jsonl`, `99_rule_empty_extract_project_required_skills.jsonl`, `01_result/extract_project_required_skills.jsonl`
-- **LLM使用**：無
+- **LLM使用**：無（実装あり / feature flag OFF）
+  - `llm_extract_skills` 内に `common.llm_client.call_llm_with_fallback` の呼び出しがあるが、`config.py` の `USE_LLM_FALLBACK=False` のため本番では呼ばれない
+  - flag ON時のみ、ルール抽出が空のレコードに対して model `gpt-4o-mini` でフォールバック抽出する
+  - flagをONにする場合は本ドキュメントのLLM使用表記も更新すること
 - **備考**：JSONL前提の後続処理との整合に注意が必要です。 / `message_id` を主キーとする処理との整合が必要です。
 
 ## 03-51_extract_project_required_skills_list
@@ -343,6 +368,13 @@
 - **出力**：`08-4_match_score_sort/01_result`
 - **LLM使用**：無
 - **備考**：実装根拠はこのPythonファイル本体を優先してください。
+
+## 08-5_high_score_required_skill_recheck
+- **目的**：08-5_high_score_required_skill_recheck 08-4の高スコア帯（100percent / 80to99percent）を対象に、必須スキル充足の確度を再チェックする。07-1の判定結果は変更しない。
+- **入力**：`08-4_match_score_sort/01_result/match_score_sort_100percent.jsonl`, `08-4_match_score_sort/01_result/match_score_sort_80to99percent.jsonl`, `04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl`, `01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl`
+- **出力**：`high_score_required_skill_recheck_all.jsonl`, `high_score_required_skill_recheck_confirmed.jsonl`, `high_score_required_skill_recheck_human_review.jsonl`, `high_score_required_skill_recheck_not_confirmed.jsonl`, `99_error_high_score_required_skill_recheck.jsonl`
+- **LLM使用**：有（`common.llm_client.call_llm` / モデル `gpt-4o`）。必須スキル充足の再判定に使用し、feature flagによる無効化はない（無条件で呼ばれる）。LLM出力不正時は `llm_parse_error` として人間確認へ回す
+- **備考**：実装根拠はこのPythonファイル本体を優先してください。 / `AGENTS.md` の「LLM利用制限」の許可step一覧に本stepは未記載。実装とポリシーのどちらを正とするか要確認
 
 ## 09-1_mail_display_format
 - **目的**：09-1_mail_display_format マッチペアを人間可読形式で1ペア1ファイル出力し、S3に保存する。

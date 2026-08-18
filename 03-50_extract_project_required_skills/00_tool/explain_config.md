@@ -13,9 +13,10 @@
 - 主な設定項目: `USE_LLM_FALLBACK`
 
 ## LLM使用有無と使用箇所
-- LLM使用: 無
-- `USE_LLM_FALLBACK` の既定値が `False` のため、通常処理経路ではLLMを呼び出しません。
-- `True` にした場合のみ、ルール抽出が空のレコードに対してLLMフォールバックが動作します。
+- LLM使用: 無（実装あり / feature flag OFF）
+- `USE_LLM_FALLBACK` の既定値が `False` のため、現行の本番実行ではLLMを呼び出しません。
+- `True` にした場合のみ、ルール抽出が空のレコードに対して model `gpt-4o-mini` のLLMフォールバックが動作します。
+- `USE_LLM_FALLBACK` をONにする場合は、本ドキュメントと `PIPELINE_OVERVIEW.md` のLLM使用表記も更新すること。
 
 ## エラー時の挙動
 - 明示的な異常系分岐は少なく、例外送出または呼び出し元処理に委ねます。

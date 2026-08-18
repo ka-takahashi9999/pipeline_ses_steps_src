@@ -29,10 +29,12 @@
 - `rule_extract_skills`: 状態遷移:
 
 ## LLM使用有無と使用箇所
-- LLM使用: 無
+- LLM使用: 無（実装あり / feature flag OFF）
 - `common.llm_client.call_llm_with_fallback` の呼び出しは `llm_extract_skills` 内に存在しますが、
-  `USE_LLM_FALLBACK=False`（`config.py` 既定値）のため通常処理経路では呼ばれません。
+  `USE_LLM_FALLBACK=False`（`config.py` 既定値）のため現行の本番実行では呼ばれません。
 - 呼び出し条件: `extract_skills` でルール抽出が空、かつスキル指標にマッチ、かつ `USE_LLM_FALLBACK=True` の場合のみ。
+- flag ON時に使用するmodel: `gpt-4o-mini`（`llm_extract_skills` 内で直接指定）。
+- `USE_LLM_FALLBACK` をONにする場合は、本ドキュメントと `PIPELINE_OVERVIEW.md` のLLM使用表記も更新すること。
 
 ## エラー時の挙動
 - 例外時は `write_error_log` でエラーログを残します。
