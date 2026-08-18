@@ -388,7 +388,7 @@ review観点は `99_reference/review_points/`（runtimeのsource of truthでは�
 - **目的**：08-5_high_score_required_skill_recheck 08-4の高スコア帯（100percent / 80to99percent）を対象に、必須スキル充足の確度を再チェックする。07-1の判定結果は変更しない。
 - **入力**：`08-4_match_score_sort/01_result/match_score_sort_100percent.jsonl`, `08-4_match_score_sort/01_result/match_score_sort_80to99percent.jsonl`, `04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl`, `01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl`
 - **出力**：`high_score_required_skill_recheck_all.jsonl`, `high_score_required_skill_recheck_confirmed.jsonl`, `high_score_required_skill_recheck_human_review.jsonl`, `high_score_required_skill_recheck_not_confirmed.jsonl`, `99_error_high_score_required_skill_recheck.jsonl`
-- **LLM使用**：有（`common.llm_client.call_llm` / モデル `gpt-4o`）。必須スキル充足の再判定に使用。feature flagなし。call条件を満たすrecordでLLMを呼び出す（`no_match` やスキルシート利用不可のrecordはLLM未呼出）。エラーはJSON parse失敗=`llm_parse_error` / parse後のschema・validation不合格=`invalid_output_schema` / call失敗=`llm_call_error` と別typeで記録し、いずれも人間確認へ回す。詳細は `00_tool/explain_high_score_required_skill_recheck.md`
+- **LLM使用**：有（`common.llm_client.call_llm` / モデル `gpt-4o`）。必須スキル充足の再判定に使用。feature flagなし。call条件を満たすrecordでLLMを呼び出す（`no_match` やスキルシート利用不可のrecordはLLM未呼出）。エラーは、LLM応答を正常に解釈できない場合（JSON parse失敗・LLM出力の途中終了など）=`llm_parse_error` / parse後のschema・validation不合格=`invalid_output_schema` / call自体の失敗=`llm_call_error` と別typeで記録し、いずれも人間確認へ回す。詳細は `00_tool/explain_high_score_required_skill_recheck.md`
 - **備考**：実装根拠はこのPythonファイル本体を優先してください。 / `AGENTS.md` §10 でLLM利用許可済み。現在のactive実装で使用中
 
 ## 09-1_mail_display_format
