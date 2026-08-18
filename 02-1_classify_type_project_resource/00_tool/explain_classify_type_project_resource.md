@@ -23,7 +23,9 @@
 
 ## LLM使用有無と使用箇所
 - LLM使用: 無
-- コード上にLLMクライアント呼び出しは見当たりません。
+- `common.llm_client.call_llm_with_fallback` の呼び出しは `llm_classify` 内に存在しますが、
+  `USE_LLM_CLASSIFY=False`（`config.py` 既定値）のため通常処理経路では呼ばれません。
+- 呼び出し条件: `mail_type` が `ambiguous` / `unknown` かつ `USE_LLM_CLASSIFY=True` の場合のみ。
 
 ## エラー時の挙動
 - 例外時は `write_error_log` でエラーログを残します。

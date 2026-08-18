@@ -30,7 +30,9 @@
 
 ## LLM使用有無と使用箇所
 - LLM使用: 無
-- コード上にLLMクライアント呼び出しは見当たりません。
+- `common.llm_client.call_llm_with_fallback` の呼び出しは `llm_extract_skills` 内に存在しますが、
+  `USE_LLM_FALLBACK=False`（`config.py` 既定値）のため通常処理経路では呼ばれません。
+- 呼び出し条件: `extract_skills` でルール抽出が空、かつスキル指標にマッチ、かつ `USE_LLM_FALLBACK=True` の場合のみ。
 
 ## エラー時の挙動
 - 例外時は `write_error_log` でエラーログを残します。
