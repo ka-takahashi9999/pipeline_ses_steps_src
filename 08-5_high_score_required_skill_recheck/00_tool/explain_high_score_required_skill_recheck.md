@@ -85,7 +85,11 @@
 - 全リトライ失敗時は `RuntimeError`、`finish_reason=length` の途中終了は `LLMOutputTruncatedError`（`ValueError` 系）。
 
 ### error handling
-例外は握りつぶさず、**すべて「記録して継続」**。step自体は止めない（入力ファイル欠落時のみ停止）。
+例外は握りつぶさない。record単位で捕捉される想定エラーは
+**error記録 → `human_review` 等へfallback → 他recordの処理を継続**する。
+一方、record単位の `try` の外側で発生する異常（入出力ファイルのI/O失敗、JSONL読込時のstep-level異常、
+出力初期化失敗、結果書込み失敗など）では**step自体が停止し得る**。
+「すべてのエラーで必ず処理継続する」わけではない。
 
 | error_type | 発生条件 |
 |---|---|
@@ -107,7 +111,11 @@
 
 ## エラー時の挙動
 - 入力ファイル欠落時は `logger.error` の上 `sys.exit(1)` で**停止**。
-- レコード単位の異常は上表の `error_type` で `99_error_*.jsonl` に**記録して継続**。
+- record単位で捕捉される想定エラー（`missing_resource_skillsheet` / `llm_parse_error` /
+  `llm_call_error` / `invalid_output_schema` / `unexpected_error`）は上表の `error_type` で
+  `99_error_*.jsonl` に**記録し、当該recordをfallbackで出力して次のrecordへ継続**。
+- record単位の `try` の外側（I/O・JSONL読込・出力初期化・結果書込みなど）で発生した例外は
+  捕捉されないため、**step自体が停止し得る**。
 - 実行時間と件数は `write_execution_time` で `99_execution_time/` に残す。
 
 ## 注意事項
