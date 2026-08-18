@@ -14,7 +14,7 @@ SESマッチングPipelineの実行系スクリプトと共通設定の置き場
 | `run_full_pipeline_managed.sh` | active runnerの実行管理wrapper。ロック / status発行 / ログS3アップロード / 終了コード確定 | ○（実行経路） | 非同期launcherから起動される |
 | `launch_full_pipeline_async.sh` | Step Functions / SSM からの非同期起動入口。`systemd-run` でPipeline本体を切り離す | ○（起動入口） | SSM command lifecycleと長時間実行を分離する |
 | `pipeline_s3_config.env` | Pipeline共通のS3 / region / Portal設定の正本 | ○（設定正本） | 秘密値は保持しない。値の変更は影響範囲を確認のうえ実施 |
-| `run_full_pipeline_20260505.sh` | 2026/05/05時点のhistorical runner snapshot。現在の本番Pipelineでは未使用 | ×（legacy） | **削除候補**。active参照0。Git未管理のため削除すると復元不可 |
+| `README.md` | このディレクトリの用途と運用ルール | －（ドキュメント） | 実ファイル構成に合わせて更新する |
 
 Step Functions の状態機械定義 `stepfunctions_pipeline_orchestration.asl.json` は
 Git管理領域（`pipeline_ses_steps_src`）側に置かれており、実行workspaceには配置しない。
@@ -70,19 +70,6 @@ Pipeline共通のS3関連設定の正本。両runner系・launcherが `source` �
 - `PORTAL_S3_PREFIX` / `PORTAL_S3_VERIFY_WAIT_SEC`
 
 APIキー等の秘密情報はここではなくAWS SSM Parameter Storeで管理する。
-
-### run_full_pipeline_20260505.sh
-
-2026/05/05時点の **historical runner snapshot**。現在の本番Pipelineでは未使用で、**削除候補**。
-
-- active runner / managed / launcher / Step Functions定義 / tools / confirm / test / docs からの参照は0
-- 現行runnerが上位集合（このsnapshotにしか無いstep実行は0件）
-- 管理機構に非対応: `RUN_ID` / `flock` / status発行 / current_step の仕組みを持たない
-- 成果物保持・Portal同期step（80-7 / 80-8 / 80-9）を含まない
-- ログ出力先が `pipeline_script_exec_20260505.log` に固定
-
-このため単体起動は構文上可能でも、pipeline-status も Portal S3同期も行われず本番運用には使えない。
-active用途に流用しないこと。
 
 ---
 
