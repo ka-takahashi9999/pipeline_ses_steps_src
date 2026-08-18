@@ -2,7 +2,9 @@
 
 ## 目的
 - 07-1_requirement_skill_ai_matching
-- 06-80 の Cache MISS ペアに対し、案件の required_skills / optional_skills を
+- 06-80 の Cache MISS ペアに対し、03-50 が抽出した案件の required_skills / optional_skills を
+  04-2 normalized の要員スキルシート本文を根拠にLLMで適合判定し、
+  skill単位の `match` / `note` を出力する。
 
 ## 実装（正本）
 - 本番active実装は `07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py` のみ。

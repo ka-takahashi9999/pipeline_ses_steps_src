@@ -1,12 +1,13 @@
 """
 07-1_requirement_skill_ai_matching
-06-12 通過ペアに対し、案件の required_skills / optional_skills を
+06-80 の新規(Cache MISS)ペアに対し、案件の required_skills / optional_skills を
 要員スキルシート本文を根拠に LLM で評価する。
 
 LLM使用許可step。手動実行推奨（nohup使用）。
 小規模テスト: python3 requirement_skill_ai_matching.py --limit 100
 
-04-2 normalized skillsheet を利用する暫定版。元の 07-1 本体は変更しない。
+入力スキルシートは 04-2 normalize_skillsheets_text。
+04-1 raw skillsheet を入力にしていた旧実装は削除済みで、本ファイルが 07-1 唯一のactive実装。
 """
 
 import argparse
@@ -278,11 +279,11 @@ def process_pair(
             f"total={total_skill_count} limit={MAX_PROJECT_SKILLS_PER_PAIR}",
         )
 
-    # 04-1 join
+    # 04-2 join
     ss_rec = skillsheet_map.get(r_mid)
     if not ss_rec:
         return None, _make_error(p_mid, r_mid, "missing_resource_skillsheet",
-                                  f"04-1にmessage_id={r_mid}のデータなし")
+                                  f"04-2にmessage_id={r_mid}のデータなし")
     if not ss_rec.get("success", False):
         return None, _make_error(p_mid, r_mid, "missing_resource_skillsheet",
                                   "skillsheet.success=false")
@@ -391,7 +392,7 @@ def main() -> None:
 
     # 入力ファイル存在確認
     for path, label in [
-        (INPUT_PAIRS, "06-20新規ペア"),
+        (INPUT_PAIRS, "06-80新規(Cache MISS)ペア"),
         (INPUT_PROJECT_SKILLS, "03-50プロジェクトスキル"),
         (INPUT_SKILLSHEETS, "04-2 normalizedスキルシート"),
     ]:
@@ -408,13 +409,13 @@ def main() -> None:
             project_skills_map[str(mid)] = rec
     logger.info(f"03-50 完了: {len(project_skills_map)}件")
 
-    logger.info("04-1 スキルシート読み込み中...")
+    logger.info("04-2 normalizedスキルシート読み込み中...")
     skillsheet_map: Dict[str, Any] = {}
     for rec in read_jsonl(str(INPUT_SKILLSHEETS)):
         mid = rec.get("message_id")
         if mid:
             skillsheet_map[str(mid)] = rec
-    logger.info(f"04-1 完了: {len(skillsheet_map)}件")
+    logger.info(f"04-2 完了: {len(skillsheet_map)}件")
 
     input_count = 0
     if INPUT_PAIRS.exists():
