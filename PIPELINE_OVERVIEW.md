@@ -309,12 +309,12 @@
 - **備考**：JSONL前提の後続処理との整合に注意が必要です。 / comparison_key の空値・cacheのschema不整合・重複キーは Cache MISS へ逃がさず fail-fast します。 / `bk_duplicate_proposal_check_diff_file.jsonl` は監査用途のみで判定には使いません。
 
 ## 07-1_requirement_skill_ai_matching
-- **目的**：07-1_requirement_skill_ai_matching 06-80 の Cache MISS ペアに対し、案件の required_skills / optional_skills を
+- **目的**：07-1_requirement_skill_ai_matching 06-80 の Cache MISS ペアに対し、案件の required_skills / optional_skills を要員スキルシートとLLMで適合判定する
 - **入力**：`06-80_duplicate_proposal_check/01_result/duplicate_proposal_check.jsonl`, `03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl`, `04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl`
 - **出力**：`07-1_requirement_skill_ai_matching/01_result/requirement_skill_ai_matching.jsonl`, `07-1_requirement_skill_ai_matching/01_result/99_error_requirement_skill_ai_matching.jsonl`, `07-1_requirement_skill_ai_matching/01_result/run_metadata.json`
 - **実装**：active実装は `07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py` のみ（04-1 raw skillsheet 前提の旧実装は削除済み）
-- **LLM使用**：無
-- **備考**：JSONL前提の後続処理との整合に注意が必要です。 / `message_id` を主キーとする処理との整合が必要です。
+- **LLM使用**：有（`common.llm_client.call_llm` / モデル `gpt-4o-mini`）。判定結果はJSONで受け取り schema validation する（parse失敗=`llm_parse_error` / schema不正=`invalid_output_schema`）
+- **備考**：JSONL前提の後続処理との整合に注意が必要です。 / `message_id` を主キーとする処理との整合が必要です。 / 判定成功結果は 08-1 へ渡り、Success Cache へ upsert される（errorは登録しない）
 
 ## 08-1_restore_and_merge_requirement_skill_ai_matching
 - **目的**：08-1_restore_and_merge_requirement_skill_ai_matching Cache HIT ペアを Success Cache の評価結果から復元して current run の `message_id` へ rebind し、07-1 の新規成功結果とマージして全件完成版を作る。その後、今回の 07-1 正常結果だけを comparison_key 単位で Success Cache へ upsert する（error は登録しない）。

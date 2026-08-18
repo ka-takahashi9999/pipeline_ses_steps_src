@@ -25,8 +25,11 @@
 - `process_pair`: 1ペアを処理。
 
 ## LLM使用有無と使用箇所
-- LLM使用: 無
-- コード上にLLMクライアント呼び出しは見当たりません。
+- LLM使用: 有（`common.llm_client.call_llm` / モデル `gpt-4o-mini`）
+- 使用箇所: `process_pair` 内。案件要件（required_skills / optional_skills）と要員スキルシートの
+  適合判定にLLMを使用する。
+- 判定結果はJSON形式で受け取り、`_validate_skills` でschema validationする。
+  parse失敗は `llm_parse_error`、parse成功後のschema不正は `invalid_output_schema` として分離する。
 
 ## エラー時の挙動
 - 致命的な異常時は `sys.exit(1)` で停止します。
