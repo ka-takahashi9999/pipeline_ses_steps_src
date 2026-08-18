@@ -1,7 +1,7 @@
 """
 07-1 表示用note文字数正規化 / schema検証契約の focused test
 
-**test対象は本番runnerが実行する active normalized版**
+**test対象は本番runnerが実行する active normalized版（07-1の唯一の実装）**
   07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py
 
 確認内容:
@@ -33,10 +33,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 STEP_DIR = PROJECT_ROOT / "07-1_requirement_skill_ai_matching"
-# 本番runnerが実行するactive実装
+# 本番runnerが実行するactive実装（07-1の唯一の実装）
 ACTIVE_SCRIPT = STEP_DIR / "00_tool/normalized/requirement_skill_ai_matching.py"
-# runnerに接続されていないraw版（bool契約の乖離防止のためだけに参照する）
-RAW_SCRIPT = STEP_DIR / "00_tool/requirement_skill_ai_matching.py"
 RUNNERS = (
     PROJECT_ROOT / "00_pipeline/00_tool/run_full_pipeline.sh",
     PROJECT_ROOT / "00_pipeline/00_tool/run_full_pipeline_master.sh",
@@ -51,7 +49,6 @@ def load_module(name: str, path: Path):
 
 
 active_mod = load_module("active_normalized_07_1_under_test", ACTIVE_SCRIPT)
-raw_mod = load_module("raw_07_1_for_parity_check", RAW_SCRIPT)
 
 from common.logger import get_logger  # noqa: E402
 
@@ -437,40 +434,37 @@ class RunMetadataNoteTruncatedCountTestCase(unittest.TestCase):
         self.assertEqual(metadata["note_truncated_count"], 0)
 
 
-class ValidatorParityTestCase(unittest.TestCase):
-    """active normalized版とraw版で validator 契約が乖離していないこと。"""
+class ValidatorContractTestCase(unittest.TestCase):
+    """active normalized版の validator 契約（match bool / note切り詰め）を直接確認する。"""
 
     ORIGINAL = [{"skill": REQUIRED_SKILL}]
 
-    def _validate(self, mod, match: Any, note: Any):
-        return mod._validate_skills(
+    def _validate(self, match: Any, note: Any):
+        return active_mod._validate_skills(
             self.ORIGINAL,
             [{"skill": REQUIRED_SKILL, "match": match, "note": note}],
             "required_skills",
         )
 
-    def test_both_reject_int_match(self):
-        for mod in (active_mod, raw_mod):
-            self.assertIsNotNone(self._validate(mod, 1, NOTE_29))
-            self.assertIsNotNone(self._validate(mod, 0, NOTE_29))
+    def test_reject_int_match(self):
+        self.assertIsNotNone(self._validate(1, NOTE_29))
+        self.assertIsNotNone(self._validate(0, NOTE_29))
 
-    def test_both_accept_bool_match(self):
-        for mod in (active_mod, raw_mod):
-            self.assertIsNone(self._validate(mod, True, NOTE_29))
-            self.assertIsNone(self._validate(mod, False, NOTE_29))
+    def test_accept_bool_match(self):
+        self.assertIsNone(self._validate(True, NOTE_29))
+        self.assertIsNone(self._validate(False, NOTE_29))
 
-    def test_both_truncate_only_long_non_empty_notes(self):
-        for mod in (active_mod, raw_mod):
-            skills = [
-                {"skill": REQUIRED_SKILL, "match": True, "note": NOTE_31},
-                {"skill": OPTIONAL_SKILL, "match": True, "note": ""},
-                {"skill": "Java", "match": True, "note": None},
-            ]
-            truncated = mod._normalize_note_lengths(skills)
-            self.assertEqual(truncated, 1)
-            self.assertEqual(len(skills[0]["note"]), 30)
-            self.assertEqual(skills[1]["note"], "")
-            self.assertIsNone(skills[2]["note"])
+    def test_truncate_only_long_non_empty_notes(self):
+        skills = [
+            {"skill": REQUIRED_SKILL, "match": True, "note": NOTE_31},
+            {"skill": OPTIONAL_SKILL, "match": True, "note": ""},
+            {"skill": "Java", "match": True, "note": None},
+        ]
+        truncated = active_mod._normalize_note_lengths(skills)
+        self.assertEqual(truncated, 1)
+        self.assertEqual(len(skills[0]["note"]), 30)
+        self.assertEqual(skills[1]["note"], "")
+        self.assertIsNone(skills[2]["note"])
 
 
 if __name__ == "__main__":

@@ -310,8 +310,9 @@
 
 ## 07-1_requirement_skill_ai_matching
 - **目的**：07-1_requirement_skill_ai_matching 06-80 の Cache MISS ペアに対し、案件の required_skills / optional_skills を
-- **入力**：`06-80_duplicate_proposal_check/01_result/duplicate_proposal_check.jsonl`, `03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl`, `04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl`
+- **入力**：`06-80_duplicate_proposal_check/01_result/duplicate_proposal_check.jsonl`, `03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl`, `04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl`
 - **出力**：`07-1_requirement_skill_ai_matching/01_result/requirement_skill_ai_matching.jsonl`, `07-1_requirement_skill_ai_matching/01_result/99_error_requirement_skill_ai_matching.jsonl`, `07-1_requirement_skill_ai_matching/01_result/run_metadata.json`
+- **実装**：active実装は `07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py` のみ（04-1 raw skillsheet 前提の旧実装は削除済み）
 - **LLM使用**：無
 - **備考**：JSONL前提の後続処理との整合に注意が必要です。 / `message_id` を主キーとする処理との整合が必要です。
 

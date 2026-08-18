@@ -166,9 +166,7 @@ run_step "06-30_match_contract_type" "$ROOT/06-30_match_contract_type/00_tool/ma
 run_step "06-80_duplicate_proposal_check" "$ROOT/06-80_duplicate_proposal_check/00_tool/duplicate_proposal_check.py"
 
 # 07-1 は LLM使用step。06-80 で仕分けた Cache MISS（新規）ペアのみを処理する。
-# 07-1 raw版を使う場合はこちら
-#run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" #新規のみ全件
-#run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/requirement_skill_ai_matching.py" --limit 2000 #件数指定(100件を例)
+# 07-1 の実装は normalized版のみ（04-1 raw skillsheet 前提の旧実装は削除済み）。
 
 # 07-1 normalized版: 04-2 normalized skillsheet を利用
 run_step "07-1_requirement_skill_ai_matching" "$ROOT/07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py" #新規のみ全件

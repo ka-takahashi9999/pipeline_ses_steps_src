@@ -2,12 +2,16 @@
 
 ## 目的
 - 07-1_requirement_skill_ai_matching
-- 06-12 通過ペアに対し、案件の required_skills / optional_skills を
+- 06-80 の Cache MISS ペアに対し、案件の required_skills / optional_skills を
+
+## 実装（正本）
+- 本番active実装は `07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py` のみ。
+- 04-1 raw skillsheet を入力にしていた旧実装（`00_tool/requirement_skill_ai_matching.py`）は削除済み。
 
 ## 入力ファイルと参照方法
 - `06-80_duplicate_proposal_check/01_result/duplicate_proposal_check.jsonl`
 - `03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl`
-- `04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl`
+- `04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl`
 
 ## 出力ファイルと構造
 - `07-1_requirement_skill_ai_matching/01_result/requirement_skill_ai_matching.jsonl`
