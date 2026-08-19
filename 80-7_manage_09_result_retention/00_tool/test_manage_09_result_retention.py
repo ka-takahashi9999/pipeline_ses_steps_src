@@ -322,6 +322,7 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
             "pipeline_ses_steps/mail_display_extract_20260818.zip",
             "pipeline_ses_steps/mail_display_extract_20260817.zip",
             "pipeline_ses_steps/mail_display_extract_20260814.zip",
+            "pipeline_ses_steps/mail_display_extract_20260230.zip",
             "pipeline_ses_steps/mail_display_format_20260413.zip",
             (
                 "pipeline_ses_steps/pipeline_ses_steps/"
@@ -355,6 +356,9 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
         )
         self.assertNotIn(
             "pipeline_ses_steps/mail_display_format_20260413.zip", plan["target_keys"]
+        )
+        self.assertNotIn(
+            "pipeline_ses_steps/mail_display_extract_20260230.zip", plan["target_keys"]
         )
         self.assertEqual(len(plan["target_keys"]), 4)
 
@@ -483,14 +487,30 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
         self.assertEqual(plan["target_keys"], [])
         self.assertEqual(plan["delete_candidate_keys"], [])
 
-    def test_invalid_calendar_date_in_exact_pattern_fails_closed(self):
-        with self.assertRaises(target.RetentionError):
-            target.plan_root_distribution_zip_retention(
-                ["pipeline_ses_steps/mail_display_extract_20260230.zip"],
-                self.BASE_PREFIX,
-                self.CURRENT,
-                ["20260818"],
-            )
+    def test_current_and_invalid_date_without_previous_passes(self):
+        current_key = "pipeline_ses_steps/mail_display_extract_20260819.zip"
+        invalid_key = "pipeline_ses_steps/mail_display_extract_20260230.zip"
+        plan = target.plan_root_distribution_zip_retention(
+            [current_key, invalid_key],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            [],
+        )
+        self.assertEqual(plan["target_keys"], [current_key])
+        self.assertEqual(plan["keep_keys"], [current_key])
+        self.assertEqual(plan["delete_candidate_keys"], [])
+
+    def test_invalid_date_only_is_noncanonical_and_does_not_fail(self):
+        invalid_key = "pipeline_ses_steps/mail_display_extract_20260230.zip"
+        plan = target.plan_root_distribution_zip_retention(
+            [invalid_key],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            [],
+        )
+        self.assertEqual(plan["target_keys"], [])
+        self.assertEqual(plan["keep_keys"], [])
+        self.assertEqual(plan["delete_candidate_keys"], [])
 
     def test_backup_generations_can_expand_without_changing_pattern(self):
         plan = target.plan_root_distribution_zip_retention(

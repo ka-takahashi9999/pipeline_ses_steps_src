@@ -370,7 +370,7 @@ def plan_root_distribution_zip_retention(
             continue
         run_date = match.group(1)
         if not _is_valid_calendar_date(run_date):
-            raise RetentionError(f"root ZIPに実在しない日付があります: {key}")
+            continue
         if run_date > current_run_date:
             raise RetentionError(
                 f"現在RUN_DATE({current_run_date})より新しいroot ZIPがあります: {key}"
