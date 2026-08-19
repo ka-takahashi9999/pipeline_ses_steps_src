@@ -2,8 +2,9 @@
 """
 80-7_manage_09_result_retention
 
-09系step（09-1 / 09-2 / 09-3 / 09-4 / 09-5）のRUN_DATE別成果物を
-「今回RUN_DATE」と「直前の正常終了RUN_DATE」の2世代だけローカル保持する。
+09系step（09-1 / 09-2 / 09-3 / 09-4 / 09-5）のRUN_DATE別成果物と
+S3 base prefix直下の外部配布ZIPを「今回RUN_DATE」と「直前の正常終了RUN_DATE」
+の2世代だけ保持する。
 
 直前の正常終了RUN_DATEの正本は S3 の
   s3://<bucket>/<base_prefix>/<status_prefix>/<RUN_DATE>/<RUN_ID>/status.json
@@ -15,6 +16,8 @@
 - 直前の正常RUN_DATEを安全に決定できず、かつ過去成果物が存在する場合は削除しない
 - --dry-run では削除0件（集計のみ）
 - 再実行時は削除0件で正常終了する（冪等）
+- S3削除は `^mail_display_extract_(\d{8})\.zip$` かつ実在日付のroot objectだけ
+- current / previous successful ZIPが無い場合やpreviousを決定できない場合は削除しない
 
 usage:
   manage_09_result_retention.py --dry-run [--run-date YYYYMMDD]
@@ -321,7 +324,7 @@ def plan_root_distribution_zip_retention(
     """
     S3 base prefix直下の外部配布ZIPについてKEEP / DELETE候補を計画する。
 
-    この純粋関数はS3 LIST/DELETEを行わず、active run()からも未接続。cutover時に
+    この純粋関数はS3 LIST/DELETEを行わない。active run()から、
     resolve_previous_successful_run_dates()の結果とroot object一覧を渡して利用する。
     """
     if not RUN_DATE_RE.fullmatch(current_run_date) or not _is_valid_calendar_date(
@@ -395,6 +398,111 @@ def plan_root_distribution_zip_retention(
         "delete_candidate_keys": [
             key for key, run_date in targets if run_date not in keep_run_dates
         ],
+    }
+
+
+def list_root_distribution_object_keys(
+    s3_client, bucket: str, base_prefix: str
+) -> List[str]:
+    """S3 base prefix直下のobject keyだけをLISTする（配下prefixは対象外）。"""
+    normalized_prefix = base_prefix.strip("/")
+    if not normalized_prefix:
+        raise RetentionError("base_prefixが空です")
+    root_prefix = f"{normalized_prefix}/"
+    keys: List[str] = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    try:
+        pages = paginator.paginate(Bucket=bucket, Prefix=root_prefix, Delimiter="/")
+        for page in pages:
+            for obj in page.get("Contents") or []:
+                key = obj.get("Key")
+                if not isinstance(key, str) or not key.startswith(root_prefix):
+                    raise RetentionError(f"S3 root LISTで不正keyが返却されました: {key!r}")
+                if "/" in key[len(root_prefix) :]:
+                    raise RetentionError(f"S3 root LISTに配下objectが混入しました: {key}")
+                keys.append(key)
+    except RetentionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - LIST失敗時は削除しない
+        raise RetentionError(f"S3 root objectのLISTに失敗しました: {exc}") from exc
+    return sorted(set(keys))
+
+
+def _required_root_zip_keys(
+    base_prefix: str, current_run_date: str, previous_successful_run_dates: List[str]
+) -> List[str]:
+    run_dates = [current_run_date] + sorted(set(previous_successful_run_dates), reverse=True)[
+        :ROOT_ZIP_BACKUP_GENERATIONS
+    ]
+    return [f"{base_prefix.strip('/')}/mail_display_extract_{run_date}.zip" for run_date in run_dates]
+
+
+def execute_root_distribution_zip_retention(
+    s3_client,
+    bucket: str,
+    base_prefix: str,
+    current_run_date: str,
+    previous_successful_run_dates: List[str],
+    apply_mode: bool,
+    logger,
+) -> Dict[str, Any]:
+    """root ZIPを事前検証し、apply時だけexact keyを個別削除して再LISTする。"""
+    before_keys = list_root_distribution_object_keys(s3_client, bucket, base_prefix)
+    plan = plan_root_distribution_zip_retention(
+        before_keys,
+        base_prefix,
+        current_run_date,
+        previous_successful_run_dates,
+    )
+    required_keys = _required_root_zip_keys(
+        base_prefix, current_run_date, previous_successful_run_dates
+    )
+    missing_required = [key for key in required_keys if key not in plan["keep_keys"]]
+    if missing_required:
+        raise RetentionError(f"root ZIPの必須KEEP対象が存在しません: {missing_required}")
+
+    delete_candidates = plan["delete_candidate_keys"]
+    logger.info(f"root ZIP KEEP: {plan['keep_keys']}")
+    logger.info(f"root ZIP DELETE候補: {delete_candidates}")
+
+    deleted_keys: List[str] = []
+    if apply_mode:
+        for key in delete_candidates:
+            filename = key[len(base_prefix.strip("/") + "/") :]
+            match = ROOT_DISTRIBUTION_ZIP_RE.fullmatch(filename)
+            if not match or not _is_valid_calendar_date(match.group(1)):
+                raise RetentionError(f"root ZIP削除直前のexact key検証に失敗しました: {key}")
+            try:
+                s3_client.delete_object(Bucket=bucket, Key=key)
+            except Exception as exc:  # noqa: BLE001 - 削除失敗はPipeline停止
+                raise RetentionError(f"root ZIPのDELETEに失敗しました: {key} ({exc})") from exc
+            deleted_keys.append(key)
+
+        after_keys = list_root_distribution_object_keys(s3_client, bucket, base_prefix)
+        after_plan = plan_root_distribution_zip_retention(
+            after_keys,
+            base_prefix,
+            current_run_date,
+            previous_successful_run_dates,
+        )
+        missing_after = [key for key in required_keys if key not in after_plan["keep_keys"]]
+        if missing_after or after_plan["delete_candidate_keys"]:
+            raise RetentionError(
+                "root ZIP apply後verifyに失敗しました "
+                f"(missing_keep={missing_after} / older={after_plan['delete_candidate_keys']})"
+            )
+        verified = True
+    else:
+        verified = False
+
+    return {
+        "backup_generations": ROOT_ZIP_BACKUP_GENERATIONS,
+        "keep_run_dates": plan["keep_run_dates"],
+        "target_keys": plan["target_keys"],
+        "keep_keys": plan["keep_keys"],
+        "delete_candidate_keys": delete_candidates,
+        "deleted_keys": deleted_keys,
+        "verified": verified,
     }
 
 
@@ -558,6 +666,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket", default=None, help="status用S3 bucket（既定は設定ファイル）")
     parser.add_argument("--status-prefix", default=None, help="status prefix（既定は設定ファイル）")
     parser.add_argument("--region", default=None, help="AWS region（既定は設定ファイル）")
+    parser.add_argument(
+        "--root-zip-only",
+        action="store_true",
+        help="cutover時のproduction個別検証用。ローカル09成果物は変更せずroot ZIPだけ処理する",
+    )
     return parser.parse_args()
 
 
@@ -570,14 +683,14 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     if not root.is_dir():
         raise RetentionError(f"pipeline rootが存在しません: {root}")
 
+    config = load_pipeline_s3_config()
+    base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
     if args.bucket and args.status_prefix and args.region:
         bucket = args.bucket
         status_prefix = args.status_prefix
         region = args.region
     else:
-        config = load_pipeline_s3_config()
         bucket = args.bucket or get_config_value(config, "PIPELINE_S3_BUCKET")
-        base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
         status_prefix = args.status_prefix or (
             f"{base_prefix}/{get_config_value(config, 'PIPELINE_STATUS_PREFIX')}"
         )
@@ -586,7 +699,8 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     logger.info(f"mode={'apply' if args.apply else 'dry-run'} / RUN_DATE={current_run_date}")
     logger.info(f"status正本: s3://{bucket}/{status_prefix}/ (region={region})")
 
-    artifacts, holds = scan_artifacts(root, current_run_date, logger)
+    root_zip_only = getattr(args, "root_zip_only", False)
+    artifacts, holds = ([], []) if root_zip_only else scan_artifacts(root, current_run_date, logger)
     all_run_dates = sorted({a["run_date"] for a in artifacts})
     older_run_dates = [d for d in all_run_dates if d < current_run_date]
 
@@ -605,6 +719,16 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 
     keep_run_dates = sorted({current_run_date} | ({previous_run_date} if previous_run_date else set()))
     logger.info(f"保持RUN_DATE: {', '.join(keep_run_dates)}")
+
+    root_zip = execute_root_distribution_zip_retention(
+        s3_client,
+        bucket,
+        base_prefix,
+        current_run_date,
+        [previous_run_date] if previous_run_date else [],
+        False,
+        logger,
+    )
 
     delete_artifacts = [a for a in artifacts if a["run_date"] not in keep_run_dates]
 
@@ -638,6 +762,16 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     removed_dirs = 0
 
     if args.apply:
+        # local / S3の全候補validation完了後に初めて削除を開始する。
+        root_zip = execute_root_distribution_zip_retention(
+            s3_client,
+            bucket,
+            base_prefix,
+            current_run_date,
+            [previous_run_date] if previous_run_date else [],
+            True,
+            logger,
+        )
         for plan in plans:
             for file_path in plan["files"]:
                 if file_path.is_symlink() or not file_path.is_file():
@@ -662,6 +796,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "mode": "apply" if args.apply else "dry-run",
         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "pipeline_root": str(root),
+        "root_zip_only": root_zip_only,
         "current_run_date": current_run_date,
         "previous_successful_run_date": previous_run_date,
         "previous_successful_run_date_source": "s3_pipeline_status",
@@ -686,6 +821,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             }
             for (step, run_date), values in sorted(by_group.items())
         ],
+        "root_zip": root_zip,
     }
     return summary
 

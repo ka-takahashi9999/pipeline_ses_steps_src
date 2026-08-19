@@ -56,12 +56,6 @@ FETCH_AFTER="$(date -d "$RUN_DATE_ISO" "+%Y/%m/%d")"
 FETCH_BEFORE="$(date -d "$RUN_DATE_ISO +1 day" "+%Y/%m/%d")"
 run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after "$FETCH_AFTER" --before "$FETCH_BEFORE" --max 3000
 
-# cutoverまでprivate uploaderを一時維持する。mail masterは80-8 CURRENT対象へ変更済みのため、
-# 現在はCURRENTとprivate prefixへの二重保存となり、cutover後にprivate uploaderを廃止予定。
-# upload / verify失敗は run_step が非0でexitさせるため、
-# 01-2以降へは進まない（Pipeline FAILEDとして既存failure handlingへ流す）。
-run_step "01-1_fetch_gmail_private_s3_upload(RUN_DATE=$RUN_DATE)" "$ROOT/01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py" --run-date "$RUN_DATE"
-
 run_step "01-2_remove_duplicate_emails" "$ROOT/01-2_remove_duplicate_emails/00_tool/remove_duplicate_emails.py"
 
 run_step "01-3_remove_individual_email" "$ROOT/01-3_remove_individual_email/00_tool/remove_individual_email.py"
@@ -209,11 +203,14 @@ bash "$ROOT/00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh" 2>&1 | te
 log "=== DONE run_suggest_and_cleanup ==="
 
 # ──────────────────────────────────────────────────────────────────────
-# 09系のローカル保持整理 → Portal同期対象prepare → Portal S3 sync。
+# 09系のローカル/root ZIP保持整理 → CURRENTのbk1退避
+# → Portal同期対象prepare → Portal CURRENT publish。
 # いずれかが失敗した場合は run_step が非0で exit し、Pipeline FAILED として
 # 既存の StopEC2AfterFailure へ流れる（warningで握りつぶさない）。
 # ──────────────────────────────────────────────────────────────────────
 run_step "80-7_manage_09_result_retention(RUN_DATE=$RUN_DATE)" "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" --apply --run-date "$RUN_DATE"
+
+run_step "80-75_portal_s3_backup_rotation" "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py"
 
 run_step "80-8_portal_s3_prepare" "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py"
 

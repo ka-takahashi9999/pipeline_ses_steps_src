@@ -1,19 +1,19 @@
 """
-80-7 / 80-8 / 80-9 のPipeline組込み確認（focused test）
+80-7 / 80-75 / 80-8 / 80-9 のPipeline組込み確認（focused test）
 
 確認内容:
 ① run_full_pipeline.sh / run_full_pipeline_master.sh が完全一致していること
-② assistant処理（run_suggest_and_cleanup）の後に 80-7 → 80-8 → 80-9 の順で並ぶこと
-③ 80-7 / 80-8 / 80-9 が run_step 経由（失敗時にPipelineをexitさせる経路）であること
+② assistant処理（run_suggest_and_cleanup）の後に 80-7 → 80-75 → 80-8 → 80-9 の順で並ぶこと
+③ 80-7 / 80-75 / 80-8 / 80-9 が run_step 経由（失敗時にPipelineをexitさせる経路）であること
 ④ 80-7のproduction code path・local retention対象・summary contractを直接検証すること
 ⑤ 設定が pipeline_s3_config.env に統合され、bucketを二重管理していないこと
 
 production contract regression（(33)-(38)）:
 ⑥ 80-7 のlocal retentionが未変更であること
 ⑦ CURRENT destination / pipeline-status / pipeline-logs prefixが未変更であること
-⑧ private mail master uploader が production wiring 上でまだ有効であること
+⑧ private mail master uploader が production wiring / file / config から削除済みであること
 ⑨ 09-2 root ZIP writer が外部配布用の正式contractとしてcutover後も有効であること
-⑩ active runner が 80-75 rotation をまだ呼び出していないこと（cutover未実施）
+⑩ active runner が 80-75 rotation を通常経路で呼び出すこと（--bootstrapは使わない）
 
 full Pipeline実行・AWSアクセスは行わない。
 
@@ -44,6 +44,7 @@ RETENTION_SCRIPT = (
 
 NEW_STEPS = (
     "80-7_manage_09_result_retention",
+    "80-75_portal_s3_backup_rotation",
     "80-8_portal_s3_prepare",
     "80-9_portal_s3_sync",
 )
@@ -68,6 +69,7 @@ class TestRunnerWiring(unittest.TestCase):
         markers = [
             "run_suggest_and_cleanup.sh",
             "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py",
+            "80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py",
             "80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py",
             "80-9_portal_s3_sync/00_tool/portal_s3_sync.py",
         ]
@@ -136,10 +138,8 @@ class TestConfig(unittest.TestCase):
         config = load_pipeline_s3_config()
         self.assertEqual(config["PIPELINE_STATUS_PREFIX"], "pipeline-status")
         self.assertEqual(config["PIPELINE_LOG_PREFIX"], "pipeline-logs")
-        self.assertEqual(config["PIPELINE_PRIVATE_PREFIX"], "pipeline_ses_steps/private")
-        self.assertEqual(
-            config["MAIL_MASTER_S3_PREFIX"], "pipeline_ses_steps/private/mail_master"
-        )
+        self.assertNotIn("PIPELINE_PRIVATE_PREFIX", config)
+        self.assertNotIn("MAIL_MASTER_S3_PREFIX", config)
 
 
 class TestProductionContracts(unittest.TestCase):
@@ -242,10 +242,11 @@ class TestProductionContracts(unittest.TestCase):
                 "deleted_bytes",
                 "removed_dirs",
                 "delete_breakdown",
+                "root_zip",
             }.issubset(summary_keys)
         )
 
-    def test_33b_root_zip_helper_is_not_in_production_code_path(self):
+    def test_33b_root_zip_rotation_is_in_production_code_path(self):
         retention = RETENTION_SCRIPT.read_text(encoding="utf-8")
         tree = ast.parse(retention)
         run_node = next(
@@ -258,38 +259,38 @@ class TestProductionContracts(unittest.TestCase):
             for node in ast.walk(run_node)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        self.assertNotIn("plan_root_distribution_zip_retention", run_calls)
+        self.assertIn("execute_root_distribution_zip_retention", run_calls)
 
         module_call_attributes = {
             node.func.attr
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
-        self.assertTrue({"delete_object", "delete_objects"}.isdisjoint(module_call_attributes))
+        self.assertIn("delete_object", module_call_attributes)
+        self.assertNotIn("delete_objects", module_call_attributes)
         self.assertNotIn("aws s3 rm", retention)
-        # 80-7はS3 pipeline-statusをread-only参照するのみ。CURRENT/bk1へは関与しない。
+        # 80-7はroot ZIPだけを削除可能。CURRENT/bk1へは関与しない。
         for token in ("pipeline_ses_steps_bk1", "PORTAL_S3_PREFIX", "PORTAL_S3_BACKUP_PREFIX"):
             self.assertNotIn(token, retention, msg=token)
 
-    # ---- (36) private uploader still operational -------------------------
-    def test_36_private_uploader_is_still_wired(self):
-        self.assertIn(PRIVATE_UPLOADER, self.text)
-        self.assertTrue((SRC_ROOT / PRIVATE_UPLOADER).is_file())
-        self.assertTrue(
-            (SRC_ROOT / "01-1_fetch_gmail/02_confirm/confirm_mail_master_private_s3.py").is_file()
+    # ---- (36) private uploader removed ----------------------------------
+    def test_36_private_uploader_is_removed(self):
+        self.assertNotIn(PRIVATE_UPLOADER, self.text)
+        self.assertFalse((SRC_ROOT / PRIVATE_UPLOADER).exists())
+        self.assertFalse(
+            (SRC_ROOT / "01-1_fetch_gmail/02_confirm/confirm_mail_master_private_s3.py").exists()
         )
-        pattern = re.compile(
-            rf'^run_step "01-1_fetch_gmail_private_s3_upload.*\$ROOT/{re.escape(PRIVATE_UPLOADER)}',
-            re.M,
+        self.assertFalse(
+            (SRC_ROOT / "01-1_fetch_gmail/00_tool/test_upload_mail_master_private_s3.py").exists()
         )
-        self.assertRegex(self.text, pattern)
+        config = CONFIG_ENV.read_text(encoding="utf-8")
+        self.assertNotIn("PIPELINE_PRIVATE_PREFIX", config)
+        self.assertNotIn("MAIL_MASTER_S3_PREFIX", config)
 
-    def test_finding_runner_comment_matches_temporary_dual_storage(self):
+    def test_runner_has_no_temporary_dual_storage_comment(self):
         for text in (self.text, RUNNER_MASTER.read_text(encoding="utf-8")):
-            self.assertIn("mail masterは80-8 CURRENT対象へ変更済み", text)
-            self.assertIn("CURRENTとprivate prefixへの二重保存", text)
-            self.assertIn("cutover後にprivate uploaderを廃止予定", text)
-            self.assertNotIn("mail masterはPortal S3へは載せない", text)
+            self.assertNotIn("private uploader", text)
+            self.assertNotIn("private prefixへの二重保存", text)
 
     # ---- (37) external distribution root ZIP contract --------------------
     def test_37_root_zip_writer_is_permanent_external_distribution_contract(self):
@@ -307,14 +308,21 @@ class TestProductionContracts(unittest.TestCase):
             self.text,
         )
 
-    # ---- (38) active runner production path unchanged --------------------
-    def test_38_runner_does_not_reference_rotation_step_yet(self):
+    # ---- (38) active runner production path cutover ----------------------
+    def test_38_runner_references_rotation_between_80_7_and_80_8(self):
         for text in (self.text, RUNNER_MASTER.read_text(encoding="utf-8")):
-            self.assertNotIn(ROTATION_STEP, text)
-            self.assertNotIn("portal_s3_backup_rotation", text)
+            self.assertIn(ROTATION_STEP, text)
+            self.assertIn("portal_s3_backup_rotation", text)
             self.assertNotIn("--bootstrap", text)
+            positions = [
+                text.find("manage_09_result_retention.py"),
+                text.find("portal_s3_backup_rotation.py"),
+                text.find("portal_s3_prepare.py"),
+                text.find("portal_s3_sync.py"),
+            ]
+            self.assertEqual(positions, sorted(positions))
 
-    def test_38b_rotation_step_exists_but_is_not_scheduled(self):
+    def test_38b_rotation_step_and_confirm_exist(self):
         self.assertTrue((SRC_ROOT / ROTATION_SCRIPT).is_file())
         self.assertTrue(
             (SRC_ROOT / ROTATION_STEP / "02_confirm"

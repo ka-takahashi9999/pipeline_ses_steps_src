@@ -45,12 +45,13 @@ ALL_RUN_DATES = [
 
 
 class FakeS3Client:
-    """list_objects_v2 / get_object だけを提供する最小のfake。"""
+    """80-7が使うlist/get/deleteだけを提供する最小のfake。"""
 
-    def __init__(self, objects, fail_get_keys=(), fail_list=False):
+    def __init__(self, objects, fail_get_keys=(), fail_list=False, fail_delete_keys=()):
         self.objects = dict(objects)
         self.fail_get_keys = set(fail_get_keys)
         self.fail_list = fail_list
+        self.fail_delete_keys = set(fail_delete_keys)
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -60,6 +61,12 @@ class FakeS3Client:
         if Key in self.fail_get_keys:
             raise RuntimeError(f"simulated GET failure: {Key}")
         return {"Body": _FakeBody(self.objects[Key])}
+
+    def delete_object(self, Bucket, Key):  # noqa: N803 - boto3互換シグネチャ
+        if Key in self.fail_delete_keys:
+            raise RuntimeError(f"simulated DELETE failure: {Key}")
+        self.objects.pop(Key, None)
+        return {}
 
 
 class _FakeBody:
@@ -80,11 +87,17 @@ class _FakePaginator:
         keys = sorted(k for k in self.client.objects if k.startswith(Prefix))
         if Delimiter:
             prefixes = set()
+            contents = []
             for key in keys:
                 rest = key[len(Prefix) :]
                 if Delimiter in rest:
                     prefixes.add(Prefix + rest.split(Delimiter, 1)[0] + Delimiter)
-            yield {"CommonPrefixes": [{"Prefix": p} for p in sorted(prefixes)]}
+                else:
+                    contents.append({"Key": key, "Size": len(self.client.objects[key])})
+            yield {
+                "CommonPrefixes": [{"Prefix": p} for p in sorted(prefixes)],
+                "Contents": contents,
+            }
             return
         # 2件ずつ返してpaginationを再現する
         for i in range(0, len(keys), 2) or [0]:
@@ -213,9 +226,26 @@ class RetentionTestBase(unittest.TestCase):
             bucket=BUCKET,
             status_prefix=STATUS_PREFIX,
             region="ap-northeast-1",
+            root_zip_only=False,
         )
 
     def set_s3(self, objects, **kwargs):
+        objects = dict(objects)
+        # run()のproduction contractに合わせ、currentと成功status日のroot ZIPを用意する。
+        objects.setdefault("pipeline_ses_steps/mail_display_extract_20260817.zip", b"current")
+        for key, raw in list(objects.items()):
+            if not key.endswith("/status.json"):
+                continue
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if document.get("status") == "SUCCEEDED" and document.get("exit_code") == 0:
+                run_date = document.get("run_date")
+                if isinstance(run_date, str):
+                    objects.setdefault(
+                        f"pipeline_ses_steps/mail_display_extract_{run_date}.zip", b"previous"
+                    )
         client = FakeS3Client(objects, **kwargs)
         target.build_s3_client = lambda region: client
         return client
@@ -300,7 +330,7 @@ class TestPreviousSuccessfulRunDate(RetentionTestBase):
 
 
 class TestRootDistributionZipRetentionPlan(RetentionTestBase):
-    """外部配布root ZIPの未wiring rotation contractを純粋関数で検証する。"""
+    """外部配布root ZIPのproduction rotation contractを検証する。"""
 
     BASE_PREFIX = "pipeline_ses_steps"
     CURRENT = "20260819"
@@ -530,6 +560,106 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
             plan["delete_candidate_keys"],
             ["pipeline_ses_steps/mail_display_extract_20260816.zip"],
         )
+
+    def test_dry_run_then_apply_deletes_only_old_valid_canonical(self):
+        objects = {
+            "pipeline_ses_steps/mail_display_extract_20260819.zip": b"current",
+            "pipeline_ses_steps/mail_display_extract_20260818.zip": b"previous",
+            "pipeline_ses_steps/mail_display_extract_20260817.zip": b"old",
+            "pipeline_ses_steps/mail_display_extract_20260230.zip": b"invalid-date",
+            "pipeline_ses_steps/mail_display_format_20260413.zip": b"legacy",
+            "pipeline_ses_steps/arbitrary.zip": b"arbitrary",
+            (
+                "pipeline_ses_steps/pipeline_ses_steps/"
+                "09-2_extract_high_score_mail_display/01_result/"
+                "mail_display_extract_20260817.zip"
+            ): b"current-mirror",
+        }
+        client = FakeS3Client(objects)
+
+        dry = target.execute_root_distribution_zip_retention(
+            client,
+            BUCKET,
+            self.BASE_PREFIX,
+            self.CURRENT,
+            ["20260818"],
+            False,
+            self.logger,
+        )
+        self.assertEqual(
+            dry["delete_candidate_keys"],
+            ["pipeline_ses_steps/mail_display_extract_20260817.zip"],
+        )
+        self.assertEqual(client.objects, objects)
+
+        applied = target.execute_root_distribution_zip_retention(
+            client,
+            BUCKET,
+            self.BASE_PREFIX,
+            self.CURRENT,
+            ["20260818"],
+            True,
+            self.logger,
+        )
+        self.assertTrue(applied["verified"])
+        self.assertEqual(applied["deleted_keys"], dry["delete_candidate_keys"])
+        self.assertNotIn("pipeline_ses_steps/mail_display_extract_20260817.zip", client.objects)
+        for key in (
+            "pipeline_ses_steps/mail_display_extract_20260819.zip",
+            "pipeline_ses_steps/mail_display_extract_20260818.zip",
+            "pipeline_ses_steps/mail_display_extract_20260230.zip",
+            "pipeline_ses_steps/mail_display_format_20260413.zip",
+            "pipeline_ses_steps/arbitrary.zip",
+        ):
+            self.assertIn(key, client.objects)
+        self.assertIn(
+            "pipeline_ses_steps/pipeline_ses_steps/"
+            "09-2_extract_high_score_mail_display/01_result/"
+            "mail_display_extract_20260817.zip",
+            client.objects,
+        )
+
+    def test_missing_current_or_previous_fails_before_delete(self):
+        old_key = "pipeline_ses_steps/mail_display_extract_20260817.zip"
+        client = FakeS3Client(
+            {
+                "pipeline_ses_steps/mail_display_extract_20260818.zip": b"previous",
+                old_key: b"old",
+            }
+        )
+        with self.assertRaises(target.RetentionError):
+            target.execute_root_distribution_zip_retention(
+                client,
+                BUCKET,
+                self.BASE_PREFIX,
+                self.CURRENT,
+                ["20260818"],
+                True,
+                self.logger,
+            )
+        self.assertIn(old_key, client.objects)
+
+    def test_delete_failure_is_not_swallowed(self):
+        old_key = "pipeline_ses_steps/mail_display_extract_20260817.zip"
+        client = FakeS3Client(
+            {
+                "pipeline_ses_steps/mail_display_extract_20260819.zip": b"current",
+                "pipeline_ses_steps/mail_display_extract_20260818.zip": b"previous",
+                old_key: b"old",
+            },
+            fail_delete_keys=[old_key],
+        )
+        with self.assertRaises(target.RetentionError):
+            target.execute_root_distribution_zip_retention(
+                client,
+                BUCKET,
+                self.BASE_PREFIX,
+                self.CURRENT,
+                ["20260818"],
+                True,
+                self.logger,
+            )
+        self.assertIn(old_key, client.objects)
 
 
 class TestStatusFailureDoesNotDelete(RetentionTestBase):
