@@ -7,8 +7,8 @@ AWSへの実writeは行わない（subprocess / boto3 clientはすべてmock）�
 確認内容:
   ① source安全ロック（production sourceのみ / 別dir / 別filename / symlink / CLIで差し替え不可）
   ② destination安全ロック（RUN_DATE / prefix / bucket / Portal prefix / 上位prefix / `..`）
-  ③ subprocess直前の最終ロック（run_upload()へ任意destinationを渡しても実行されないこと）
-  ④ aws s3 cp のargv（recursive / sync / delete / wildcardが無いこと）
+  ③ AWS CLI実行境界（run_upload()はargvを受け取らず、canonical argv以外は実行しないこと）
+  ④ canonical argv構造（--endpoint-url等の任意global optionが注入できないこと）
   ⑤ upload失敗 / head-object失敗 / size mismatch で非0終了すること
   ⑥ 冪等性（同一RUN_DATE再実行で同一key）
   ⑦ confirm（bucket一致 / 不正bucket / 実在しないRUN_DATE）
@@ -22,6 +22,7 @@ AWSへの実writeは行わない（subprocess / boto3 clientはすべてmock）�
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -119,12 +120,19 @@ def fake_completed(returncode: int = 0, output: bytes = b""):
     return subprocess.CompletedProcess(args=["dummy"], returncode=returncode, stdout=output)
 
 
-def canonical_argv(source: str, destination: str = EXPECTED_URI):
-    return [
+CANONICAL_METADATA = "run-date=20260818,run-id=unset,record-count=2"
+
+
+def canonical_argv(source: str, destination: str = EXPECTED_URI, dry_run: bool = False):
+    """production applyで唯一許可されるargv（テスト側で独立に組み立てた期待値）。"""
+    argv = [
         up.AWS_BIN, "s3", "cp", source, destination,
         "--only-show-errors", "--region", "ap-northeast-1",
-        "--metadata", "run-date=20260818,run-id=unset,record-count=2",
+        "--metadata", CANONICAL_METADATA,
     ]
+    if dry_run:
+        argv.append("--dryrun")
+    return argv
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +311,25 @@ class TestDestinationLock(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ③ subprocess直前の最終ロック（低レベル関数を直接呼んでも拒否されること）
+# ③ AWS CLI実行境界（run_upload はargvを受け取らず、canonical argvしか実行しない）
 # ---------------------------------------------------------------------------
+
+
+# canonical argvへ注入を試みるパターン（すべて subprocess 0回でFAILすること）
+INJECTION_CASES = (
+    ("--endpoint-url", ["--endpoint-url", "https://attacker.example.com"]),
+    ("--profile", ["--profile", "attacker"]),
+    ("--acl", ["--acl", "public-read"]),
+    ("--region追加", ["--region", "us-east-1"]),
+    ("--no-sign-request", ["--no-sign-request"]),
+    ("--request-payer", ["--request-payer", "requester"]),
+    ("--recursive", ["--recursive"]),
+    ("--delete", ["--delete"]),
+    ("--include", ["--include", "*"]),
+    ("--exclude", ["--exclude", "*"]),
+    ("apply時--dryrun", ["--dryrun"]),
+    ("未知option", ["--some-unknown-option", "x"]),
+)
 
 
 class TestFinalUploadLock(unittest.TestCase):
@@ -315,126 +340,158 @@ class TestFinalUploadLock(unittest.TestCase):
             with mock.patch.object(up, "_STEP_DIR", step_dir):
                 yield str(step_dir / "01_result" / up.MAIL_MASTER_FILENAME)
 
-    def test_canonical_argv_is_executed(self):
+    def _run_upload(self, dry_run=False, run_date=VALID_RUN_DATE):
+        return up.run_upload(run_date, "", 2, dry_run, up.get_logger("test"))
+
+    def test_run_upload_does_not_accept_argv(self):
+        """外部からargvを受け取らない設計であること（注入自体がAPI上不可能）。"""
+        params = list(inspect.signature(up.run_upload).parameters)
+        self.assertEqual(params, ["run_date", "run_id", "record_count", "dry_run", "logger"])
+        self.assertNotIn("argv", params)
+        self.assertFalse(hasattr(up, "build_cp_argv"))
+        self.assertFalse(hasattr(up, "assert_safe_argv"))
+
+    def test_canonical_apply_argv_is_executed_once(self):
         with self._tmp_source() as source:
             with mock.patch.object(up.subprocess, "run", return_value=fake_completed()) as run_mock:
-                expected = up.run_upload(canonical_argv(source), VALID_RUN_DATE, up.get_logger("test"))
+                expected = self._run_upload()
             run_mock.assert_called_once()
+            self.assertEqual(run_mock.call_args[0][0], canonical_argv(source))
+            self.assertFalse(run_mock.call_args[1]["shell"])
             self.assertEqual(expected["uri"], EXPECTED_URI)
 
-    def test_unsafe_destinations_are_rejected(self):
-        cases = [
-            ("bucket root", "s3://technoverse/"),
-            ("bucket rootのみ", "s3://technoverse"),
-            ("base prefix root", "s3://technoverse/pipeline_ses_steps/"),
-            ("Portal prefix", "s3://technoverse/pipeline_ses_steps/pipeline_ses_steps/"
-                              "20260818/fetch_gmail_mail_master.jsonl"),
-            ("別bucket", "s3://other-bucket/pipeline_ses_steps/private/mail_master/"
-                         "20260818/fetch_gmail_mail_master.jsonl"),
-            ("別RUN_DATE", "s3://technoverse/pipeline_ses_steps/private/mail_master/"
-                           "20250101/fetch_gmail_mail_master.jsonl"),
-            ("別filename", "s3://technoverse/pipeline_ses_steps/private/mail_master/"
-                           "20260818/other.jsonl"),
-            ("親参照", "s3://technoverse/pipeline_ses_steps/private/mail_master/../"
-                       "20260818/fetch_gmail_mail_master.jsonl"),
-            ("別private prefix", "s3://technoverse/pipeline_ses_steps/private/other/"
-                                 "20260818/fetch_gmail_mail_master.jsonl"),
-            ("空", ""),
-            ("任意destination", "s3://attacker-bucket/anything"),
-            ("local path", "/tmp/attacker/out.jsonl"),
-        ]
+    def test_canonical_dry_run_argv_is_executed_once(self):
         with self._tmp_source() as source:
-            for label, destination in cases:
+            with mock.patch.object(up.subprocess, "run", return_value=fake_completed()) as run_mock:
+                self._run_upload(dry_run=True)
+            run_mock.assert_called_once()
+            self.assertEqual(run_mock.call_args[0][0], canonical_argv(source, dry_run=True))
+
+    def test_injected_options_are_rejected_at_execution_boundary(self):
+        """
+        argv構築側が壊れた / 迂回された場合でも、subprocess直前の完全一致比較で拒否する。
+        （build_canonical_argv を差し替えて注入を再現する）
+        """
+        with self._tmp_source() as source:
+            for label, extra in INJECTION_CASES:
                 with self.subTest(label):
-                    with mock.patch.object(up.subprocess, "run") as run_mock:
+                    tampered = canonical_argv(source) + extra
+                    with mock.patch.object(up, "build_canonical_argv", return_value=tampered), \
+                            mock.patch.object(up.subprocess, "run") as run_mock:
                         with self.assertRaises(up.UploadError):
-                            up.run_upload(
-                                canonical_argv(source, destination), VALID_RUN_DATE, up.get_logger("test")
-                            )
+                            self._run_upload()
                         run_mock.assert_not_called()
 
-    def test_unsafe_source_is_rejected(self):
-        with tempfile.TemporaryDirectory() as other_tmp:
-            other = str(make_step_dir(other_tmp) / "01_result" / up.MAIL_MASTER_FILENAME)
-            with self._tmp_source():
-                with mock.patch.object(up.subprocess, "run") as run_mock:
-                    with self.assertRaises(up.UploadError):
-                        up.run_upload(canonical_argv(other), VALID_RUN_DATE, up.get_logger("test"))
-                    run_mock.assert_not_called()
+    def test_tampered_subcommand_and_paths_are_rejected(self):
+        cases = {
+            "sync": (2, "sync"),
+            "rm": (2, "rm"),
+            "mv": (2, "mv"),
+            "source変更": (3, "/tmp/attacker/other.jsonl"),
+            "destination変更": (4, "s3://attacker-bucket/anything"),
+            "destination Portal": (4, "s3://technoverse/pipeline_ses_steps/pipeline_ses_steps/x.jsonl"),
+            "destination bucket root": (4, "s3://technoverse/"),
+            "wildcard source": (3, "/tmp/x/*.jsonl"),
+        }
+        with self._tmp_source() as source:
+            for label, (index, value) in cases.items():
+                with self.subTest(label):
+                    tampered = canonical_argv(source)
+                    tampered[index] = value
+                    with mock.patch.object(up, "build_canonical_argv", return_value=tampered), \
+                            mock.patch.object(up.subprocess, "run") as run_mock:
+                        with self.assertRaises(up.UploadError):
+                            self._run_upload()
+                        run_mock.assert_not_called()
+
+    def test_assert_canonical_argv_rejects_extra_options(self):
+        """最終境界の判定関数を直接呼んでも同じく拒否されること。"""
+        base = canonical_argv("/tmp/src.jsonl")
+        for label, extra in INJECTION_CASES:
+            with self.subTest(label):
+                with self.assertRaises(up.UploadError):
+                    up.assert_canonical_argv(
+                        base + extra, "/tmp/src.jsonl", EXPECTED_URI,
+                        "ap-northeast-1", CANONICAL_METADATA, False,
+                    )
+
+    def test_assert_canonical_argv_accepts_canonical(self):
+        up.assert_canonical_argv(
+            canonical_argv("/tmp/src.jsonl"), "/tmp/src.jsonl", EXPECTED_URI,
+            "ap-northeast-1", CANONICAL_METADATA, False,
+        )
+        up.assert_canonical_argv(
+            canonical_argv("/tmp/src.jsonl", dry_run=True), "/tmp/src.jsonl", EXPECTED_URI,
+            "ap-northeast-1", CANONICAL_METADATA, True,
+        )
 
     def test_invalid_run_date_blocks_upload(self):
-        with self._tmp_source() as source:
+        with self._tmp_source():
             for raw in ("20260230", "..", "", "20260818/../20250101"):
                 with self.subTest(raw):
                     with mock.patch.object(up.subprocess, "run") as run_mock:
                         with self.assertRaises(up.UploadError):
-                            up.run_upload(canonical_argv(source), raw, up.get_logger("test"))
+                            self._run_upload(run_date=raw)
                         run_mock.assert_not_called()
 
-    def test_forbidden_options_block_upload(self):
-        with self._tmp_source() as source:
-            for extra in (["--recursive"], ["--delete"], ["--include", "x"], ["--exclude", "x"]):
-                with self.subTest(str(extra)):
+    def test_invalid_metadata_inputs_block_upload(self):
+        with self._tmp_source():
+            for run_id, record_count in (("bad id", 2), ("a,b", 2), ("", 0), ("", -1), ("", "2")):
+                with self.subTest("{0}/{1}".format(run_id, record_count)):
                     with mock.patch.object(up.subprocess, "run") as run_mock:
                         with self.assertRaises(up.UploadError):
-                            up.run_upload(
-                                canonical_argv(source) + extra, VALID_RUN_DATE, up.get_logger("test")
-                            )
+                            up.run_upload(VALID_RUN_DATE, run_id, record_count, False, up.get_logger("test"))
                         run_mock.assert_not_called()
 
-    def test_sync_command_blocks_upload(self):
-        with self._tmp_source() as source:
-            argv = canonical_argv(source)
-            argv[2] = "sync"
-            with mock.patch.object(up.subprocess, "run") as run_mock:
+    def test_non_canonical_source_blocks_upload(self):
+        """canonical sourceがsymlink等で成立しない場合はupload自体を行わない。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = make_step_dir(tmp, filename="real_master.jsonl")
+            os.symlink(
+                str(step_dir / "01_result" / "real_master.jsonl"),
+                str(step_dir / "01_result" / up.MAIL_MASTER_FILENAME),
+            )
+            with mock.patch.object(up, "_STEP_DIR", step_dir), \
+                    mock.patch.object(up.subprocess, "run") as run_mock:
                 with self.assertRaises(up.UploadError):
-                    up.run_upload(argv, VALID_RUN_DATE, up.get_logger("test"))
-                run_mock.assert_not_called()
-
-    def test_wildcard_blocks_upload(self):
-        with self._tmp_source() as source:
-            argv = canonical_argv(source)
-            argv[3] = str(Path(source).parent / "*.jsonl")
-            with mock.patch.object(up.subprocess, "run") as run_mock:
-                with self.assertRaises(up.UploadError):
-                    up.run_upload(argv, VALID_RUN_DATE, up.get_logger("test"))
+                    self._run_upload()
                 run_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# ④ argv構造
+# ④ canonical argv構造
 # ---------------------------------------------------------------------------
 
 
-class TestUploadArgv(unittest.TestCase):
+class TestCanonicalArgv(unittest.TestCase):
     def build(self, dry_run=False):
-        return up.build_cp_argv(
-            Path("/tmp/x/fetch_gmail_mail_master.jsonl"),
-            EXPECTED_URI,
-            "ap-northeast-1",
-            dry_run,
-            "run-date=20260818,run-id=unset,record-count=2919",
+        return up.build_canonical_argv(
+            "/tmp/x/fetch_gmail_mail_master.jsonl", EXPECTED_URI,
+            "ap-northeast-1", CANONICAL_METADATA, dry_run,
         )
 
-    def test_argv_shape(self):
+    def test_apply_argv_shape(self):
         argv = self.build()
-        self.assertEqual(argv[:3], [up.AWS_BIN, "s3", "cp"])
-        self.assertEqual(argv[3], "/tmp/x/fetch_gmail_mail_master.jsonl")
-        self.assertEqual(argv[4], EXPECTED_URI)
-        self.assertIn("--region", argv)
-        self.assertIn("ap-northeast-1", argv)
+        self.assertEqual(argv, canonical_argv("/tmp/x/fetch_gmail_mail_master.jsonl"))
         self.assertNotIn("--dryrun", argv)
 
-    def test_argv_has_no_dangerous_options(self):
-        argv = self.build()
-        for token in ("sync", "mv", "rm", "--recursive", "--delete", "--include", "--exclude"):
-            self.assertNotIn(token, argv[1:2] + argv[5:])
-        for token in argv:
-            self.assertNotIn("*", token)
-            self.assertNotIn("?", token)
+    def test_dry_run_argv_shape(self):
+        self.assertEqual(
+            self.build(dry_run=True),
+            canonical_argv("/tmp/x/fetch_gmail_mail_master.jsonl", dry_run=True),
+        )
 
-    def test_dry_run_argv(self):
-        self.assertIn("--dryrun", self.build(dry_run=True))
+    def test_only_allowed_options_appear(self):
+        for argv in (self.build(), self.build(dry_run=True)):
+            options = [token for token in argv if token.startswith("--")]
+            self.assertTrue(set(options).issubset(set(up.ALLOWED_ARGV_OPTIONS)))
+            for token in ("sync", "mv", "rm", "--recursive", "--delete", "--include",
+                          "--exclude", "--endpoint-url", "--profile", "--acl",
+                          "--no-sign-request", "--request-payer"):
+                self.assertNotIn(token, argv[1:2] + argv[5:])
+            for token in argv:
+                self.assertNotIn("*", token)
+                self.assertNotIn("?", token)
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +678,40 @@ class TestConfirm(unittest.TestCase):
             with mock.patch.object(up, "_STEP_DIR", step_dir):
                 errors = confirm_mod.confirm(self._summary(step_dir, s3_bytes=1))
             self.assertTrue(any("s3_bytes" in message for message in errors))
+
+    def test_symlinked_mail_master_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = make_step_dir(tmp, filename="real_master.jsonl")
+            source = step_dir / "01_result" / up.MAIL_MASTER_FILENAME
+            os.symlink(str(step_dir / "01_result" / "real_master.jsonl"), str(source))
+            summary = {
+                "status": "SUCCEEDED", "mode": "apply", "run_date": VALID_RUN_DATE,
+                "local_path": str(source), "local_bytes": 1, "record_count": 1,
+                "s3_bucket": "technoverse", "s3_key": EXPECTED_KEY, "s3_uri": EXPECTED_URI,
+                "s3_bytes": 1, "verified": True,
+            }
+            with mock.patch.object(up, "_STEP_DIR", step_dir):
+                errors = confirm_mod.confirm(summary)
+            self.assertTrue(any("canonical source" in message for message in errors))
+
+    def test_symlinked_result_dir_fails(self):
+        """01_resultがsymlinkの場合もconfirmで拒否する（親directory経由の偽装）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = Path(tmp).resolve() / up.PRODUCTION_STEP_DIR_NAME
+            real_dir = step_dir / "real_result"
+            real_dir.mkdir(parents=True)
+            (real_dir / up.MAIL_MASTER_FILENAME).write_text('{"message_id":"m"}\n', encoding="utf-8")
+            os.symlink(str(real_dir), str(step_dir / "01_result"))
+            source = step_dir / "01_result" / up.MAIL_MASTER_FILENAME
+            summary = {
+                "status": "SUCCEEDED", "mode": "apply", "run_date": VALID_RUN_DATE,
+                "local_path": str(source), "local_bytes": source.stat().st_size,
+                "record_count": 1, "s3_bucket": "technoverse", "s3_key": EXPECTED_KEY,
+                "s3_uri": EXPECTED_URI, "s3_bytes": source.stat().st_size, "verified": True,
+            }
+            with mock.patch.object(up, "_STEP_DIR", step_dir):
+                errors = confirm_mod.confirm(summary)
+            self.assertTrue(any("canonical source" in message for message in errors))
 
 
 # ---------------------------------------------------------------------------

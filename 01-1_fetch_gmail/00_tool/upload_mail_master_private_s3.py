@@ -18,10 +18,12 @@ Portalとは分離した private prefix へ 1 object だけ保存する。
 - destination安全ロック: bucket / base prefix / private prefix / mail master prefix /
   RUN_DATE / 最終key / 完全URI を期待値と完全一致比較し、1つでも異なれば upload開始前にFAILする
   （startswith判定はしない）。
-- 最終ロック: subprocess実行の直前に、run_upload() が呼び出し元の値を信用せず
-  正本設定(pipeline_s3_config.env) と RUN_DATE から expected URI / expected source を
-  **独立して再構築** し、argv と完全一致比較してから実行する。
-  低レベル関数へ任意のdestinationを渡してもproduction applyでは危険な宛先へuploadできない。
+- 最終ロック: run_upload() は **外部からargvを受け取らない**。subprocess実行の直前に
+  正本設定(pipeline_s3_config.env) と RUN_DATE から expected URI / expected source /
+  region を **独立して再構築** し、canonical argv を自分で組み立てて実行する。
+  さらに実行直前に、渡すargv全体が期待argvと **完全一致（list等価）** することを確認するため、
+  --endpoint-url / --profile / --acl / --no-sign-request 等の任意AWS CLI optionは
+  API上も実行境界上も注入できない。
 - upload前に local file を検査する（regular file / symlink不可 / size>0 / JSONL record>0）。
   record走査は1パスのみ（341MB級を何度も全scanしない）。
 - AWS CLI は argv配列で subprocess 実行する（eval / bash -c / sh -c は使わない）。
@@ -86,17 +88,10 @@ FORBIDDEN_PORTAL_PREFIX = "{0}/pipeline_ses_steps".format(EXPECTED_BASE_PREFIX)
 RUN_DATE_RE = re.compile(r"[0-9]{8}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
-# `aws s3 cp` で 1 object だけ扱うため、これらは1つでも現れたらFAILさせる
-FORBIDDEN_ARGV_TOKENS = (
-    "sync",
-    "mv",
-    "rm",
-    "--recursive",
-    "--delete",
-    "--include",
-    "--exclude",
-    "--follow-symlinks",
-)
+# apply / dry-run で唯一許可するargv構造。ここに無いoptionは一切実行しない。
+#   apply   : aws s3 cp <source> <destination> --only-show-errors --region <region> --metadata <value>
+#   dry-run : 上記 + --dryrun
+ALLOWED_ARGV_OPTIONS = ("--only-show-errors", "--region", "--metadata", "--dryrun")
 FORBIDDEN_ARGV_CHARS = ("*", "?")
 
 SAMPLE_LIMIT = 3
@@ -354,19 +349,25 @@ def build_metadata_value(run_date: str, run_id: str, record_count: int) -> str:
     return value
 
 
-def build_cp_argv(
-    source_path: Path,
-    destination_uri: str,
-    region: str,
-    dry_run: bool,
-    metadata_value: str,
+def validate_record_count(value: Any) -> int:
+    """metadataへ載せるrecord数は正の整数のみ受理する。"""
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise UploadError("record_countが不正です: {0!r}".format(value))
+    return value
+
+
+def build_canonical_argv(
+    source: str, destination_uri: str, region: str, metadata_value: str, dry_run: bool
 ) -> List[str]:
-    """`aws s3 cp` の argv を組み立てる（shell文字列は使わない / 1 objectのみ）。"""
+    """
+    唯一実行を許可するargvを組み立てる（shell文字列は使わない / 1 objectのみ）。
+    引数はすべて内部で再構築・検証済みの値であること。
+    """
     argv = [
         AWS_BIN,
         "s3",
         "cp",
-        str(source_path),
+        source,
         destination_uri,
         "--only-show-errors",
         "--region",
@@ -379,44 +380,77 @@ def build_cp_argv(
     return argv
 
 
-def assert_safe_argv(argv: List[str], expected_source: str, expected_uri: str) -> None:
+def assert_canonical_argv(
+    argv: Any, source: str, destination_uri: str, region: str, metadata_value: str, dry_run: bool
+) -> None:
     """
-    argvが「正規sourceを期待URIへ cp する1 object操作」だけであることを確認する。
-    expected_source / expected_uri は呼び出し元の値ではなく、再構築済みの期待値を渡すこと。
+    subprocessへ渡すargv全体が canonical argv と完全一致することを確認する。
+
+    期待argvは build_canonical_argv() を呼ばずにこの関数内で組み立てる。
+    構築側が壊れた場合でも、この最終境界で不一致として検出できるようにするため、
+    重複した組み立ては意図的に残している。
+    完全一致比較のため、--endpoint-url / --profile / --acl / --no-sign-request /
+    --request-payer / --recursive / --delete / --include / --exclude や
+    apply時の --dryrun、未知optionの追加はすべて不一致として拒否される。
     """
-    if not isinstance(argv, list) or len(argv) < 5:
-        raise UploadError("argvが不正です: {0!r}".format(argv))
-    if argv[:3] != [AWS_BIN, "s3", "cp"]:
-        raise UploadError("aws s3 cp 以外のcommandは実行しません: {0!r}".format(argv[:3]))
-    if argv[3] != expected_source:
+    expected = [
+        AWS_BIN,
+        "s3",
+        "cp",
+        source,
+        destination_uri,
+        "--only-show-errors",
+        "--region",
+        region,
+        "--metadata",
+        metadata_value,
+    ]
+    if dry_run:
+        expected.append("--dryrun")
+
+    if not isinstance(argv, list) or argv != expected:
         raise UploadError(
-            "source安全ロック違反: upload元が期待値と一致しません "
-            "(actual={0!r} / expected={1!r})".format(argv[3], expected_source)
+            "AWS CLI実行ロック違反: argvがcanonical argvと一致しません "
+            "(actual={0!r} / expected={1!r})".format(argv, expected)
         )
-    if argv[4] != expected_uri:
-        raise UploadError(
-            "destination安全ロック違反: upload先が期待値と一致しません "
-            "(actual={0!r} / expected={1!r})".format(argv[4], expected_uri)
-        )
+
+    # 完全一致比較で十分だが、意図を明示するための最終確認
     for token in argv[5:]:
-        if token in FORBIDDEN_ARGV_TOKENS:
-            raise UploadError("禁止オプションが含まれています: {0!r}".format(token))
+        if token.startswith("--") and token not in ALLOWED_ARGV_OPTIONS:
+            raise UploadError("許可されていないoptionです: {0!r}".format(token))
     for token in argv:
         if any(char in token for char in FORBIDDEN_ARGV_CHARS):
             raise UploadError("wildcardを含む引数は使用できません: {0!r}".format(token))
 
 
-def run_upload(argv: List[str], run_date: Any, logger) -> Dict[str, str]:
+def run_upload(
+    run_date: Any, run_id: Any, record_count: Any, dry_run: bool, logger
+) -> Dict[str, str]:
     """
-    aws s3 cp を argv配列で実行する（shell未使用）。
+    aws s3 cp を実行する（shell未使用）。
 
-    subprocess直前の最終ロックとして、呼び出し元の値を信用せず
-    正規source path と 正本設定+RUN_DATE から再構築したexpected URI を独立に求め、
-    argv と完全一致しなければ実行しない。非0終了は握りつぶさない。
+    **外部からargvを受け取らない**。subprocess直前の最終境界として、
+    正規source path / 正本設定+RUN_DATEから再構築したdestination・region を独立に求め、
+    canonical argv を内部で組み立て、実行直前に期待argvと完全一致することを確認する。
+    非0終了は握りつぶさない。
     """
     expected_source = str(assert_canonical_source_path(canonical_source_path()))
     expected = rebuild_expected_destination(run_date)
-    assert_safe_argv(argv, expected_source, expected["uri"])
+    validated_run_id, _ = validate_run_id(run_id)
+    validated_count = validate_record_count(record_count)
+    metadata_value = build_metadata_value(expected["run_date"], validated_run_id, validated_count)
+
+    argv = build_canonical_argv(
+        expected_source, expected["uri"], expected["region"], metadata_value, bool(dry_run)
+    )
+    assert_canonical_argv(
+        argv,
+        expected_source,
+        expected["uri"],
+        expected["region"],
+        metadata_value,
+        bool(dry_run),
+    )
 
     logger.info("aws s3 cp 実行: dest={0}".format(expected["uri"]))
     completed = subprocess.run(  # noqa: S603 - argv配列固定・shell未使用
@@ -547,9 +581,12 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "verified": False,
     }
 
-    metadata_value = build_metadata_value(run_date, run_id, scan["record_count"])
-    argv = build_cp_argv(local_path, destination_uri, region, args.dry_run, metadata_value)
-    run_upload(argv, run_date, logger)
+    executed = run_upload(run_date, run_id, scan["record_count"], args.dry_run, logger)
+    if executed["uri"] != destination_uri or executed["key"] != key:
+        raise UploadError(
+            "upload境界で再構築したdestinationが一致しません "
+            "(actual={0!r} / expected={1!r})".format(executed["uri"], destination_uri)
+        )
 
     if args.dry_run:
         logger.warn("dry-runのため verify は実施しません（S3未変更）")

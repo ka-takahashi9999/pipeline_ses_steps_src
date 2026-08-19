@@ -16,7 +16,9 @@ RUN_DATE検証・key組み立ては upload utility の実装を再利用する�
   2. run_dateがYYYYMMDDかつ実在日付（例: 20260230 はNG）
   3. s3_bucket == 正本設定のbucket
   4. s3_key == 正本設定 + run_date から組み立てた期待key
-  5. local mail masterの存在・regular file・symlinkでない
+  5. local mail masterが canonical source であること
+     （file symlink / 01_result symlink / stepディレクトリ経由のsymlink / realpath不一致 /
+      ファイル名違い / 階層違いを upload本体と同じ判定で拒否する）
   6. local bytes == summary.local_bytes / record数 == summary.record_count
   7. apply実行では verified == True かつ s3_bytes == local_bytes
 
@@ -43,6 +45,7 @@ from upload_mail_master_private_s3 import (  # noqa: E402 - 00_tool の実装を
     MAIL_MASTER_FILENAME,
     SUMMARY_FILENAME,
     UploadError,
+    assert_canonical_source_path,
     build_object_key,
     canonical_source_path,
     lock_destination,
@@ -99,6 +102,14 @@ def check_destination(summary, errors):
 def check_local(summary, errors):
     """localのmail masterとsummaryのbytes / record数が整合しているか確認する。"""
     local_path = canonical_source_path()
+    # canonical source判定は upload本体の実装を再利用する（二重実装しない）。
+    # file自身のsymlinkに加え、01_result / stepディレクトリ経由のsymlink・realpath不一致・
+    # ファイル名違い・階層違いもここで拒否される。
+    try:
+        assert_canonical_source_path(local_path)
+    except UploadError as exc:
+        errors.append("canonical sourceではありません: {0}".format(exc))
+        return
     if local_path.is_symlink():
         errors.append("mail masterがsymlinkです: {0}".format(local_path))
         return
