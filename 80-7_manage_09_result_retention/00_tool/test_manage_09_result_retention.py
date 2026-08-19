@@ -305,6 +305,17 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
     BASE_PREFIX = "pipeline_ses_steps"
     CURRENT = "20260819"
 
+    def test_current_only_without_previous_success_passes(self):
+        current_key = "pipeline_ses_steps/mail_display_extract_20260819.zip"
+        plan = target.plan_root_distribution_zip_retention(
+            [current_key],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            [],
+        )
+        self.assertEqual(plan["keep_keys"], [current_key])
+        self.assertEqual(plan["delete_candidate_keys"], [])
+
     def test_exact_pattern_keeps_current_and_previous_successful(self):
         keys = [
             "pipeline_ses_steps/mail_display_extract_20260819.zip",
@@ -347,7 +358,7 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
         )
         self.assertEqual(len(plan["target_keys"]), 4)
 
-    def test_current_is_unconditionally_protected_and_failed_only_old_zip_is_delete_candidate(self):
+    def test_current_is_protected_and_failed_old_zip_is_delete_candidate_when_previous_exists(self):
         client = self.set_s3(
             status_objects(
                 [
@@ -380,6 +391,97 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
             "pipeline_ses_steps/mail_display_extract_20260817.zip",
             plan["delete_candidate_keys"],
         )
+
+    def test_no_previous_success_with_one_old_canonical_fails_closed(self):
+        with self.assertRaises(target.RetentionError):
+            target.plan_root_distribution_zip_retention(
+                [
+                    "pipeline_ses_steps/mail_display_extract_20260819.zip",
+                    "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                ],
+                self.BASE_PREFIX,
+                self.CURRENT,
+                [],
+            )
+
+    def test_no_previous_success_with_multiple_old_canonical_fails_closed(self):
+        with self.assertRaises(target.RetentionError):
+            target.plan_root_distribution_zip_retention(
+                [
+                    "pipeline_ses_steps/mail_display_extract_20260819.zip",
+                    "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                    "pipeline_ses_steps/mail_display_extract_20260817.zip",
+                ],
+                self.BASE_PREFIX,
+                self.CURRENT,
+                [],
+            )
+
+    def test_failed_only_status_with_old_canonical_fails_closed(self):
+        client = self.set_s3(
+            status_objects([("20260818", "sfn-failed-only", "FAILED", 1, {})])
+        )
+        previous = target.resolve_previous_successful_run_dates(
+            client,
+            BUCKET,
+            STATUS_PREFIX,
+            self.CURRENT,
+            self.logger,
+        )
+        self.assertEqual(previous, [])
+        with self.assertRaises(target.RetentionError):
+            target.plan_root_distribution_zip_retention(
+                [
+                    "pipeline_ses_steps/mail_display_extract_20260819.zip",
+                    "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                ],
+                self.BASE_PREFIX,
+                self.CURRENT,
+                previous,
+            )
+
+    def test_invalid_status_with_old_canonical_fails_before_planning(self):
+        broken = status_document("20260818", "sfn-broken")
+        del broken["exit_code"]
+        client = self.set_s3(
+            {
+                status_key("20260818", "sfn-broken"): json.dumps(broken).encode(
+                    "utf-8"
+                )
+            }
+        )
+        with self.assertRaises(target.RetentionError):
+            previous = target.resolve_previous_successful_run_dates(
+                client,
+                BUCKET,
+                STATUS_PREFIX,
+                self.CURRENT,
+                self.logger,
+            )
+            target.plan_root_distribution_zip_retention(
+                ["pipeline_ses_steps/mail_display_extract_20260818.zip"],
+                self.BASE_PREFIX,
+                self.CURRENT,
+                previous,
+            )
+
+    def test_legacy_only_without_previous_success_does_not_fail(self):
+        plan = target.plan_root_distribution_zip_retention(
+            [
+                "pipeline_ses_steps/mail_display_format_20260413.zip",
+                "pipeline_ses_steps/arbitrary.zip",
+                (
+                    "pipeline_ses_steps/pipeline_ses_steps/"
+                    "09-2_extract_high_score_mail_display/01_result/"
+                    "mail_display_extract_20260818.zip"
+                ),
+            ],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            [],
+        )
+        self.assertEqual(plan["target_keys"], [])
+        self.assertEqual(plan["delete_candidate_keys"], [])
 
     def test_invalid_calendar_date_in_exact_pattern_fails_closed(self):
         with self.assertRaises(target.RetentionError):

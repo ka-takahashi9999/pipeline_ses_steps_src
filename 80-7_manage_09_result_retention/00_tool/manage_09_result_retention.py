@@ -377,6 +377,16 @@ def plan_root_distribution_zip_retention(
             )
         targets.append((key, run_date))
 
+    older_canonical_keys = [
+        key for key, run_date in targets if run_date < current_run_date
+    ]
+    if backup_generations > 0 and not selected_previous and older_canonical_keys:
+        raise RetentionError(
+            "直前の正常終了RUN_DATEをstatus正本から決定できません。"
+            f"古いcanonical root ZIPが{len(older_canonical_keys)}件あるため"
+            "DELETE candidateを生成せず停止します"
+        )
+
     return {
         "backup_generations": backup_generations,
         "keep_run_dates": sorted(keep_run_dates),

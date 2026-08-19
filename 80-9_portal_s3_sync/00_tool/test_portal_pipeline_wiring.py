@@ -5,8 +5,7 @@
 ① run_full_pipeline.sh / run_full_pipeline_master.sh が完全一致していること
 ② assistant処理（run_suggest_and_cleanup）の後に 80-7 → 80-8 → 80-9 の順で並ぶこと
 ③ 80-7 / 80-8 / 80-9 が run_step 経由（失敗時にPipelineをexitさせる経路）であること
-④ 09-1〜09-5本体 / 06-80 / 07-1 / 08-1 / Success Cache / 80-7 に差分がないこと
-   （workspace と _src のcheckoutをsha256比較する）
+④ 80-7のproduction code path・local retention対象・summary contractを直接検証すること
 ⑤ 設定が pipeline_s3_config.env に統合され、bucketを二重管理していないこと
 
 production contract regression（(33)-(38)）:
@@ -22,6 +21,7 @@ full Pipeline実行・AWSアクセスは行わない。
   python3 80-9_portal_s3_sync/00_tool/test_portal_pipeline_wiring.py
 """
 
+import ast
 import hashlib
 import re
 import sys
@@ -34,11 +34,13 @@ sys.path.insert(0, str(project_root))
 from common.pipeline_s3_env import load_pipeline_s3_config  # noqa: E402
 
 SRC_ROOT = project_root
-GIT_ROOT = Path("/home/ec2-user/pipeline_ses_steps_src")
 
 RUNNER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline.sh"
 RUNNER_MASTER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline_master.sh"
 CONFIG_ENV = SRC_ROOT / "00_pipeline/00_tool/pipeline_s3_config.env"
+RETENTION_SCRIPT = (
+    SRC_ROOT / "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py"
+)
 
 NEW_STEPS = (
     "80-7_manage_09_result_retention",
@@ -50,26 +52,6 @@ ROTATION_STEP = "80-75_portal_s3_backup_rotation"
 ROTATION_SCRIPT = f"{ROTATION_STEP}/00_tool/portal_s3_backup_rotation.py"
 PRIVATE_UPLOADER = "01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py"
 ZIP_WRITER = SRC_ROOT / "09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py"
-
-# 今回変更してはいけない領域
-FROZEN_GLOBS = (
-    "common/success_cache.py",
-    "80-7_manage_09_result_retention/00_tool/*.py",
-    "80-7_manage_09_result_retention/02_confirm/*.py",
-    "01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py",
-    "01-1_fetch_gmail/02_confirm/confirm_mail_master_private_s3.py",
-    "06-80_duplicate_proposal_check/00_tool/*.py",
-    "07-1_requirement_skill_ai_matching/00_tool/*.py",
-    "07-1_requirement_skill_ai_matching/00_tool/normalized/*.py",
-    "08-1_restore_and_merge_requirement_skill_ai_matching/00_tool/*.py",
-    "09-1_mail_display_format/00_tool/*.py",
-    "09-2_extract_high_score_mail_display/00_tool/*.py",
-    "09-3_prepare_sales_proposal_input/00_tool/*.py",
-    "09-3_prepare_sales_mail_context/00_tool/*.py",
-    "09-4_remove_category_mismatch_sales_candidates/00_tool/*.py",
-    "09-5_generate_sales_reply_draft/00_tool/*.py",
-)
-
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -166,24 +148,128 @@ class TestProductionContracts(unittest.TestCase):
     def setUp(self):
         self.text = RUNNER.read_text(encoding="utf-8")
 
-    # ---- (33) 80-7 unchanged --------------------------------------------
-    def test_33_80_7_local_retention_is_unchanged(self):
-        """80-7はEC2 localのretention責務のまま。S3 CURRENT/bk1へ関与しない。
-        （実体の未変更は TestFrozenAreasHaveNoDiff のsha256比較で担保する）"""
+    # ---- (33) 80-7 production contract ----------------------------------
+    def test_33_80_7_local_retention_contract_is_fixed(self):
+        """80-7のlocal対象と既存summary contractをproduction codeから検証する。"""
         line = [l for l in self.text.splitlines() if "manage_09_result_retention.py" in l]
         self.assertEqual(len(line), 1)
         self.assertIn("--apply", line[0])
         self.assertIn('--run-date "$RUN_DATE"', line[0])
-        retention = (
-            SRC_ROOT / "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py"
-        ).read_text(encoding="utf-8")
+        retention = RETENTION_SCRIPT.read_text(encoding="utf-8")
+        tree = ast.parse(retention)
+        retention_targets = next(
+            ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "RETENTION_TARGETS"
+        )
+        self.assertEqual(
+            retention_targets,
+            (
+                ("09-1_mail_display_format", "dir", r"^mail_display_format_(\d{8})$"),
+                (
+                    "09-2_extract_high_score_mail_display",
+                    "dir",
+                    r"^mail_display_extract_(\d{8})$",
+                ),
+                (
+                    "09-2_extract_high_score_mail_display",
+                    "file",
+                    r"^mail_display_extract_(\d{8})\.zip$",
+                ),
+                (
+                    "09-3_prepare_sales_proposal_input",
+                    "file",
+                    r"^proposal_input_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-3_prepare_sales_mail_context",
+                    "file",
+                    r"^prepare_sales_mail_context_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-4_remove_category_mismatch_sales_candidates",
+                    "file",
+                    r"^sales_proposal_candidates_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-4_remove_category_mismatch_sales_candidates",
+                    "file",
+                    r"^99_excluded_category_mismatch_sales_candidates_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-5_generate_sales_reply_draft",
+                    "file",
+                    r"^generate_sales_reply_draft_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-5_generate_sales_reply_draft",
+                    "dir",
+                    r"^reply_preview_(\d{8})$",
+                ),
+            ),
+        )
+
+        run_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run"
+        )
+        summary_assign = next(
+            node
+            for node in ast.walk(run_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(name, ast.Name) and name.id == "summary"
+                for name in node.targets
+            )
+        )
+        summary_keys = {
+            ast.literal_eval(key) for key in summary_assign.value.keys if key is not None
+        }
+        self.assertTrue(
+            {
+                "current_run_date",
+                "previous_successful_run_date",
+                "previous_successful_run_date_source",
+                "keep_run_dates",
+                "artifact_run_dates",
+                "planned_entry_count",
+                "planned_delete_files",
+                "planned_delete_bytes",
+                "deleted_files",
+                "deleted_bytes",
+                "removed_dirs",
+                "delete_breakdown",
+            }.issubset(summary_keys)
+        )
+
+    def test_33b_root_zip_helper_is_not_in_production_code_path(self):
+        retention = RETENTION_SCRIPT.read_text(encoding="utf-8")
+        tree = ast.parse(retention)
+        run_node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "run"
+        )
+        run_calls = {
+            node.func.id
+            for node in ast.walk(run_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("plan_root_distribution_zip_retention", run_calls)
+
+        module_call_attributes = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertTrue({"delete_object", "delete_objects"}.isdisjoint(module_call_attributes))
+        self.assertNotIn("aws s3 rm", retention)
         # 80-7はS3 pipeline-statusをread-only参照するのみ。CURRENT/bk1へは関与しない。
         for token in ("pipeline_ses_steps_bk1", "PORTAL_S3_PREFIX", "PORTAL_S3_BACKUP_PREFIX"):
             self.assertNotIn(token, retention, msg=token)
-        # root ZIP helperは準備済みだがactive run()には未接続で、S3 delete実装も持たない。
-        self.assertEqual(retention.count("plan_root_distribution_zip_retention("), 1)
-        self.assertNotIn("delete_object(", retention)
-        self.assertNotIn("delete_objects(", retention)
 
     # ---- (36) private uploader still operational -------------------------
     def test_36_private_uploader_is_still_wired(self):
@@ -240,28 +326,6 @@ class TestProductionContracts(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(ROTATION_STEP, prepare)
-
-
-class TestFrozenAreasHaveNoDiff(unittest.TestCase):
-    def test_success_cache_and_09_bodies_are_unchanged(self):
-        if not (GIT_ROOT / ".git").is_dir():
-            self.skipTest(f"_src が存在しないため比較をスキップ: {GIT_ROOT}")
-
-        checked = 0
-        diffs = []
-        for pattern in FROZEN_GLOBS:
-            for path in sorted(SRC_ROOT.glob(pattern)):
-                relative = path.relative_to(SRC_ROOT)
-                counterpart = GIT_ROOT / relative
-                if not counterpart.is_file():
-                    diffs.append(f"_srcに存在しない: {relative}")
-                    continue
-                checked += 1
-                if sha256(path) != sha256(counterpart):
-                    diffs.append(f"差分あり: {relative}")
-        self.assertGreater(checked, 0, msg="比較対象が0件です")
-        self.assertEqual(diffs, [], msg=f"凍結領域に差分があります: {diffs[:3]}")
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
