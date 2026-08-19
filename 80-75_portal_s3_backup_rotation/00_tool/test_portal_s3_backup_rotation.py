@@ -16,6 +16,7 @@ full Pipeline実行は行わない。
 
 import argparse
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -32,6 +33,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import portal_s3_backup_rotation as target  # noqa: E402
 from common.logger import get_logger  # noqa: E402
 
+STATUS_WRITER_PATH = (
+    project_root / "99-9_publish_pipeline_status" / "00_tool" / "publish_pipeline_status.py"
+)
+STATUS_WRITER_SPEC = importlib.util.spec_from_file_location(
+    "publish_pipeline_status_for_80_75_test", str(STATUS_WRITER_PATH)
+)
+status_writer = importlib.util.module_from_spec(STATUS_WRITER_SPEC)
+STATUS_WRITER_SPEC.loader.exec_module(status_writer)
+
 BUCKET = target.EXPECTED_BUCKET
 BASE_PREFIX = target.EXPECTED_BASE_PREFIX
 CURRENT_PREFIX = target.EXPECTED_CURRENT_PREFIX
@@ -42,6 +52,7 @@ DESTINATION_URI = target.EXPECTED_DESTINATION_URI
 PREV_RUN_DATE = "20260818"
 PREV_RUN_ID = "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951"
 CURRENT_RUN_ID = "sfn-current-run"
+CURRENT_RUN_DATE = "20260819"
 
 
 class FakeS3Client:
@@ -131,6 +142,26 @@ def make_sync_summary(**overrides):
     }
     summary.update(overrides)
     return summary
+
+
+def make_status_document(run_date, run_id, status, exit_code):
+    """99-9正本のbuild_documentで実schema documentを生成する。"""
+    running = status == "RUNNING"
+    args = argparse.Namespace(
+        run_id=run_id,
+        run_date=run_date,
+        status=status,
+        started_at="2026-08-19T00:00:00Z",
+        finished_at=None if running else "2026-08-19T01:00:00Z",
+        exit_code=exit_code,
+        current_step="INITIALIZING" if running else "PIPELINE_END",
+        error_message="failed" if status == "FAILED" else "",
+        log_s3_uri=f"s3://{BUCKET}/{BASE_PREFIX}/pipeline-logs/{run_date}/{run_id}/pipeline.log",
+        bucket=BUCKET,
+        base_prefix=BASE_PREFIX,
+        log_prefix="pipeline-logs",
+    )
+    return status_writer.build_document(args)
 
 
 class RotationTestBase(unittest.TestCase):
@@ -236,15 +267,7 @@ class RotationTestBase(unittest.TestCase):
             key = f"{BASE_PREFIX}/pipeline-status/{run_date}/{run_id}/status.json"
             objects[key] = 500
             last_modified[key] = index + 1
-            status_docs[key] = {
-                "run_id": run_id,
-                "run_date": run_date,
-                "status": status,
-                "exit_code": exit_code,
-                "finished_at": None if status == "RUNNING" else "2026-08-19T00:00:00Z",
-                "finished_at_source": "not_finished" if status == "RUNNING" else "managed_wrapper",
-                "exit_code_source": "pending" if status == "RUNNING" else "managed_wrapper",
-            }
+            status_docs[key] = make_status_document(run_date, run_id, status, exit_code)
         client = getattr(self, "client", None)
         if client is None:
             client = FakeS3Client(objects, status_docs, **self._client_kwargs)
@@ -256,6 +279,19 @@ class RotationTestBase(unittest.TestCase):
         self.client = client
         target.build_s3_client = lambda region: client
         return client
+
+    def stub_current_running(self):
+        """正常な99-9 RUNNING documentを持つmanaged current runを用意する。"""
+        os.environ["RUN_DATE"] = CURRENT_RUN_DATE
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                (CURRENT_RUN_DATE, CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        key = f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/{CURRENT_RUN_ID}/status.json"
+        return client, key
 
 
 # ---------------------------------------------------------------------------
@@ -598,17 +634,85 @@ class TestPreviousCurrentGuard(RotationTestBase):
         self.assertEqual(self.sync_calls, [])
 
     def test_18c_own_run_is_excluded_from_status_check(self):
-        os.environ["RUN_DATE"] = "20260819"
-        os.environ["RUN_ID"] = CURRENT_RUN_ID
         self.stub_sync()
-        self.stub_s3(
-            status_runs=[
-                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
-                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
-            ]
-        )
+        self.stub_current_running()
         summary = target.run(self.make_args(), self.logger)
         self.assertTrue(summary["verify"]["verified"])
+
+    def test_finding_schema_version_unsupported_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["schema_version"] = "unsupported"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_schema_version_missing_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key].pop("schema_version")
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_required_status_key_missing_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key].pop("current_step")
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_started_at_invalid_fails(self):
+        for invalid in ("", "arbitrary text", "2026-02-30T09:00:00Z", "2026-08-19T09:00:00"):
+            with self.subTest(started_at=invalid):
+                client, key = self.stub_current_running()
+                client.status_docs[key]["started_at"] = invalid
+                self.stub_sync()
+                with self.assertRaises(target.RotationError):
+                    target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_started_at_missing_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key].pop("started_at")
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_finished_at_source_must_match_99_9(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["finished_at_source"] = "default"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_exit_code_source_must_match_99_9(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["exit_code_source"] = "managed_wrapper"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_managed_env_document_identity_mismatch_fails(self):
+        client, key = self.stub_current_running()
+        os.environ["RUN_DATE"] = "20260820"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(client.status_docs[key]["run_date"], CURRENT_RUN_DATE)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_invalid_running_does_not_fallback_to_older_succeeded(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["schema_version"] = "unsupported"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
 
     def test_finding_current_cli_without_managed_env_fails(self):
         self.stub_sync()

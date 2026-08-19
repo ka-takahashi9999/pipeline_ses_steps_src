@@ -77,6 +77,24 @@ EXPECTED_STATUS_PREFIX = "pipeline-status"
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RUN_DATE_RE = re.compile(r"^\d{8}$")
+STATUS_SCHEMA_VERSION = "1.0"
+STATUS_REQUIRED_KEYS = frozenset(
+    (
+        "schema_version",
+        "run_id",
+        "run_date",
+        "status",
+        "started_at",
+        "finished_at",
+        "finished_at_source",
+        "exit_code",
+        "exit_code_source",
+        "current_step",
+        "error_message",
+        "log_s3_uri",
+        "updated_at",
+    )
+)
 
 SAMPLE_LIMIT = 3
 
@@ -404,28 +422,69 @@ def resolve_current_managed_identity(args: argparse.Namespace) -> Optional[Dict[
     return {"run_date": env_run_date, "run_id": env_run_id, "source": "env"}
 
 
+def _validate_status_timestamp(name: str, value: Any) -> None:
+    """99-9と同じ基準でtimezone付きISO 8601 timestampを検証する。"""
+    if not isinstance(value, str) or not value:
+        raise RotationError(f"current RUNNING statusの{name}が文字列ではありません: {value!r}")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise RotationError(
+            f"current RUNNING statusの{name}がISO 8601形式ではありません: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise RotationError(f"current RUNNING statusの{name}にtimezoneがありません: {value!r}")
+
+
 def _validate_running_current_document(
     current_run: Dict[str, Any], document: Dict[str, Any], identity: Dict[str, str]
 ) -> None:
-    """除外候補が現在実行中のmanaged run自身であることをfail-closedで確認する。"""
+    """99-9 status schema 1.0準拠のRUNNING自runだけを除外候補として認める。"""
+    missing_keys = sorted(STATUS_REQUIRED_KEYS - set(document))
+    if missing_keys:
+        raise RotationError(f"current RUNNING statusに必須keyがありません: {missing_keys}")
+    if document["schema_version"] != STATUS_SCHEMA_VERSION:
+        raise RotationError(
+            "current RUNNING statusのschema_versionが不正です "
+            f"(actual={document['schema_version']!r} / expected={STATUS_SCHEMA_VERSION!r})"
+        )
+    if not isinstance(document["run_date"], str) or not RUN_DATE_RE.match(document["run_date"]):
+        raise RotationError(f"current RUNNING statusのrun_dateが不正です: {document['run_date']!r}")
+    try:
+        datetime.strptime(document["run_date"], "%Y%m%d")
+    except ValueError as exc:
+        raise RotationError(
+            f"current RUNNING statusのrun_dateが実在日ではありません: {document['run_date']!r}"
+        ) from exc
+    if not isinstance(document["run_id"], str) or not RUN_ID_RE.match(document["run_id"]):
+        raise RotationError(f"current RUNNING statusのrun_idが不正です: {document['run_id']!r}")
+    _validate_status_timestamp("started_at", document["started_at"])
+    _validate_status_timestamp("updated_at", document["updated_at"])
+    for key in ("current_step", "log_s3_uri"):
+        if not isinstance(document[key], str) or not document[key].strip():
+            raise RotationError(f"current RUNNING statusの{key}が空または文字列ではありません")
+    if not isinstance(document["error_message"], str):
+        raise RotationError("current RUNNING statusのerror_messageが文字列ではありません")
+
     if current_run["run_date"] != identity["run_date"] or current_run["run_id"] != identity["run_id"]:
         raise RotationError("current managed run identityとpipeline-status keyが一致しません")
-    if document.get("run_date") != identity["run_date"]:
+    if document["run_date"] != identity["run_date"]:
         raise RotationError("current managed RUN_DATEとstatus.jsonのrun_dateが一致しません")
-    if document.get("run_id") != identity["run_id"]:
+    if document["run_id"] != identity["run_id"]:
         raise RotationError("current managed RUN_IDとstatus.jsonのrun_idが一致しません")
-    if document.get("status") != "RUNNING":
+    if document["status"] != "RUNNING":
         raise RotationError(
             "current managed runはRUNNINGの場合だけ除外できます "
-            f"(status={document.get('status')!r})"
+            f"(status={document['status']!r})"
         )
-    if document.get("exit_code") is not None:
+    if document["exit_code"] is not None:
         raise RotationError("RUNNING status.jsonにexit_codeがあるため自runを除外できません")
-    if document.get("finished_at") is not None:
+    if document["finished_at"] is not None:
         raise RotationError("RUNNING status.jsonにfinished_atがあるため自runを除外できません")
-    if document.get("finished_at_source") not in (None, "not_finished"):
+    if document["finished_at_source"] != "not_finished":
         raise RotationError("RUNNING status.jsonのfinished_at_sourceが不正です")
-    if document.get("exit_code_source") not in (None, "pending"):
+    if document["exit_code_source"] != "pending":
         raise RotationError("RUNNING status.jsonのexit_code_sourceが不正です")
 
 
