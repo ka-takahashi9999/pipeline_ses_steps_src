@@ -194,6 +194,13 @@ class TestCutoverPending(unittest.TestCase):
         )
         self.assertRegex(self.text, pattern)
 
+    def test_finding_runner_comment_matches_temporary_dual_storage(self):
+        for text in (self.text, RUNNER_MASTER.read_text(encoding="utf-8")):
+            self.assertIn("mail masterは80-8 CURRENT対象へ変更済み", text)
+            self.assertIn("CURRENTとprivate prefixへの二重保存", text)
+            self.assertIn("cutover後にprivate uploaderを廃止予定", text)
+            self.assertNotIn("mail masterはPortal S3へは載せない", text)
+
     # ---- (37) root ZIP writer still operational --------------------------
     def test_37_root_zip_writer_is_still_operational(self):
         source = ZIP_WRITER.read_text(encoding="utf-8")

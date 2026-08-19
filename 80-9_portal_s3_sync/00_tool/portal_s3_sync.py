@@ -137,16 +137,24 @@ def resolve_provenance(args: argparse.Namespace) -> Dict[str, str]:
         ("run_date", getattr(args, "run_date", None), "RUN_DATE", RUN_DATE_RE),
         ("run_id", getattr(args, "run_id", None), "RUN_ID", RUN_ID_RE),
     ):
-        raw = cli_value or os.environ.get(env_name) or ""
-        raw = raw.strip()
+        env_value = os.environ.get(env_name)
+        if cli_value is not None and str(cli_value).strip():
+            raw = str(cli_value).strip()
+            source = "cli"
+        elif env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            source = "env"
+        else:
+            raw = ""
+            source = "default"
         if not raw:
             provenance[key] = UNKNOWN_PROVENANCE
-            provenance[f"{key}_source"] = "default"
+            provenance[f"{key}_source"] = source
             continue
         if not pattern.match(raw):
             raise SyncError(f"{env_name} の形式が不正です: {raw!r}")
         provenance[key] = raw
-        provenance[f"{key}_source"] = "env"
+        provenance[f"{key}_source"] = source
     return provenance
 
 

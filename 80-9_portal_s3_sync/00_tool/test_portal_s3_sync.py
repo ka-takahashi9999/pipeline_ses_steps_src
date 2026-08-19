@@ -20,8 +20,10 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(project_root / "80-75_portal_s3_backup_rotation" / "00_tool"))
 
 import portal_s3_sync as target  # noqa: E402
+import portal_s3_backup_rotation as rotation_target  # noqa: E402
 from common.json_utils import write_jsonl  # noqa: E402
 from common.logger import get_logger  # noqa: E402
 
@@ -493,6 +495,8 @@ class TestProvenance(SyncTestBase):
         self.assertEqual(summary["run_date_source"], "env")
         self.assertEqual(summary["run_id"], "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951")
         self.assertEqual(summary["run_id_source"], "env")
+        accepted = rotation_target.validate_previous_sync_summary(summary)
+        self.assertEqual(accepted["run_id"], summary["run_id"])
         # 80-75 guardが参照する既存フィールドも揃っていること
         self.assertEqual(summary["s3_destination"], DESTINATION)
         self.assertEqual(summary["sync_status"], "SUCCEEDED")
@@ -518,6 +522,45 @@ class TestProvenance(SyncTestBase):
         self.assertEqual(summary["run_date_source"], "default")
         self.assertEqual(summary["run_id"], target.UNKNOWN_PROVENANCE)
         self.assertEqual(summary["run_id_source"], "default")
+        with self.assertRaises(rotation_target.RotationError):
+            rotation_target.validate_previous_sync_summary(summary)
+
+    def test_finding_provenance_cli_only_uses_cli_source(self):
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(
+            self.make_args(run_date="20260819", run_id="sfn-cli-only"), self.logger
+        )
+        self.assertEqual(summary["run_date"], "20260819")
+        self.assertEqual(summary["run_date_source"], "cli")
+        self.assertEqual(summary["run_id"], "sfn-cli-only")
+        self.assertEqual(summary["run_id_source"], "cli")
+        with self.assertRaises(rotation_target.RotationError):
+            rotation_target.validate_previous_sync_summary(summary)
+
+    def test_finding_provenance_cli_precedes_env_and_records_cli(self):
+        os.environ["RUN_DATE"] = "20260818"
+        os.environ["RUN_ID"] = "sfn-env"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(
+            self.make_args(run_date="20260819", run_id="sfn-cli"), self.logger
+        )
+        self.assertEqual(summary["run_date"], "20260819")
+        self.assertEqual(summary["run_date_source"], "cli")
+        self.assertEqual(summary["run_id"], "sfn-cli")
+        self.assertEqual(summary["run_id_source"], "cli")
+
+    def test_finding_provenance_mixed_sources_record_adopted_side(self):
+        os.environ["RUN_DATE"] = "20260818"
+        os.environ["RUN_ID"] = "sfn-env"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(self.make_args(run_date="20260819"), self.logger)
+        self.assertEqual(summary["run_date"], "20260819")
+        self.assertEqual(summary["run_date_source"], "cli")
+        self.assertEqual(summary["run_id"], "sfn-env")
+        self.assertEqual(summary["run_id_source"], "env")
 
     def test_31c_invalid_run_id_fails(self):
         os.environ["RUN_ID"] = "bad id/with slash"

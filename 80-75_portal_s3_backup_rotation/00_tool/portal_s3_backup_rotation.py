@@ -267,12 +267,14 @@ def build_s3_client(region: str):
     return boto3.client("s3", region_name=region)
 
 
-def list_prefix_objects(s3_client, bucket: str, prefix: str) -> Dict[str, int]:
+def _list_prefix_objects(
+    s3_client, bucket: str, prefix: str, include_fingerprint: bool
+) -> Dict[str, Any]:
     """
-    prefix配下を全ページLISTし、{relative_path: size} を返す。
+    prefix配下を全ページLISTし、pathごとのsizeまたはsource fingerprintを返す。
     prefix自身のobjectのみ除外し、directory markerを含む全objectをactual集合に含める。
     """
-    actual: Dict[str, int] = {}
+    actual: Dict[str, Any] = {}
     full_prefix = f"{prefix}/"
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
@@ -291,12 +293,35 @@ def list_prefix_objects(s3_client, bucket: str, prefix: str) -> Dict[str, int]:
                     raise RotationError(f"S3 objectのSizeが不正です: {key}")
                 if relative_path in actual:
                     raise RotationError(f"S3 LISTでkeyが重複しました: {key}")
-                actual[relative_path] = size
+                if include_fingerprint:
+                    etag = obj.get("ETag")
+                    last_modified = obj.get("LastModified")
+                    if not isinstance(etag, str) or not etag:
+                        raise RotationError(f"S3 objectのETagが不正です: {key}")
+                    if last_modified is None:
+                        raise RotationError(f"S3 objectのLastModifiedがありません: {key}")
+                    actual[relative_path] = {
+                        "size": size,
+                        "etag": etag,
+                        "last_modified": last_modified,
+                    }
+                else:
+                    actual[relative_path] = size
     except RotationError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise RotationError(f"S3 LISTに失敗しました ({prefix}): {exc}") from exc
     return actual
+
+
+def list_prefix_objects(s3_client, bucket: str, prefix: str) -> Dict[str, int]:
+    """BK1 mirror確認用に {relative_path: size} を返す。"""
+    return _list_prefix_objects(s3_client, bucket, prefix, include_fingerprint=False)
+
+
+def list_source_fingerprints(s3_client, bucket: str, prefix: str) -> Dict[str, Dict[str, Any]]:
+    """CURRENT変更検知用に path + size + ETag + LastModified を返す。"""
+    return _list_prefix_objects(s3_client, bucket, prefix, include_fingerprint=True)
 
 
 def list_status_runs(s3_client, bucket: str, base_prefix: str, status_prefix: str) -> List[Dict[str, Any]]:
@@ -353,26 +378,94 @@ def _sort_key(run: Dict[str, Any]) -> Tuple[Any, str, str]:
     return (last_modified, run["run_date"], run["run_id"])
 
 
+def resolve_current_managed_identity(args: argparse.Namespace) -> Optional[Dict[str, str]]:
+    """除外候補となる自run identityをmanaged environmentからのみ解決する。"""
+    cli_run_id = getattr(args, "current_run_id", None)
+    env_run_date = (os.environ.get("RUN_DATE") or "").strip()
+    env_run_id = (os.environ.get("RUN_ID") or "").strip()
+
+    if cli_run_id is not None and str(cli_run_id).strip():
+        cli_run_id = str(cli_run_id).strip()
+        if not RUN_ID_RE.match(cli_run_id):
+            raise RotationError(f"--current-run-id の形式が不正です: {cli_run_id!r}")
+        if not env_run_id:
+            raise RotationError("--current-run-id 単独ではpipeline-status runを除外できません")
+        if cli_run_id != env_run_id:
+            raise RotationError("--current-run-id がmanaged environmentのRUN_IDと一致しません")
+
+    if not env_run_date and not env_run_id:
+        return None
+    if not env_run_date or not env_run_id:
+        raise RotationError("current managed runのRUN_DATE/RUN_IDが片方しかありません")
+    if not RUN_DATE_RE.match(env_run_date):
+        raise RotationError(f"current managed RUN_DATEの形式が不正です: {env_run_date!r}")
+    if not RUN_ID_RE.match(env_run_id):
+        raise RotationError(f"current managed RUN_IDの形式が不正です: {env_run_id!r}")
+    return {"run_date": env_run_date, "run_id": env_run_id, "source": "env"}
+
+
+def _validate_running_current_document(
+    current_run: Dict[str, Any], document: Dict[str, Any], identity: Dict[str, str]
+) -> None:
+    """除外候補が現在実行中のmanaged run自身であることをfail-closedで確認する。"""
+    if current_run["run_date"] != identity["run_date"] or current_run["run_id"] != identity["run_id"]:
+        raise RotationError("current managed run identityとpipeline-status keyが一致しません")
+    if document.get("run_date") != identity["run_date"]:
+        raise RotationError("current managed RUN_DATEとstatus.jsonのrun_dateが一致しません")
+    if document.get("run_id") != identity["run_id"]:
+        raise RotationError("current managed RUN_IDとstatus.jsonのrun_idが一致しません")
+    if document.get("status") != "RUNNING":
+        raise RotationError(
+            "current managed runはRUNNINGの場合だけ除外できます "
+            f"(status={document.get('status')!r})"
+        )
+    if document.get("exit_code") is not None:
+        raise RotationError("RUNNING status.jsonにexit_codeがあるため自runを除外できません")
+    if document.get("finished_at") is not None:
+        raise RotationError("RUNNING status.jsonにfinished_atがあるため自runを除外できません")
+    if document.get("finished_at_source") not in (None, "not_finished"):
+        raise RotationError("RUNNING status.jsonのfinished_at_sourceが不正です")
+    if document.get("exit_code_source") not in (None, "pending"):
+        raise RotationError("RUNNING status.jsonのexit_code_sourceが不正です")
+
+
 def guard_pipeline_status(
     s3_client,
     bucket: str,
     base_prefix: str,
     status_prefix: str,
     provenance: Dict[str, Any],
-    current_run_id: Optional[str],
+    current_identity: Optional[Dict[str, str]],
     logger,
 ) -> Dict[str, Any]:
     """
     pipeline-status を照合し、直前の terminal run が
     「80-9 summaryが指すrun」かつ SUCCEEDED であることを確認する。
 
-    自runを除外した最新runがsummaryのrunと一致しない場合はFAILさせる。
+    env由来identityとstatus documentが正しいRUNNING自runだけを除外し、
+    その後の最新runがsummaryのrunと一致しない場合はFAILさせる。
     これにより「古い成功summaryだけが残り、直近runが80-9途中で落ちてCURRENTがpartial」
     というケースをbackupしない。
     """
     runs = list_status_runs(s3_client, bucket, base_prefix, status_prefix)
-    if current_run_id:
-        runs = [run for run in runs if run["run_id"] != current_run_id]
+    if current_identity:
+        current_runs = [
+            run for run in runs
+            if run["run_date"] == current_identity["run_date"]
+            and run["run_id"] == current_identity["run_id"]
+        ]
+        if len(current_runs) != 1:
+            raise RotationError(
+                "current managed runのpipeline-status keyを一意に特定できません "
+                f"(matches={len(current_runs)})"
+            )
+        current_run = current_runs[0]
+        current_document = get_status_document(s3_client, bucket, current_run["key"])
+        _validate_running_current_document(current_run, current_document, current_identity)
+        runs = [run for run in runs if run["key"] != current_run["key"]]
+        logger.info(
+            f"RUNNING自runのみ除外: {current_identity['run_date']}/{current_identity['run_id']}"
+        )
     if not runs:
         raise RotationError("自runを除くpipeline-status runが存在しません")
     if any(run.get("last_modified") is None for run in runs):
@@ -522,7 +615,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--current-run-id",
         default=None,
-        help="自runのRUN_ID（既定は環境変数RUN_ID）。pipeline-status照合から除外する。",
+        help="互換確認用。環境変数RUN_IDと一致する場合のみ受理し、除外identityには使用しない。",
     )
     return parser.parse_args()
 
@@ -573,12 +666,15 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     )
 
     s3_client = build_s3_client(region)
-    current_run_id = args.current_run_id or os.environ.get("RUN_ID") or None
+    current_identity = resolve_current_managed_identity(args)
     status_info = guard_pipeline_status(
-        s3_client, bucket, base_prefix, status_prefix, provenance, current_run_id, logger
+        s3_client, bucket, base_prefix, status_prefix, provenance, current_identity, logger
     )
 
-    current_before = list_prefix_objects(s3_client, bucket, current_prefix)
+    current_before_fingerprint = list_source_fingerprints(s3_client, bucket, current_prefix)
+    current_before = {
+        path: fingerprint["size"] for path, fingerprint in current_before_fingerprint.items()
+    }
     if not current_before:
         raise RotationError(f"CURRENTが0件です（backupしません）: {source_uri}")
     current_bytes = sum(current_before.values())
@@ -630,9 +726,12 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     time.sleep(wait_seconds)
     summary["wait_performed"] = True
 
-    current_after = list_prefix_objects(s3_client, bucket, current_prefix)
-    if current_after != current_before:
+    current_after_fingerprint = list_source_fingerprints(s3_client, bucket, current_prefix)
+    if current_after_fingerprint != current_before_fingerprint:
         raise RotationError("backup中にCURRENTが変化しました（backup結果を信頼できません）")
+    current_after = {
+        path: fingerprint["size"] for path, fingerprint in current_after_fingerprint.items()
+    }
 
     backup_after = list_prefix_objects(s3_client, bucket, backup_prefix)
     verify_result = compare_sets(current_after, backup_after, logger)

@@ -47,7 +47,7 @@ CURRENT_RUN_ID = "sfn-current-run"
 class FakeS3Client:
     """
     LIST / GET のみをmockする最小のS3クライアント。
-    objects: {key: size} / status_docs: {key: dict} / list_meta: {key: last_modified}
+    objects: {key: size} / status_docs: {key: dict} / LIST metadataを保持する。
     """
 
     def __init__(self, objects, status_docs, fail_list_prefixes=(), truncated_prefixes=(),
@@ -58,6 +58,7 @@ class FakeS3Client:
         self.truncated_prefixes = tuple(truncated_prefixes)
         self.fail_get = fail_get
         self.last_modified = {}
+        self.etags = {}
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -93,6 +94,7 @@ class _FakePaginator:
                         "Key": k,
                         "Size": self.client.objects[k],
                         "LastModified": self.client.last_modified.get(k, 0),
+                        "ETag": self.client.etags.get(k, f'"etag-{k}"'),
                     }
                     for k in chunk
                 ]
@@ -148,6 +150,8 @@ class RotationTestBase(unittest.TestCase):
             "06-80_duplicate_proposal_check/01_result/dup.jsonl": 20,
             "09-1_mail_display_format/01_result/20260818/a.txt": 5,
         }
+        self.current_etags = {path: '"etag-v1"' for path in self.current}
+        self.current_last_modified = {path: 100 for path in self.current}
         self.backup = dict(self.current)
         self.write_sync_summary(make_sync_summary())
 
@@ -157,6 +161,7 @@ class RotationTestBase(unittest.TestCase):
         self.original_build = target.build_s3_client
         os.environ["PORTAL_S3_VERIFY_WAIT_SEC"] = "0"
         os.environ.pop("RUN_ID", None)
+        os.environ.pop("RUN_DATE", None)
 
     def tearDown(self):
         target.time.sleep = self.original_sleep
@@ -170,6 +175,7 @@ class RotationTestBase(unittest.TestCase):
             "PIPELINE_S3_BASE_PREFIX",
             "PIPELINE_STATUS_PREFIX",
             "RUN_ID",
+            "RUN_DATE",
         ):
             os.environ.pop(name, None)
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -191,13 +197,16 @@ class RotationTestBase(unittest.TestCase):
             current_run_id=current_run_id,
         )
 
-    def stub_sync(self, fail=False, apply_to_backup=True):
+    def stub_sync(self, fail=False, apply_to_backup=True, mutate_current=None):
         def _run_sync(argv, logger):
             self.sync_calls.append({"argv": argv})
             if fail:
                 raise target.RotationError("aws s3 sync が失敗しました (exit=1)")
             if apply_to_backup and "--dryrun" not in argv:
                 self.backup = dict(self.current)
+                self._refresh_client()
+            if mutate_current is not None and "--dryrun" not in argv:
+                mutate_current()
                 self._refresh_client()
 
         target.run_sync = _run_sync
@@ -218,6 +227,11 @@ class RotationTestBase(unittest.TestCase):
         objects.update({f"{BACKUP_PREFIX}/{p}": s for p, s in self.backup.items()})
         status_docs = {}
         last_modified = {}
+        etags = {}
+        for path in self.current:
+            key = f"{CURRENT_PREFIX}/{path}"
+            last_modified[key] = self.current_last_modified.get(path, 100)
+            etags[key] = self.current_etags.get(path, '"etag-v1"')
         for index, (run_date, run_id, status, exit_code) in enumerate(self._status_runs):
             key = f"{BASE_PREFIX}/pipeline-status/{run_date}/{run_id}/status.json"
             objects[key] = 500
@@ -227,6 +241,9 @@ class RotationTestBase(unittest.TestCase):
                 "run_date": run_date,
                 "status": status,
                 "exit_code": exit_code,
+                "finished_at": None if status == "RUNNING" else "2026-08-19T00:00:00Z",
+                "finished_at_source": "not_finished" if status == "RUNNING" else "managed_wrapper",
+                "exit_code_source": "pending" if status == "RUNNING" else "managed_wrapper",
             }
         client = getattr(self, "client", None)
         if client is None:
@@ -235,6 +252,7 @@ class RotationTestBase(unittest.TestCase):
             client.objects = objects
             client.status_docs = status_docs
         client.last_modified = last_modified
+        client.etags = etags
         self.client = client
         target.build_s3_client = lambda region: client
         return client
@@ -420,6 +438,52 @@ class TestBackupVerify(RotationTestBase):
         self.assertEqual(result["extra_count"], 1)
         self.assertFalse(result["verified"])
 
+    def test_finding_fingerprint_path_added_fails(self):
+        self.stub_sync(
+            mutate_current=lambda: self.current.update({"new/01_result/added.jsonl": 4})
+        )
+        self.stub_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_fingerprint_path_deleted_fails(self):
+        path = next(iter(self.current))
+        self.stub_sync(mutate_current=lambda: self.current.pop(path))
+        self.stub_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_fingerprint_size_changed_fails(self):
+        path = next(iter(self.current))
+        self.stub_sync(mutate_current=lambda: self.current.update({path: self.current[path] + 1}))
+        self.stub_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_fingerprint_same_size_etag_changed_fails(self):
+        path = next(iter(self.current))
+        self.stub_sync(mutate_current=lambda: self.current_etags.update({path: '"etag-v2"'}))
+        self.stub_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_fingerprint_same_size_last_modified_changed_fails(self):
+        path = next(iter(self.current))
+        self.stub_sync(
+            mutate_current=lambda: self.current_last_modified.update(
+                {path: self.current_last_modified[path] + 1}
+            )
+        )
+        self.stub_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_fingerprint_unchanged_passes(self):
+        self.stub_sync()
+        self.stub_s3()
+        summary = target.run(self.make_args(), self.logger)
+        self.assertTrue(summary["verify"]["verified"])
+
     def test_current_changed_during_backup_fails(self):
         def _run_sync(argv, logger):
             self.sync_calls.append({"argv": argv})
@@ -534,6 +598,8 @@ class TestPreviousCurrentGuard(RotationTestBase):
         self.assertEqual(self.sync_calls, [])
 
     def test_18c_own_run_is_excluded_from_status_check(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
         self.stub_sync()
         self.stub_s3(
             status_runs=[
@@ -541,8 +607,134 @@ class TestPreviousCurrentGuard(RotationTestBase):
                 ("20260819", CURRENT_RUN_ID, "RUNNING", None),
             ]
         )
-        summary = target.run(self.make_args(current_run_id=CURRENT_RUN_ID), self.logger)
+        summary = target.run(self.make_args(), self.logger)
         self.assertTrue(summary["verify"]["verified"])
+
+    def test_finding_current_cli_without_managed_env_fails(self):
+        self.stub_sync()
+        self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(current_run_id=CURRENT_RUN_ID), self.logger)
+
+    def test_finding_current_cli_must_match_managed_env(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        self.stub_sync()
+        self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(current_run_id="sfn-arbitrary"), self.logger)
+
+    def test_finding_current_failed_cannot_be_excluded_by_cli(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        self.stub_sync()
+        self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "FAILED", 1),
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(current_run_id=CURRENT_RUN_ID), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_current_succeeded_cannot_be_excluded(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        self.stub_sync()
+        self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "SUCCEEDED", 0),
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_current_document_run_date_mismatch_fails(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        key = f"{BASE_PREFIX}/pipeline-status/20260819/{CURRENT_RUN_ID}/status.json"
+        client.status_docs[key]["run_date"] = "20260820"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_current_document_run_id_mismatch_fails(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        key = f"{BASE_PREFIX}/pipeline-status/20260819/{CURRENT_RUN_ID}/status.json"
+        client.status_docs[key]["run_id"] = "sfn-tampered"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_running_with_exit_code_fails(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        key = f"{BASE_PREFIX}/pipeline-status/20260819/{CURRENT_RUN_ID}/status.json"
+        client.status_docs[key]["exit_code"] = 1
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_running_with_terminal_timestamp_fails(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", CURRENT_RUN_ID, "RUNNING", None),
+            ]
+        )
+        key = f"{BASE_PREFIX}/pipeline-status/20260819/{CURRENT_RUN_ID}/status.json"
+        client.status_docs[key]["finished_at"] = "2026-08-19T01:00:00Z"
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+
+    def test_finding_stale_summary_failed_cli_bypass_is_closed(self):
+        os.environ["RUN_DATE"] = "20260819"
+        os.environ["RUN_ID"] = "sfn-newer-failed"
+        self.stub_sync()
+        self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                ("20260819", "sfn-newer-failed", "FAILED", 1),
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(current_run_id="sfn-newer-failed"), self.logger)
+        self.assertEqual(self.sync_calls, [])
 
     def test_19_run_id_mismatch_fails(self):
         self.write_sync_summary(make_sync_summary(run_id="sfn-other-run"))
@@ -562,6 +754,8 @@ class TestPreviousCurrentGuard(RotationTestBase):
 
     def test_19c_provenance_source_not_env_fails(self):
         for overrides in (
+            {"run_id_source": "cli", "run_id": "sfn-cli"},
+            {"run_date_source": "cli", "run_date": "20260819"},
             {"run_id_source": "default", "run_id": "unknown"},
             {"run_date_source": "default", "run_date": "unknown"},
         ):
