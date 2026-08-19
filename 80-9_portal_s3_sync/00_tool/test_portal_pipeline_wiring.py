@@ -9,11 +9,11 @@
    （workspace と _src のcheckoutをsha256比較する）
 ⑤ 設定が pipeline_s3_config.env に統合され、bucketを二重管理していないこと
 
-cutover前regression（(33)-(38)）:
+production contract regression（(33)-(38)）:
 ⑥ 80-7 のlocal retentionが未変更であること
 ⑦ CURRENT destination / pipeline-status / pipeline-logs prefixが未変更であること
 ⑧ private mail master uploader が production wiring 上でまだ有効であること
-⑨ 09-2 root ZIP writer が production 上でまだ有効であること
+⑨ 09-2 root ZIP writer が外部配布用の正式contractとしてcutover後も有効であること
 ⑩ active runner が 80-75 rotation をまだ呼び出していないこと（cutover未実施）
 
 full Pipeline実行・AWSアクセスは行わない。
@@ -160,8 +160,8 @@ class TestConfig(unittest.TestCase):
         )
 
 
-class TestCutoverPending(unittest.TestCase):
-    """cutover前に production 経路が壊れていないこと（(33)(36)(37)(38)）。"""
+class TestProductionContracts(unittest.TestCase):
+    """production contractとcutover前の未wiringを確認する（(33)(36)(37)(38)）。"""
 
     def setUp(self):
         self.text = RUNNER.read_text(encoding="utf-8")
@@ -180,6 +180,10 @@ class TestCutoverPending(unittest.TestCase):
         # 80-7はS3 pipeline-statusをread-only参照するのみ。CURRENT/bk1へは関与しない。
         for token in ("pipeline_ses_steps_bk1", "PORTAL_S3_PREFIX", "PORTAL_S3_BACKUP_PREFIX"):
             self.assertNotIn(token, retention, msg=token)
+        # root ZIP helperは準備済みだがactive run()には未接続で、S3 delete実装も持たない。
+        self.assertEqual(retention.count("plan_root_distribution_zip_retention("), 1)
+        self.assertNotIn("delete_object(", retention)
+        self.assertNotIn("delete_objects(", retention)
 
     # ---- (36) private uploader still operational -------------------------
     def test_36_private_uploader_is_still_wired(self):
@@ -201,11 +205,17 @@ class TestCutoverPending(unittest.TestCase):
             self.assertIn("cutover後にprivate uploaderを廃止予定", text)
             self.assertNotIn("mail masterはPortal S3へは載せない", text)
 
-    # ---- (37) root ZIP writer still operational --------------------------
-    def test_37_root_zip_writer_is_still_operational(self):
+    # ---- (37) external distribution root ZIP contract --------------------
+    def test_37_root_zip_writer_is_permanent_external_distribution_contract(self):
         source = ZIP_WRITER.read_text(encoding="utf-8")
         self.assertIn("s3_client.upload_file(", source)
-        self.assertIn("S3_PREFIX", source)
+        self.assertIn('S3_BUCKET = "technoverse"', source)
+        self.assertIn('S3_PREFIX = "pipeline_ses_steps"', source)
+        self.assertIn('s3_key = f"{S3_PREFIX}/{zip_path.name}"', source)
+        # local/CURRENT用ZIPとroot外部配布ZIPは同名の意図した二重配置。
+        self.assertIn('zip_path = STEP_DIR / "01_result"', source)
+        self.assertIn("local 01_result の ZIP は CURRENT mirror / SES Portal 用", source)
+        self.assertIn("S3 base prefix直下の", source)
         self.assertIn(
             "09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py",
             self.text,

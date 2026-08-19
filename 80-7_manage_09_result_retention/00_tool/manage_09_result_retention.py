@@ -45,6 +45,11 @@ SUMMARY_FILENAME = "manage_09_result_retention_summary.json"
 RUN_DATE_RE = re.compile(r"^\d{8}$")
 VALID_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED")
 
+# S3 base prefix直下に置く外部配布用09-2 ZIPの正式contract。
+# CURRENT mirror内の同名ZIPとは用途が異なり、両方を維持する。
+ROOT_DISTRIBUTION_ZIP_RE = re.compile(r"^mail_display_extract_(\d{8})\.zip$")
+ROOT_ZIP_BACKUP_GENERATIONS = 1
+
 # status.json の正本: 99-9_publish_pipeline_status/00_tool/publish_pipeline_status.py
 SUPPORTED_SCHEMA_VERSIONS = ("1.0",)
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -251,23 +256,136 @@ def has_successful_run(s3_client, bucket: str, status_prefix: str, run_date: str
     return found
 
 
-def resolve_previous_successful_run_date(
-    s3_client, bucket: str, status_prefix: str, current_run_date: str, logger
-) -> Optional[str]:
-    """現在RUN_DATEより前で、正常終了runを持つ最新RUN_DATEを返す。無ければNone。"""
+def resolve_previous_successful_run_dates(
+    s3_client,
+    bucket: str,
+    status_prefix: str,
+    current_run_date: str,
+    logger,
+    backup_generations: int = ROOT_ZIP_BACKUP_GENERATIONS,
+) -> List[str]:
+    """現在RUN_DATEより前の正常終了RUN_DATEを新しい順に指定世代数返す。"""
+    if not RUN_DATE_RE.fullmatch(current_run_date) or not _is_valid_calendar_date(
+        current_run_date
+    ):
+        raise RetentionError(f"RUN_DATEが不正です: {current_run_date}")
+    if (
+        not isinstance(backup_generations, int)
+        or isinstance(backup_generations, bool)
+        or backup_generations < 0
+    ):
+        raise RetentionError(f"backup_generationsが不正です: {backup_generations!r}")
+    if backup_generations == 0:
+        return []
+
     all_run_dates = list_status_run_dates(s3_client, bucket, status_prefix)
     candidates = [d for d in all_run_dates if d < current_run_date]
     logger.info(
         f"S3 status RUN_DATE: 全{len(all_run_dates)}件 / 現在RUN_DATE未満 {len(candidates)}件"
     )
+    selected: List[str] = []
     for run_date in sorted(candidates, reverse=True):
         if has_successful_run(s3_client, bucket, status_prefix, run_date, logger):
             if run_date >= current_run_date:
                 raise RetentionError(
                     f"直前の正常終了RUN_DATEが現在RUN_DATE以降です: {run_date} >= {current_run_date}"
                 )
-            return run_date
-    return None
+            selected.append(run_date)
+            if len(selected) >= backup_generations:
+                break
+    return selected
+
+
+def resolve_previous_successful_run_date(
+    s3_client, bucket: str, status_prefix: str, current_run_date: str, logger
+) -> Optional[str]:
+    """現在RUN_DATEより前で、正常終了runを持つ最新RUN_DATEを返す。無ければNone。"""
+    selected = resolve_previous_successful_run_dates(
+        s3_client,
+        bucket,
+        status_prefix,
+        current_run_date,
+        logger,
+        backup_generations=1,
+    )
+    return selected[0] if selected else None
+
+
+def plan_root_distribution_zip_retention(
+    object_keys: List[str],
+    base_prefix: str,
+    current_run_date: str,
+    previous_successful_run_dates: List[str],
+    backup_generations: int = ROOT_ZIP_BACKUP_GENERATIONS,
+) -> Dict[str, Any]:
+    """
+    S3 base prefix直下の外部配布ZIPについてKEEP / DELETE候補を計画する。
+
+    この純粋関数はS3 LIST/DELETEを行わず、active run()からも未接続。cutover時に
+    resolve_previous_successful_run_dates()の結果とroot object一覧を渡して利用する。
+    """
+    if not RUN_DATE_RE.fullmatch(current_run_date) or not _is_valid_calendar_date(
+        current_run_date
+    ):
+        raise RetentionError(f"RUN_DATEが不正です: {current_run_date}")
+    if (
+        not isinstance(backup_generations, int)
+        or isinstance(backup_generations, bool)
+        or backup_generations < 0
+    ):
+        raise RetentionError(f"backup_generationsが不正です: {backup_generations!r}")
+
+    normalized_prefix = base_prefix.strip("/")
+    if not normalized_prefix:
+        raise RetentionError("base_prefixが空です")
+
+    validated_previous: List[str] = []
+    for run_date in previous_successful_run_dates:
+        if not isinstance(run_date, str) or not RUN_DATE_RE.fullmatch(run_date):
+            raise RetentionError(f"previous successful RUN_DATEが不正です: {run_date!r}")
+        if not _is_valid_calendar_date(run_date):
+            raise RetentionError(
+                f"previous successful RUN_DATEが実在日付ではありません: {run_date}"
+            )
+        if run_date >= current_run_date:
+            raise RetentionError(
+                "previous successful RUN_DATEがcurrent以降です: "
+                f"{run_date} >= {current_run_date}"
+            )
+        validated_previous.append(run_date)
+
+    selected_previous = sorted(set(validated_previous), reverse=True)[:backup_generations]
+    keep_run_dates = {current_run_date, *selected_previous}
+    root_prefix = f"{normalized_prefix}/"
+    targets: List[Tuple[str, str]] = []
+
+    for key in sorted(set(object_keys)):
+        if not isinstance(key, str) or not key.startswith(root_prefix):
+            continue
+        filename = key[len(root_prefix) :]
+        if "/" in filename:
+            continue
+        match = ROOT_DISTRIBUTION_ZIP_RE.fullmatch(filename)
+        if not match:
+            continue
+        run_date = match.group(1)
+        if not _is_valid_calendar_date(run_date):
+            raise RetentionError(f"root ZIPに実在しない日付があります: {key}")
+        if run_date > current_run_date:
+            raise RetentionError(
+                f"現在RUN_DATE({current_run_date})より新しいroot ZIPがあります: {key}"
+            )
+        targets.append((key, run_date))
+
+    return {
+        "backup_generations": backup_generations,
+        "keep_run_dates": sorted(keep_run_dates),
+        "target_keys": [key for key, _run_date in targets],
+        "keep_keys": [key for key, run_date in targets if run_date in keep_run_dates],
+        "delete_candidate_keys": [
+            key for key, run_date in targets if run_date not in keep_run_dates
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

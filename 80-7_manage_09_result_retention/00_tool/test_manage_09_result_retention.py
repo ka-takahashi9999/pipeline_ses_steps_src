@@ -276,6 +276,139 @@ class TestPreviousSuccessfulRunDate(RetentionTestBase):
         summary = target.run(self.make_args(root, "20260817"), self.logger)
         self.assertEqual(summary["previous_successful_run_date"], "20260813")
 
+    def test_multiple_backup_generations_skip_failed_only_run_date(self):
+        """世代数を増やしてもFAILED-only日はprevious successfulに採用しない。"""
+        client = self.set_s3(
+            status_objects(
+                [
+                    ("20260818", "sfn-fail", "FAILED", 1, {}),
+                    ("20260817", "sfn-ok-1", "SUCCEEDED", 0, {}),
+                    ("20260816", "sfn-fail-2", "FAILED", 2, {}),
+                    ("20260815", "sfn-ok-2", "SUCCEEDED", 0, {}),
+                ]
+            )
+        )
+        selected = target.resolve_previous_successful_run_dates(
+            client,
+            BUCKET,
+            STATUS_PREFIX,
+            "20260819",
+            self.logger,
+            backup_generations=2,
+        )
+        self.assertEqual(selected, ["20260817", "20260815"])
+
+
+class TestRootDistributionZipRetentionPlan(RetentionTestBase):
+    """外部配布root ZIPの未wiring rotation contractを純粋関数で検証する。"""
+
+    BASE_PREFIX = "pipeline_ses_steps"
+    CURRENT = "20260819"
+
+    def test_exact_pattern_keeps_current_and_previous_successful(self):
+        keys = [
+            "pipeline_ses_steps/mail_display_extract_20260819.zip",
+            "pipeline_ses_steps/mail_display_extract_20260818.zip",
+            "pipeline_ses_steps/mail_display_extract_20260817.zip",
+            "pipeline_ses_steps/mail_display_extract_20260814.zip",
+            "pipeline_ses_steps/mail_display_format_20260413.zip",
+            (
+                "pipeline_ses_steps/pipeline_ses_steps/"
+                "09-2_extract_high_score_mail_display/01_result/"
+                "mail_display_extract_20260819.zip"
+            ),
+        ]
+
+        plan = target.plan_root_distribution_zip_retention(
+            keys,
+            self.BASE_PREFIX,
+            self.CURRENT,
+            ["20260818"],
+        )
+
+        self.assertEqual(plan["backup_generations"], 1)
+        self.assertEqual(plan["keep_run_dates"], ["20260818", "20260819"])
+        self.assertEqual(
+            plan["keep_keys"],
+            [
+                "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                "pipeline_ses_steps/mail_display_extract_20260819.zip",
+            ],
+        )
+        self.assertEqual(
+            plan["delete_candidate_keys"],
+            [
+                "pipeline_ses_steps/mail_display_extract_20260814.zip",
+                "pipeline_ses_steps/mail_display_extract_20260817.zip",
+            ],
+        )
+        self.assertNotIn(
+            "pipeline_ses_steps/mail_display_format_20260413.zip", plan["target_keys"]
+        )
+        self.assertEqual(len(plan["target_keys"]), 4)
+
+    def test_current_is_unconditionally_protected_and_failed_only_old_zip_is_delete_candidate(self):
+        client = self.set_s3(
+            status_objects(
+                [
+                    ("20260818", "sfn-ok", "SUCCEEDED", 0, {}),
+                    ("20260817", "sfn-failed-only", "FAILED", 1, {}),
+                ]
+            )
+        )
+        previous = target.resolve_previous_successful_run_dates(
+            client,
+            BUCKET,
+            STATUS_PREFIX,
+            self.CURRENT,
+            self.logger,
+        )
+        plan = target.plan_root_distribution_zip_retention(
+            [
+                "pipeline_ses_steps/mail_display_extract_20260819.zip",
+                "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                "pipeline_ses_steps/mail_display_extract_20260817.zip",
+            ],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            previous,
+        )
+        self.assertIn(
+            "pipeline_ses_steps/mail_display_extract_20260819.zip", plan["keep_keys"]
+        )
+        self.assertIn(
+            "pipeline_ses_steps/mail_display_extract_20260817.zip",
+            plan["delete_candidate_keys"],
+        )
+
+    def test_invalid_calendar_date_in_exact_pattern_fails_closed(self):
+        with self.assertRaises(target.RetentionError):
+            target.plan_root_distribution_zip_retention(
+                ["pipeline_ses_steps/mail_display_extract_20260230.zip"],
+                self.BASE_PREFIX,
+                self.CURRENT,
+                ["20260818"],
+            )
+
+    def test_backup_generations_can_expand_without_changing_pattern(self):
+        plan = target.plan_root_distribution_zip_retention(
+            [
+                "pipeline_ses_steps/mail_display_extract_20260819.zip",
+                "pipeline_ses_steps/mail_display_extract_20260818.zip",
+                "pipeline_ses_steps/mail_display_extract_20260817.zip",
+                "pipeline_ses_steps/mail_display_extract_20260816.zip",
+            ],
+            self.BASE_PREFIX,
+            self.CURRENT,
+            ["20260818", "20260817", "20260816"],
+            backup_generations=2,
+        )
+        self.assertEqual(plan["keep_run_dates"], ["20260817", "20260818", "20260819"])
+        self.assertEqual(
+            plan["delete_candidate_keys"],
+            ["pipeline_ses_steps/mail_display_extract_20260816.zip"],
+        )
+
 
 class TestStatusFailureDoesNotDelete(RetentionTestBase):
     def assert_no_delete_and_fail(self, root, args):

@@ -1,6 +1,9 @@
 """
 09-2_extract_high_score_mail_display
 09-1 の高確度メール表示ファイルのみを抽出し、整理・圧縮して S3 に保存する。
+
+local 01_result の ZIP は CURRENT mirror / SES Portal 用、S3 base prefix直下の
+同名ZIPは外部配布用の正式成果物であり、この二重配置は意図したcontractである。
 """
 
 import re
