@@ -56,6 +56,11 @@ FETCH_AFTER="$(date -d "$RUN_DATE_ISO" "+%Y/%m/%d")"
 FETCH_BEFORE="$(date -d "$RUN_DATE_ISO +1 day" "+%Y/%m/%d")"
 run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after "$FETCH_AFTER" --before "$FETCH_BEFORE" --max 3000
 
+# 01-1のmail masterはPortal S3へは載せない（80-8で明示除外）。
+# 代わりにprivate prefixへ正式保存する。upload / verify失敗は run_step が非0でexitさせるため、
+# 01-2以降へは進まない（Pipeline FAILEDとして既存failure handlingへ流す）。
+run_step "01-1_fetch_gmail_private_s3_upload(RUN_DATE=$RUN_DATE)" "$ROOT/01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py" --run-date "$RUN_DATE"
+
 run_step "01-2_remove_duplicate_emails" "$ROOT/01-2_remove_duplicate_emails/00_tool/remove_duplicate_emails.py"
 
 run_step "01-3_remove_individual_email" "$ROOT/01-3_remove_individual_email/00_tool/remove_individual_email.py"
