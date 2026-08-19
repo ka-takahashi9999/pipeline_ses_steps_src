@@ -7,12 +7,12 @@
 ③ wait実施（wait_performed=true / verify_wait_sec が非負整数）
 ④ bk1 verify成功（verified=true）
 ⑤ missing=0 / extra=0 / size mismatch=0
-⑥ CURRENT / bk1 の file count 一致
-⑦ CURRENT / bk1 の total bytes 一致
-⑧ previous CURRENT provenance（run_date / run_id / pipeline-status key）が記録されている
-⑨ 直前の 80-9 summary の verify actual と CURRENT件数/bytesが一致
+⑥ rotation時previous CURRENT snapshot / bk1 の file count 一致
+⑦ rotation時previous CURRENT snapshot / bk1 の total bytes 一致
+⑧ previous CURRENT snapshotのprovenance / destination / verifiedが記録されている
 
-AWS APIは再実行せず、80-75のsummaryと80-9のsummaryのみで確認する。
+AWS APIと最新80-9 summaryは読み直さず、80-75 summaryに固定保存された
+rotation時previous CURRENT snapshotを正本とする。
 """
 
 import json
@@ -28,9 +28,6 @@ from common.logger import get_logger  # noqa: E402
 STEP_NAME = "80-75_portal_s3_backup_rotation_confirm"
 STEP_DIR = Path(__file__).resolve().parents[1]
 BACKUP_SUMMARY_PATH = STEP_DIR / "01_result" / "portal_s3_backup_rotation_summary.json"
-SYNC_SUMMARY_PATH = (
-    project_root / "80-9_portal_s3_sync" / "01_result" / "portal_s3_sync_summary.json"
-)
 CONFIRM_RESULT = Path(__file__).resolve().parent / "confirm_result_portal_s3_backup_rotation.txt"
 
 EXPECTED_SOURCE_URI = "s3://technoverse/pipeline_ses_steps/pipeline_ses_steps/"
@@ -122,32 +119,46 @@ def main() -> None:
         else:
             lines.append(f"[OK] {label}=0")
 
-    # ⑥⑦
-    current_files = verify.get("expected_file_count")
+    # ⑥⑦: latest 80-9 summaryではなく、80-75実行時snapshotが正本。
+    previous = summary.get("previous_current") or {}
+    snapshot_files = previous.get("file_count")
     backup_files = verify.get("actual_file_count")
-    current_bytes = verify.get("expected_total_bytes")
+    verify_expected_files = verify.get("expected_file_count")
+    snapshot_bytes = previous.get("total_bytes")
     backup_bytes = verify.get("actual_total_bytes")
+    verify_expected_bytes = verify.get("expected_total_bytes")
 
-    if not _is_count(current_files) or not _is_count(backup_files):
-        lines.append(f"[NG] file countが記録されていない: current={current_files} bk1={backup_files}")
+    if not all(_is_count(v) for v in (snapshot_files, verify_expected_files, backup_files)):
+        lines.append(
+            "[NG] file countが記録されていない: "
+            f"snapshot={snapshot_files} expected={verify_expected_files} bk1={backup_files}"
+        )
         errors.append("file count")
-    elif current_files != backup_files:
-        lines.append(f"[NG] file count不一致: current={current_files} bk1={backup_files}")
+    elif snapshot_files != verify_expected_files or snapshot_files != backup_files:
+        lines.append(
+            "[NG] file count不一致: "
+            f"snapshot={snapshot_files} expected={verify_expected_files} bk1={backup_files}"
+        )
         errors.append("file count")
     else:
-        lines.append(f"[OK] file count一致 ({current_files}件)")
+        lines.append(f"[OK] snapshot / bk1 file count一致 ({snapshot_files}件)")
 
-    if not _is_count(current_bytes) or not _is_count(backup_bytes):
-        lines.append(f"[NG] total bytesが記録されていない: current={current_bytes} bk1={backup_bytes}")
+    if not all(_is_count(v) for v in (snapshot_bytes, verify_expected_bytes, backup_bytes)):
+        lines.append(
+            "[NG] total bytesが記録されていない: "
+            f"snapshot={snapshot_bytes} expected={verify_expected_bytes} bk1={backup_bytes}"
+        )
         errors.append("total bytes")
-    elif current_bytes != backup_bytes:
-        lines.append(f"[NG] total bytes不一致: current={current_bytes} bk1={backup_bytes}")
+    elif snapshot_bytes != verify_expected_bytes or snapshot_bytes != backup_bytes:
+        lines.append(
+            "[NG] total bytes不一致: "
+            f"snapshot={snapshot_bytes} expected={verify_expected_bytes} bk1={backup_bytes}"
+        )
         errors.append("total bytes")
     else:
-        lines.append(f"[OK] total bytes一致 ({current_bytes} bytes)")
+        lines.append(f"[OK] snapshot / bk1 total bytes一致 ({snapshot_bytes} bytes)")
 
     # ⑧
-    previous = summary.get("previous_current") or {}
     run_date = previous.get("run_date")
     run_id = previous.get("run_id")
     if not isinstance(run_date, str) or not RUN_DATE_RE.match(run_date or ""):
@@ -156,34 +167,26 @@ def main() -> None:
     elif not isinstance(run_id, str) or not RUN_ID_RE.match(run_id or ""):
         lines.append(f"[NG] previous CURRENTのrun_idが不正: {run_id!r}")
         errors.append("run_id")
+    elif previous.get("run_date_source") != "env":
+        lines.append(f"[NG] previous CURRENTのrun_date_sourceが不正: {previous.get('run_date_source')!r}")
+        errors.append("run_date source")
+    elif previous.get("run_id_source") != "env":
+        lines.append(f"[NG] previous CURRENTのrun_id_sourceが不正: {previous.get('run_id_source')!r}")
+        errors.append("run_id source")
+    elif previous.get("destination") != EXPECTED_SOURCE_URI:
+        lines.append(f"[NG] previous CURRENT destinationが不正: {previous.get('destination')!r}")
+        errors.append("previous destination")
+    elif previous.get("verified") is not True:
+        lines.append(f"[NG] previous CURRENT verifiedがtrueでない: {previous.get('verified')!r}")
+        errors.append("previous verified")
+    elif previous.get("sync_step") != "80-9_portal_s3_sync":
+        lines.append(f"[NG] previous CURRENT sync_stepが不正: {previous.get('sync_step')!r}")
+        errors.append("previous sync step")
     elif not previous.get("status_key"):
         lines.append("[NG] pipeline-status照合keyが記録されていない")
         errors.append("status key")
     else:
-        lines.append(f"[OK] previous CURRENT provenance ({run_date}/{run_id})")
-
-    # ⑨
-    if SYNC_SUMMARY_PATH.is_file():
-        with open(SYNC_SUMMARY_PATH, "r", encoding="utf-8") as f:
-            sync_summary = json.load(f)
-        sync_verify = sync_summary.get("verify") or {}
-        if previous.get("file_count") != sync_verify.get("actual_file_count"):
-            lines.append(
-                f"[NG] 80-9 actual_file_countと不一致: "
-                f"{previous.get('file_count')} != {sync_verify.get('actual_file_count')}"
-            )
-            errors.append("sync file count")
-        elif previous.get("total_bytes") != sync_verify.get("actual_total_bytes"):
-            lines.append(
-                f"[NG] 80-9 actual_total_bytesと不一致: "
-                f"{previous.get('total_bytes')} != {sync_verify.get('actual_total_bytes')}"
-            )
-            errors.append("sync bytes")
-        else:
-            lines.append("[OK] 80-9 CURRENT publish summaryと一致")
-    else:
-        lines.append(f"[NG] 80-9 summaryが存在しない: {SYNC_SUMMARY_PATH}")
-        errors.append("sync summary missing")
+        lines.append(f"[OK] previous CURRENT snapshot provenance ({run_date}/{run_id})")
 
     _write_and_exit(logger, lines, errors)
 

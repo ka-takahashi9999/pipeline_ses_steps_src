@@ -273,6 +273,11 @@ def validate_previous_sync_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "run_date": run_date,
         "run_id": run_id,
+        "run_date_source": summary.get("run_date_source"),
+        "run_id_source": summary.get("run_id_source"),
+        "destination": summary.get("s3_destination"),
+        "verified": verify.get("verified"),
+        "sync_step": summary.get("step"),
         "file_count": actual_files,
         "total_bytes": actual_bytes,
     }
@@ -441,9 +446,14 @@ def _validate_running_current_document(
     current_run: Dict[str, Any], document: Dict[str, Any], identity: Dict[str, str]
 ) -> None:
     """99-9 status schema 1.0準拠のRUNNING自runだけを除外候補として認める。"""
-    missing_keys = sorted(STATUS_REQUIRED_KEYS - set(document))
-    if missing_keys:
-        raise RotationError(f"current RUNNING statusに必須keyがありません: {missing_keys}")
+    actual_keys = set(document)
+    missing_keys = sorted(STATUS_REQUIRED_KEYS - actual_keys)
+    extra_keys = sorted(actual_keys - STATUS_REQUIRED_KEYS)
+    if missing_keys or extra_keys:
+        raise RotationError(
+            "current RUNNING statusのschema keyが13 key完全一致ではありません "
+            f"(missing={missing_keys} / extra={extra_keys})"
+        )
     if document["schema_version"] != STATUS_SCHEMA_VERSION:
         raise RotationError(
             "current RUNNING statusのschema_versionが不正です "
@@ -760,6 +770,11 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     summary["previous_current"] = {
         "run_date": provenance["run_date"],
         "run_id": provenance["run_id"],
+        "run_date_source": provenance["run_date_source"],
+        "run_id_source": provenance["run_id_source"],
+        "destination": provenance["destination"],
+        "verified": provenance["verified"],
+        "sync_step": provenance["sync_step"],
         "file_count": provenance["file_count"],
         "total_bytes": provenance["total_bytes"],
         "status_key": status_info["status_key"],

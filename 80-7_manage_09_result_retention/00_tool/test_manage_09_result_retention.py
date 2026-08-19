@@ -10,11 +10,13 @@ full Pipeline実行・AWS実アクセスは行わない。
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
@@ -23,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manage_09_result_retention as target  # noqa: E402
 from common.logger import get_logger  # noqa: E402
 
-BUCKET = "test-bucket"
+BUCKET = target.EXPECTED_ROOT_ZIP_BUCKET
 STATUS_PREFIX = "pipeline_ses_steps/pipeline-status"
 
 # 13 RUN_DATE（金曜→月曜・祝日跨ぎを含む）
@@ -52,6 +54,8 @@ class FakeS3Client:
         self.fail_get_keys = set(fail_get_keys)
         self.fail_list = fail_list
         self.fail_delete_keys = set(fail_delete_keys)
+        self.list_calls = []
+        self.delete_calls = []
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -63,6 +67,7 @@ class FakeS3Client:
         return {"Body": _FakeBody(self.objects[Key])}
 
     def delete_object(self, Bucket, Key):  # noqa: N803 - boto3互換シグネチャ
+        self.delete_calls.append((Bucket, Key))
         if Key in self.fail_delete_keys:
             raise RuntimeError(f"simulated DELETE failure: {Key}")
         self.objects.pop(Key, None)
@@ -82,6 +87,7 @@ class _FakePaginator:
         self.client = client
 
     def paginate(self, Bucket, Prefix, Delimiter=None):  # noqa: N803
+        self.client.list_calls.append((Bucket, Prefix, Delimiter))
         if self.client.fail_list:
             raise RuntimeError("simulated LIST failure")
         keys = sorted(k for k in self.client.objects if k.startswith(Prefix))
@@ -224,6 +230,7 @@ class RetentionTestBase(unittest.TestCase):
             run_date=run_date,
             pipeline_root=str(root),
             bucket=BUCKET,
+            base_prefix=None,
             status_prefix=STATUS_PREFIX,
             region="ap-northeast-1",
             root_zip_only=False,
@@ -660,6 +667,145 @@ class TestRootDistributionZipRetentionPlan(RetentionTestBase):
                 self.logger,
             )
         self.assertIn(old_key, client.objects)
+
+
+class TestRootDistributionCanonicalBoundary(RetentionTestBase):
+    """root ZIPのLIST前lockとDELETE直前lockをproduction run経路で検証する。"""
+
+    CURRENT = "20260819"
+    PREVIOUS = "20260818"
+    BASE_PREFIX = target.EXPECTED_ROOT_ZIP_BASE_PREFIX
+
+    def canonical_objects(self):
+        return {
+            f"{self.BASE_PREFIX}/mail_display_extract_{self.CURRENT}.zip": b"current",
+            f"{self.BASE_PREFIX}/mail_display_extract_{self.PREVIOUS}.zip": b"previous",
+            f"{self.BASE_PREFIX}/mail_display_extract_20260817.zip": b"old",
+        }
+
+    def test_canonical_bucket_prefix_planning_passes(self):
+        client = FakeS3Client(self.canonical_objects())
+        result = target.execute_root_distribution_zip_retention(
+            client,
+            BUCKET,
+            self.BASE_PREFIX,
+            self.CURRENT,
+            [self.PREVIOUS],
+            False,
+            self.logger,
+        )
+        self.assertTrue(result["destination_locked"])
+        self.assertEqual(
+            result["delete_candidate_keys"],
+            [f"{self.BASE_PREFIX}/mail_display_extract_20260817.zip"],
+        )
+        self.assertEqual(client.delete_calls, [])
+
+    def test_wrong_bucket_fails_before_list_and_delete(self):
+        client = FakeS3Client(self.canonical_objects())
+        with self.assertRaises(target.RetentionError):
+            target.execute_root_distribution_zip_retention(
+                client,
+                "other-bucket",
+                self.BASE_PREFIX,
+                self.CURRENT,
+                [self.PREVIOUS],
+                True,
+                self.logger,
+            )
+        self.assertEqual(client.list_calls, [])
+        self.assertEqual(client.delete_calls, [])
+
+    def test_wrong_prefixes_fail_before_list_and_delete(self):
+        for prefix in (
+            "other_prefix",
+            "other_prefix/",
+            "pipeline-status",
+            "pipeline-logs",
+            "private",
+            "pipeline_ses_steps/pipeline_ses_steps",
+            "pipeline_ses_steps_bk1",
+            "",
+            "/",
+            "..",
+            "*",
+        ):
+            with self.subTest(prefix=prefix):
+                client = FakeS3Client(
+                    {f"{prefix}/mail_display_extract_20260818.zip": b"must-not-delete"}
+                )
+                with self.assertRaises(target.RetentionError):
+                    target.execute_root_distribution_zip_retention(
+                        client,
+                        BUCKET,
+                        prefix,
+                        self.CURRENT,
+                        [self.PREVIOUS],
+                        True,
+                        self.logger,
+                    )
+                self.assertEqual(client.list_calls, [])
+                self.assertEqual(client.delete_calls, [])
+
+    def test_cli_override_other_prefix_fails_in_run_before_s3_list(self):
+        root = self.build_fixture(run_dates=[self.CURRENT])
+        client = self.set_s3(status_objects([(self.PREVIOUS, "sfn-prev", "SUCCEEDED", 0, {})]))
+        args = self.make_args(root, self.CURRENT, apply_mode=True)
+        args.base_prefix = "other_prefix"
+        with self.assertRaises(target.RetentionError):
+            target.run(args, self.logger)
+        self.assertEqual(client.list_calls, [])
+        self.assertEqual(client.delete_calls, [])
+
+    def test_env_override_wrong_bucket_or_prefix_fails_before_s3_list(self):
+        root = self.build_fixture(run_dates=[self.CURRENT])
+        for env_name, env_value in (
+            ("PIPELINE_S3_BUCKET", "other-bucket"),
+            ("PIPELINE_S3_BASE_PREFIX", "other_prefix"),
+        ):
+            with self.subTest(env_name=env_name):
+                client = self.set_s3(
+                    status_objects([(self.PREVIOUS, "sfn-prev", "SUCCEEDED", 0, {})])
+                )
+                args = self.make_args(root, self.CURRENT, apply_mode=True)
+                args.bucket = None
+                args.base_prefix = None
+                args.status_prefix = None
+                args.region = None
+                with mock.patch.dict(os.environ, {env_name: env_value}, clear=False):
+                    with self.assertRaises(target.RetentionError):
+                        target.run(args, self.logger)
+                self.assertEqual(client.list_calls, [])
+                self.assertEqual(client.delete_calls, [])
+
+    def test_delete_candidate_key_mutation_fails_before_delete_object(self):
+        client = FakeS3Client(self.canonical_objects())
+        original_plan = target.plan_root_distribution_zip_retention
+
+        def mutated_plan(*args, **kwargs):
+            result = original_plan(*args, **kwargs)
+            result["delete_candidate_keys"] = [
+                "other_prefix/mail_display_extract_20260818.zip"
+            ]
+            return result
+
+        with mock.patch.object(
+            target, "plan_root_distribution_zip_retention", side_effect=mutated_plan
+        ):
+            with self.assertRaises(target.RetentionError):
+                target.execute_root_distribution_zip_retention(
+                    client,
+                    BUCKET,
+                    self.BASE_PREFIX,
+                    self.CURRENT,
+                    [self.PREVIOUS],
+                    True,
+                    self.logger,
+                )
+        self.assertEqual(client.delete_calls, [])
+        self.assertIn(
+            f"{self.BASE_PREFIX}/mail_display_extract_20260817.zip", client.objects
+        )
 
 
 class TestStatusFailureDoesNotDelete(RetentionTestBase):

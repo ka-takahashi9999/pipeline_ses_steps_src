@@ -42,6 +42,18 @@ STATUS_WRITER_SPEC = importlib.util.spec_from_file_location(
 status_writer = importlib.util.module_from_spec(STATUS_WRITER_SPEC)
 STATUS_WRITER_SPEC.loader.exec_module(status_writer)
 
+CONFIRM_PATH = (
+    project_root
+    / "80-75_portal_s3_backup_rotation"
+    / "02_confirm"
+    / "confirm_portal_s3_backup_rotation.py"
+)
+CONFIRM_SPEC = importlib.util.spec_from_file_location(
+    "confirm_portal_s3_backup_rotation_for_test", str(CONFIRM_PATH)
+)
+confirm_target = importlib.util.module_from_spec(CONFIRM_SPEC)
+CONFIRM_SPEC.loader.exec_module(confirm_target)
+
 BUCKET = target.EXPECTED_BUCKET
 BASE_PREFIX = target.EXPECTED_BASE_PREFIX
 CURRENT_PREFIX = target.EXPECTED_CURRENT_PREFIX
@@ -568,8 +580,16 @@ class TestPreviousCurrentGuard(RotationTestBase):
         self.stub_sync()
         self.stub_s3()
         summary = target.run(self.make_args(), self.logger)
-        self.assertEqual(summary["previous_current"]["run_date"], PREV_RUN_DATE)
-        self.assertEqual(summary["previous_current"]["run_id"], PREV_RUN_ID)
+        snapshot = summary["previous_current"]
+        self.assertEqual(snapshot["run_date"], PREV_RUN_DATE)
+        self.assertEqual(snapshot["run_id"], PREV_RUN_ID)
+        self.assertEqual(snapshot["run_date_source"], "env")
+        self.assertEqual(snapshot["run_id_source"], "env")
+        self.assertEqual(snapshot["destination"], SOURCE_URI)
+        self.assertTrue(snapshot["verified"])
+        self.assertEqual(snapshot["sync_step"], "80-9_portal_s3_sync")
+        self.assertEqual(snapshot["file_count"], 3)
+        self.assertEqual(snapshot["total_bytes"], 35)
         self.assertTrue(summary["verify"]["verified"])
 
     def test_15_verified_false_fails(self):
@@ -658,6 +678,40 @@ class TestPreviousCurrentGuard(RotationTestBase):
     def test_finding_required_status_key_missing_fails(self):
         client, key = self.stub_current_running()
         client.status_docs[key].pop("current_step")
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_running_schema_exact_13_keys_passes(self):
+        client, key = self.stub_current_running()
+        self.assertEqual(set(client.status_docs[key]), target.STATUS_REQUIRED_KEYS)
+        self.assertEqual(len(client.status_docs[key]), 13)
+        self.stub_sync()
+        summary = target.run(self.make_args(), self.logger)
+        self.assertTrue(summary["verify"]["verified"])
+
+    def test_finding_running_schema_12_keys_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key].pop("current_step")
+        self.assertEqual(len(client.status_docs[key]), 12)
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_running_schema_14_keys_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["future_schema_field"] = "must-fail"
+        self.assertEqual(len(client.status_docs[key]), 14)
+        self.stub_sync()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_finding_running_unknown_extra_field_fails(self):
+        client, key = self.stub_current_running()
+        client.status_docs[key]["unknown_extra_field"] = True
         self.stub_sync()
         with self.assertRaises(target.RotationError):
             target.run(self.make_args(), self.logger)
@@ -1056,6 +1110,107 @@ class TestSummaryValidationUnits(RotationTestBase):
         for value in ("-1", "1.5", "abc", "", "30s", None):
             with self.assertRaises(target.RotationError, msg=repr(value)):
                 target.parse_wait_seconds(value)
+
+
+class TestConfirmUsesRotationSnapshot(unittest.TestCase):
+    """confirmが後続80-9ではなく80-75 summary内snapshotだけを正本にすること。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="test_80_75_confirm_"))
+        self.summary_path = self.tmp / "portal_s3_backup_rotation_summary.json"
+        self.result_path = self.tmp / "confirm_result.txt"
+        self.original_summary_path = confirm_target.BACKUP_SUMMARY_PATH
+        self.original_result_path = confirm_target.CONFIRM_RESULT
+        confirm_target.BACKUP_SUMMARY_PATH = self.summary_path
+        confirm_target.CONFIRM_RESULT = self.result_path
+
+    def tearDown(self):
+        confirm_target.BACKUP_SUMMARY_PATH = self.original_summary_path
+        confirm_target.CONFIRM_RESULT = self.original_result_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make_backup_summary(self):
+        return {
+            "operation": "rotation",
+            "mode": "apply",
+            "s3_source": SOURCE_URI,
+            "s3_destination": DESTINATION_URI,
+            "s3_destination_locked": True,
+            "backup_method": "aws s3 sync CURRENT -> BK1 --delete (no CLI filters)",
+            "backup_status": "SUCCEEDED",
+            "verify_wait_sec": 0,
+            "wait_performed": True,
+            "previous_current": {
+                "run_date": PREV_RUN_DATE,
+                "run_id": PREV_RUN_ID,
+                "run_date_source": "env",
+                "run_id_source": "env",
+                "destination": SOURCE_URI,
+                "verified": True,
+                "sync_step": "80-9_portal_s3_sync",
+                "file_count": 100,
+                "total_bytes": 1000,
+                "status_key": (
+                    f"pipeline_ses_steps/pipeline-status/{PREV_RUN_DATE}/"
+                    f"{PREV_RUN_ID}/status.json"
+                ),
+            },
+            "verify": {
+                "verified": True,
+                "missing_count": 0,
+                "extra_count": 0,
+                "size_mismatch_count": 0,
+                "expected_file_count": 100,
+                "actual_file_count": 100,
+                "expected_total_bytes": 1000,
+                "actual_total_bytes": 1000,
+            },
+        }
+
+    def write_summary(self, summary):
+        with open(self.summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False)
+
+    def assert_confirm_fails(self, summary):
+        self.write_summary(summary)
+        with self.assertRaises(SystemExit) as caught:
+            confirm_target.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("【結果】NG", self.result_path.read_text(encoding="utf-8"))
+
+    def test_snapshot_100_bk1_100_passes_after_new_current_summary_120(self):
+        # 後続80-9が120件で上書きされた想定のfileはconfirmの入力にしない。
+        latest_summary = make_sync_summary()
+        latest_summary["verify"].update(
+            {
+                "expected_file_count": 120,
+                "actual_file_count": 120,
+                "expected_total_bytes": 1200,
+                "actual_total_bytes": 1200,
+            }
+        )
+        with open(self.tmp / "latest_80_9_summary.json", "w", encoding="utf-8") as f:
+            json.dump(latest_summary, f)
+
+        self.write_summary(self.make_backup_summary())
+        confirm_target.main()
+        self.assertIn("【結果】OK", self.result_path.read_text(encoding="utf-8"))
+        self.assertFalse(hasattr(confirm_target, "SYNC_SUMMARY_PATH"))
+
+    def test_snapshot_100_bk1_99_fails(self):
+        summary = self.make_backup_summary()
+        summary["verify"]["actual_file_count"] = 99
+        self.assert_confirm_fails(summary)
+
+    def test_snapshot_bytes_mismatch_fails(self):
+        summary = self.make_backup_summary()
+        summary["verify"]["actual_total_bytes"] = 999
+        self.assert_confirm_fails(summary)
+
+    def test_snapshot_provenance_missing_fails(self):
+        summary = self.make_backup_summary()
+        summary["previous_current"].pop("run_id_source")
+        self.assert_confirm_fails(summary)
 
 
 if __name__ == "__main__":

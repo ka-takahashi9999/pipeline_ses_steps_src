@@ -52,6 +52,11 @@ VALID_STATUSES = ("RUNNING", "SUCCEEDED", "FAILED")
 # CURRENT mirror内の同名ZIPとは用途が異なり、両方を維持する。
 ROOT_DISTRIBUTION_ZIP_RE = re.compile(r"^mail_display_extract_(\d{8})\.zip$")
 ROOT_ZIP_BACKUP_GENERATIONS = 1
+EXPECTED_ROOT_ZIP_BUCKET = "technoverse"
+EXPECTED_ROOT_ZIP_BASE_PREFIX = "pipeline_ses_steps"
+ROOT_DISTRIBUTION_ZIP_KEY_RE = re.compile(
+    r"^pipeline_ses_steps/mail_display_extract_(\d{8})\.zip$"
+)
 
 # status.json の正本: 99-9_publish_pipeline_status/00_tool/publish_pipeline_status.py
 SUPPORTED_SCHEMA_VERSIONS = ("1.0",)
@@ -338,9 +343,7 @@ def plan_root_distribution_zip_retention(
     ):
         raise RetentionError(f"backup_generationsが不正です: {backup_generations!r}")
 
-    normalized_prefix = base_prefix.strip("/")
-    if not normalized_prefix:
-        raise RetentionError("base_prefixが空です")
+    normalized_prefix = lock_root_distribution_base_prefix(base_prefix)
 
     validated_previous: List[str] = []
     for run_date in previous_successful_run_dates:
@@ -401,18 +404,57 @@ def plan_root_distribution_zip_retention(
     }
 
 
+def lock_root_distribution_base_prefix(base_prefix: Any) -> str:
+    """root ZIP cleanupのbase prefixをcanonical値に完全固定する。"""
+    if not isinstance(base_prefix, str) or base_prefix != EXPECTED_ROOT_ZIP_BASE_PREFIX:
+        raise RetentionError(
+            "root ZIP destination lock違反: base prefixがcanonical値と一致しません "
+            f"(actual={base_prefix!r} / expected={EXPECTED_ROOT_ZIP_BASE_PREFIX!r})"
+        )
+    return EXPECTED_ROOT_ZIP_BASE_PREFIX
+
+
+def lock_root_distribution_route(bucket: Any, base_prefix: Any) -> Tuple[str, str]:
+    """root ZIPのLIST開始前にbucket / prefix / root prefixを完全固定する。"""
+    if not isinstance(bucket, str) or bucket != EXPECTED_ROOT_ZIP_BUCKET:
+        raise RetentionError(
+            "root ZIP destination lock違反: bucketがcanonical値と一致しません "
+            f"(actual={bucket!r} / expected={EXPECTED_ROOT_ZIP_BUCKET!r})"
+        )
+    locked_prefix = lock_root_distribution_base_prefix(base_prefix)
+    root_prefix = f"{locked_prefix}/"
+    if root_prefix != "pipeline_ses_steps/":
+        raise RetentionError(f"root ZIP destination lock違反: root prefix={root_prefix!r}")
+    return EXPECTED_ROOT_ZIP_BUCKET, root_prefix
+
+
+def lock_root_distribution_delete_target(bucket: Any, key: Any) -> str:
+    """DELETE直前の実際のbucket/keyを独立に再検証する。"""
+    if not isinstance(bucket, str) or bucket != EXPECTED_ROOT_ZIP_BUCKET:
+        raise RetentionError(
+            "root ZIP DELETE final lock違反: bucketがcanonical値と一致しません "
+            f"(actual={bucket!r} / expected={EXPECTED_ROOT_ZIP_BUCKET!r})"
+        )
+    if not isinstance(key, str):
+        raise RetentionError(f"root ZIP DELETE final lock違反: keyが文字列ではありません: {key!r}")
+    match = ROOT_DISTRIBUTION_ZIP_KEY_RE.fullmatch(key)
+    if not match:
+        raise RetentionError(f"root ZIP DELETE final lock違反: canonical keyではありません: {key!r}")
+    run_date = match.group(1)
+    if not _is_valid_calendar_date(run_date):
+        raise RetentionError(f"root ZIP DELETE final lock違反: 実在日付ではありません: {key!r}")
+    return run_date
+
+
 def list_root_distribution_object_keys(
     s3_client, bucket: str, base_prefix: str
 ) -> List[str]:
     """S3 base prefix直下のobject keyだけをLISTする（配下prefixは対象外）。"""
-    normalized_prefix = base_prefix.strip("/")
-    if not normalized_prefix:
-        raise RetentionError("base_prefixが空です")
-    root_prefix = f"{normalized_prefix}/"
+    locked_bucket, root_prefix = lock_root_distribution_route(bucket, base_prefix)
     keys: List[str] = []
     paginator = s3_client.get_paginator("list_objects_v2")
     try:
-        pages = paginator.paginate(Bucket=bucket, Prefix=root_prefix, Delimiter="/")
+        pages = paginator.paginate(Bucket=locked_bucket, Prefix=root_prefix, Delimiter="/")
         for page in pages:
             for obj in page.get("Contents") or []:
                 key = obj.get("Key")
@@ -431,10 +473,11 @@ def list_root_distribution_object_keys(
 def _required_root_zip_keys(
     base_prefix: str, current_run_date: str, previous_successful_run_dates: List[str]
 ) -> List[str]:
+    locked_prefix = lock_root_distribution_base_prefix(base_prefix)
     run_dates = [current_run_date] + sorted(set(previous_successful_run_dates), reverse=True)[
         :ROOT_ZIP_BACKUP_GENERATIONS
     ]
-    return [f"{base_prefix.strip('/')}/mail_display_extract_{run_date}.zip" for run_date in run_dates]
+    return [f"{locked_prefix}/mail_display_extract_{run_date}.zip" for run_date in run_dates]
 
 
 def execute_root_distribution_zip_retention(
@@ -447,6 +490,7 @@ def execute_root_distribution_zip_retention(
     logger,
 ) -> Dict[str, Any]:
     """root ZIPを事前検証し、apply時だけexact keyを個別削除して再LISTする。"""
+    locked_bucket, _root_prefix = lock_root_distribution_route(bucket, base_prefix)
     before_keys = list_root_distribution_object_keys(s3_client, bucket, base_prefix)
     plan = plan_root_distribution_zip_retention(
         before_keys,
@@ -468,12 +512,9 @@ def execute_root_distribution_zip_retention(
     deleted_keys: List[str] = []
     if apply_mode:
         for key in delete_candidates:
-            filename = key[len(base_prefix.strip("/") + "/") :]
-            match = ROOT_DISTRIBUTION_ZIP_RE.fullmatch(filename)
-            if not match or not _is_valid_calendar_date(match.group(1)):
-                raise RetentionError(f"root ZIP削除直前のexact key検証に失敗しました: {key}")
+            lock_root_distribution_delete_target(locked_bucket, key)
             try:
-                s3_client.delete_object(Bucket=bucket, Key=key)
+                s3_client.delete_object(Bucket=locked_bucket, Key=key)
             except Exception as exc:  # noqa: BLE001 - 削除失敗はPipeline停止
                 raise RetentionError(f"root ZIPのDELETEに失敗しました: {key} ({exc})") from exc
             deleted_keys.append(key)
@@ -497,6 +538,9 @@ def execute_root_distribution_zip_retention(
 
     return {
         "backup_generations": ROOT_ZIP_BACKUP_GENERATIONS,
+        "destination_bucket": locked_bucket,
+        "destination_base_prefix": EXPECTED_ROOT_ZIP_BASE_PREFIX,
+        "destination_locked": True,
         "keep_run_dates": plan["keep_run_dates"],
         "target_keys": plan["target_keys"],
         "keep_keys": plan["keep_keys"],
@@ -664,6 +708,7 @@ def parse_args() -> argparse.Namespace:
         help="Pipeline root（focused test用）",
     )
     parser.add_argument("--bucket", default=None, help="status用S3 bucket（既定は設定ファイル）")
+    parser.add_argument("--base-prefix", default=None, help="focused test用。productionではcanonical値以外を拒否")
     parser.add_argument("--status-prefix", default=None, help="status prefix（既定は設定ファイル）")
     parser.add_argument("--region", default=None, help="AWS region（既定は設定ファイル）")
     parser.add_argument(
@@ -684,7 +729,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         raise RetentionError(f"pipeline rootが存在しません: {root}")
 
     config = load_pipeline_s3_config()
-    base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
+    base_prefix = getattr(args, "base_prefix", None) or get_config_value(
+        config, "PIPELINE_S3_BASE_PREFIX"
+    )
     if args.bucket and args.status_prefix and args.region:
         bucket = args.bucket
         status_prefix = args.status_prefix
@@ -695,6 +742,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             f"{base_prefix}/{get_config_value(config, 'PIPELINE_STATUS_PREFIX')}"
         )
         region = args.region or get_config_value(config, "PIPELINE_AWS_REGION")
+
+    # root ZIPのS3参照より前に、config/env/CLIの値をcanonical値と完全一致検証する。
+    lock_root_distribution_route(bucket, base_prefix)
 
     logger.info(f"mode={'apply' if args.apply else 'dry-run'} / RUN_DATE={current_run_date}")
     logger.info(f"status正本: s3://{bucket}/{status_prefix}/ (region={region})")
