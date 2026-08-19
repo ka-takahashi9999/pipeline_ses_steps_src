@@ -7,8 +7,10 @@
 ③ relative_pathの重複0
 ④ unsafe path 0（absolute path / `..` / 空component）
 ⑤ manifestの各行が実ファイルとして存在し、sizeが一致する
-⑥ 明示除外（.gitkeep / *.bak_* / fetch_gmail_mail_master.jsonl / 80-7・80-8・80-9の01_result）が
-   manifestに入っていない
+⑥ 除外対象（.gitkeep / *.bak_* / error_*.log / nohup*.log / Success Cache /
+   80-7・80-75・80-8・80-9の01_result）が manifestに入っていない
+⑦ mail master（01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl）がCURRENT対象として
+   manifestに入っている（EC2成果物と同じrelative path）
 
 S3へのアクセスは行わない。
 """
@@ -29,9 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "00_tool"))
 from portal_s3_prepare import (  # noqa: E402
     EXCLUDE_BASENAMES,
     EXCLUDE_BASENAME_GLOBS,
+    EXCLUDE_LOG_BASENAME_GLOBS,
     EXCLUDE_RELATIVE_PATHS,
     SELF_STEP_DIRS,
 )
+
+MAIL_MASTER_RELATIVE_PATH = "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
 
 STEP_NAME = "80-8_portal_s3_prepare_confirm"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -103,6 +108,7 @@ def main() -> None:
             rel in EXCLUDE_RELATIVE_PATHS
             or basename in EXCLUDE_BASENAMES
             or any(fnmatch.fnmatch(basename, g) for g in EXCLUDE_BASENAME_GLOBS)
+            or any(fnmatch.fnmatch(basename, g) for g in EXCLUDE_LOG_BASENAME_GLOBS)
             or parts[0] in SELF_STEP_DIRS
         ):
             excluded_leaks.append(rel)
@@ -127,6 +133,13 @@ def main() -> None:
             errors.append(key)
         else:
             lines.append(f"[OK] {label} 0件")
+
+    # ⑦ mail masterがCURRENT対象として含まれていること
+    if MAIL_MASTER_RELATIVE_PATH in seen:
+        lines.append("[OK] mail masterがCURRENT対象に含まれている")
+    else:
+        lines.append(f"[NG] mail masterがmanifestに無い: {MAIL_MASTER_RELATIVE_PATH}")
+        errors.append("mail master")
 
     if sorted(seen) != [r.get("relative_path") for r in records]:
         lines.append("[NG] manifestがrelative_path辞書順ではない、または重複がある")

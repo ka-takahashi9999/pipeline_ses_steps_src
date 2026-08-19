@@ -19,6 +19,9 @@
 - verify は manifest を期待値とし、S3を全ページLISTして path集合とsizeを比較する。
   directory markerを含め、prefix自身を除く全objectをactual集合に含める。
 - missing / extra / size mismatch / LIST失敗 はすべて異常終了
+- summaryへ provenance（run_date / run_id / s3_destination / sync_status / verified /
+  expected・actual の count/bytes / missing / extra / size mismatch）を保持する。
+  この情報を 80-75（CURRENT -> bk1 rotation）の previous CURRENT 正常性guardが参照する。
 
 pipeline-logs / pipeline-status / 既存S3直下ZIP はPortal専用prefix外のため一切触らない。
 
@@ -29,6 +32,7 @@ usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +72,14 @@ EXPECTED_DESTINATION_URI = f"s3://{EXPECTED_BUCKET}/{EXPECTED_PORTAL_PREFIX}/"
 STAGE_DIR_PREFIX = ".portal_s3_stage_"
 
 SAMPLE_LIMIT = 3
+
+# ---- provenance（80-75 rotation guardが参照する） ----------------------------
+# managed runner（run_full_pipeline_managed.sh）が RUN_ID / RUN_DATE をexportする。
+# 取得できない場合は null にせず、既定値 + *_source="default" で「managed run由来ではない」
+# ことが分かる形で残す。80-75は *_source="env" のsummaryのみをbackup対象として扱う。
+UNKNOWN_PROVENANCE = "unknown"
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RUN_DATE_RE = re.compile(r"^\d{8}$")
 
 
 class SyncError(Exception):
@@ -112,6 +124,30 @@ def lock_destination(bucket: Any, base_prefix: Any, portal_prefix: Any) -> str:
             f"(actual={destination_uri!r} / expected={EXPECTED_DESTINATION_URI!r})"
         )
     return destination_uri
+
+
+def resolve_provenance(args: argparse.Namespace) -> Dict[str, str]:
+    """
+    run_date / run_id を解決する。
+    優先順位: CLI引数 -> 環境変数（managed runnerがexport） -> 既定値。
+    形式不正は黙って捨てず RUN_ID/RUN_DATE 不正としてFAILさせる。
+    """
+    provenance: Dict[str, str] = {}
+    for key, cli_value, env_name, pattern in (
+        ("run_date", getattr(args, "run_date", None), "RUN_DATE", RUN_DATE_RE),
+        ("run_id", getattr(args, "run_id", None), "RUN_ID", RUN_ID_RE),
+    ):
+        raw = cli_value or os.environ.get(env_name) or ""
+        raw = raw.strip()
+        if not raw:
+            provenance[key] = UNKNOWN_PROVENANCE
+            provenance[f"{key}_source"] = "default"
+            continue
+        if not pattern.match(raw):
+            raise SyncError(f"{env_name} の形式が不正です: {raw!r}")
+        provenance[key] = raw
+        provenance[f"{key}_source"] = "env"
+    return provenance
 
 
 def parse_wait_seconds(raw: Any) -> int:
@@ -440,6 +476,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-root", default=str(project_root), help="Pipeline root（focused test用）")
     parser.add_argument("--step-dir", default=str(STEP_DIR), help="出力先stepディレクトリ（focused test用）")
     parser.add_argument("--prepare-dir", default=None, help="80-8 stepディレクトリ（focused test用）")
+    parser.add_argument("--run-date", default=None, help="RUN_DATE（既定は環境変数RUN_DATE）")
+    parser.add_argument("--run-id", default=None, help="RUN_ID（既定は環境変数RUN_ID）")
     return parser.parse_args()
 
 
@@ -461,6 +499,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     # sync開始前に destination を完全固定する
     destination_uri = lock_destination(bucket, base_prefix, portal_prefix)
     wait_seconds = parse_wait_seconds(get_config_value(config, "PORTAL_S3_VERIFY_WAIT_SEC"))
+    provenance = resolve_provenance(args)
 
     expected = load_manifest(manifest_path)
     step_dirs = load_selected_step_dirs(prepare_summary_path)
@@ -468,11 +507,19 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     logger.info(f"同期先(lock済): {destination_uri} (region={region})")
     logger.info(f"expected files={len(expected)} / bytes={sum(expected.values())}")
     logger.info(f"PORTAL_S3_VERIFY_WAIT_SEC={wait_seconds}")
+    logger.info(
+        f"run_date={provenance['run_date']}({provenance['run_date_source']}) / "
+        f"run_id={provenance['run_id']}({provenance['run_id_source']})"
+    )
 
     summary: Dict[str, Any] = {
         "step": STEP_NAME,
         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "mode": "dry-run" if args.dry_run else "apply",
+        "run_date": provenance["run_date"],
+        "run_date_source": provenance["run_date_source"],
+        "run_id": provenance["run_id"],
+        "run_id_source": provenance["run_id_source"],
         "pipeline_root": str(root),
         "s3_destination": destination_uri,
         "s3_destination_locked": True,
@@ -527,6 +574,33 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     return summary
 
 
+def build_failed_summary(args: argparse.Namespace, error_message: str) -> Dict[str, Any]:
+    """
+    FAILED時のsummary。provenanceは可能な限り残す（形式不正で解決できない場合は既定値）。
+    sync_status=FAILED のsummaryは 80-75 rotation guardでbackup対象外として扱われる。
+    """
+    try:
+        provenance = resolve_provenance(args)
+    except SyncError:
+        provenance = {
+            "run_date": UNKNOWN_PROVENANCE,
+            "run_date_source": "default",
+            "run_id": UNKNOWN_PROVENANCE,
+            "run_id_source": "default",
+        }
+    return {
+        "step": STEP_NAME,
+        "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": "dry-run" if args.dry_run else "apply",
+        "run_date": provenance["run_date"],
+        "run_date_source": provenance["run_date_source"],
+        "run_id": provenance["run_id"],
+        "run_id_source": provenance["run_id_source"],
+        "sync_status": "FAILED",
+        "error_message": error_message,
+    }
+
+
 def main() -> int:
     logger = get_logger(STEP_NAME)
     args = parse_args()
@@ -540,23 +614,11 @@ def main() -> int:
         summary = run(args, logger)
     except SyncError as exc:
         logger.error(f"[NG] {exc}")
-        summary = {
-            "step": STEP_NAME,
-            "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mode": "dry-run" if args.dry_run else "apply",
-            "sync_status": "FAILED",
-            "error_message": str(exc),
-        }
+        summary = build_failed_summary(args, str(exc))
         exit_code = 1
     except Exception as exc:  # noqa: BLE001 - 想定外例外も握りつぶさずFAILさせる
         logger.error(f"[NG] 想定外エラー: {type(exc).__name__}: {exc}")
-        summary = {
-            "step": STEP_NAME,
-            "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mode": "dry-run" if args.dry_run else "apply",
-            "sync_status": "FAILED",
-            "error_message": f"{type(exc).__name__}: {exc}",
-        }
+        summary = build_failed_summary(args, f"{type(exc).__name__}: {exc}")
         exit_code = 1
 
     with open(summary_path, "w", encoding="utf-8") as f:

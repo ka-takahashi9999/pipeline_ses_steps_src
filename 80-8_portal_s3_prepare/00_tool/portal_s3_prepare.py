@@ -10,10 +10,16 @@ Portal向けS3同期の対象fileを確定し、manifestを作成する。
   （positive selection。XX-X_ 形式かつ 01_result を持つstepだけ）
 
 除外:
-  80-7 / 80-8 / 80-9 自身の 01_result
+  80-7 / 80-75 / 80-8 / 80-9 自身の 01_result
   */01_result/.gitkeep
   */01_result/*.bak_*
-  01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl （資格情報様文字列を含むため必須除外）
+  historical log（error_*.log / nohup*.log）
+    ※中央basename ruleで除外する。error JSONL（99_error_*.jsonl 等）は業務成果物のため除外しない
+  08-1 Success Cache（Portal成果物ではなくSTATEのため除外）
+
+含める（本方式で変更した点）:
+  01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl
+    → 通常の 01_result 成果物としてCURRENTへ載せる（RUN_DATE専用partitionは作らない）
 
 出力:
   01_result/portal_s3_manifest.jsonl        1行1file / relative_path辞書順
@@ -53,14 +59,25 @@ STEP_DIR_RE = re.compile(r"^\d{2}-\d+_[A-Za-z0-9][A-Za-z0-9._-]*$")
 # 自身の01_resultはPortal同期対象外
 SELF_STEP_DIRS: Tuple[str, ...] = (
     "80-7_manage_09_result_retention",
+    "80-75_portal_s3_backup_rotation",
     "80-8_portal_s3_prepare",
     "80-9_portal_s3_sync",
 )
 
 EXCLUDE_BASENAMES: Tuple[str, ...] = (".gitkeep",)
 EXCLUDE_BASENAME_GLOBS: Tuple[str, ...] = ("*.bak_*",)
+
+# historical log の中央basename rule。
+# `.log` 拡張子に限定するため、error JSONL（99_error_*.jsonl / *_error_*.jsonl 等）や
+# 「処理対象外」JSONLといった業務成果物は除外されない（"*error*" のような広い除外はしない）。
+EXCLUDE_LOG_BASENAME_GLOBS: Tuple[str, ...] = ("error_*.log", "nohup*.log")
+
+# STATE / Portal非対象の明示除外。
+# Success CacheはPortal成果物ではなく 06-80/07-1/08-1 のSTATEのため載せない
+# （Success Cache本体の動作・保存方式は変更しない）。
 EXCLUDE_RELATIVE_PATHS: Tuple[str, ...] = (
-    "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl",
+    "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+    "success_cache_requirement_skill_ai_matching.jsonl",
 )
 
 # 新たな秘密情報様ファイルを検出したら異常終了する（Portalへ流さない）
@@ -121,6 +138,9 @@ def is_excluded(relative_path: str, basename: str) -> str:
     for pattern in EXCLUDE_BASENAME_GLOBS:
         if fnmatch.fnmatch(basename, pattern):
             return "bak"
+    for pattern in EXCLUDE_LOG_BASENAME_GLOBS:
+        if fnmatch.fnmatch(basename, pattern):
+            return "historical_log"
     return ""
 
 
@@ -146,7 +166,12 @@ def check_secret_name(relative_path: str, basename: str) -> None:
 def collect_entries(root: Path, step_dirs: List[str], logger) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     entries: List[Dict[str, Any]] = []
     seen: Dict[str, str] = {}
-    excluded_counts: Dict[str, int] = {"gitkeep": 0, "bak": 0, "explicit_path": 0}
+    excluded_counts: Dict[str, int] = {
+        "gitkeep": 0,
+        "bak": 0,
+        "explicit_path": 0,
+        "historical_log": 0,
+    }
 
     for step in step_dirs:
         result_dir = root / step / RESULT_DIR_NAME
@@ -257,6 +282,8 @@ def run(args: argparse.Namespace, logger) -> Tuple[Dict[str, Any], List[Dict[str
         "total_bytes": total_bytes,
         "excluded_counts": excluded_counts,
         "excluded_relative_paths": list(EXCLUDE_RELATIVE_PATHS),
+        "excluded_basename_globs": list(EXCLUDE_BASENAME_GLOBS),
+        "excluded_log_basename_globs": list(EXCLUDE_LOG_BASENAME_GLOBS),
         "manifest_filename": MANIFEST_FILENAME,
     }
     return summary, entries

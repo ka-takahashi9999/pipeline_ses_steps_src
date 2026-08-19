@@ -44,7 +44,21 @@ class PrepareTestBase(unittest.TestCase):
 
     def _build_fixture(self):
         self._write("01-1_fetch_gmail/01_result/fetch_gmail.jsonl", "a")
-        self._write("01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl", "SECRET")
+        # mail masterはCURRENT対象（本方式で除外をやめた）
+        self._write("01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl", "master")
+        # historical log（中央basename ruleで除外）
+        self._write("01-1_fetch_gmail/01_result/error_20260428_093528.log", "log")
+        self._write("03-50_extract_project_required_skills/01_result/nohup_extract.log", "log")
+        self._write("03-50_extract_project_required_skills/01_result/nohup.log", "log")
+        self._write("03-50_extract_project_required_skills/01_result/skills.jsonl", "sk")
+        # error JSONL / 処理対象外JSONL は業務成果物のため除外しない
+        self._write("08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+                    "99_error_restore_requirement_skill_ai_matching.jsonl", "err")
+        self._write("08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+                    "merged_requirement_skill_ai_matching.jsonl", "mg")
+        # Success CacheはSTATEのため明示除外
+        self._write("08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+                    "success_cache_requirement_skill_ai_matching.jsonl", "cache")
         self._write("03-10_extract_project_location/01_result/loc.jsonl", "bb")
         self._write("06-80_duplicate_proposal_check/01_result/dup.jsonl", "ccc")
         self._write("06-80_duplicate_proposal_check/01_result/dup.jsonl.bak_20260424", "old")
@@ -53,6 +67,7 @@ class PrepareTestBase(unittest.TestCase):
         self._write("09-1_mail_display_format/01_result/mail_display_format_20260814/a.txt", "e")
         # 自身の01_result（同期対象外）
         self._write("80-7_manage_09_result_retention/01_result/summary.json", "{}")
+        self._write("80-75_portal_s3_backup_rotation/01_result/backup.json", "{}")
         self._write("80-8_portal_s3_prepare/01_result/portal_s3_manifest.jsonl", "{}")
         self._write("80-9_portal_s3_sync/01_result/sync.json", "{}")
         # step形式でないディレクトリ / 01_resultを持たないstep
@@ -94,9 +109,15 @@ class TestPositiveSelection(PrepareTestBase):
             paths,
             [
                 "01-1_fetch_gmail/01_result/fetch_gmail.jsonl",
+                "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl",
                 "03-10_extract_project_location/01_result/loc.jsonl",
+                "03-50_extract_project_required_skills/01_result/skills.jsonl",
                 "04-1_fetch_skillsheets_text/01_result/sheet.jsonl",
                 "06-80_duplicate_proposal_check/01_result/dup.jsonl",
+                "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+                "99_error_restore_requirement_skill_ai_matching.jsonl",
+                "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+                "merged_requirement_skill_ai_matching.jsonl",
                 "09-1_mail_display_format/01_result/mail_display_format_20260814/a.txt",
             ],
         )
@@ -112,9 +133,83 @@ class TestPositiveSelection(PrepareTestBase):
     def test_explicit_exclusions_are_not_in_manifest(self):
         self.assertEqual(self.run_main(), 0)
         paths = self.manifest_paths()
-        self.assertNotIn("01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl", paths)
         self.assertFalse([p for p in paths if p.endswith(".gitkeep")])
         self.assertFalse([p for p in paths if ".bak_" in p])
+
+    # ---- (24) mail master included -------------------------------------
+    def test_24_mail_master_is_included(self):
+        self.assertEqual(self.run_main(), 0)
+        self.assertIn(
+            "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl", self.manifest_paths()
+        )
+
+    # ---- (25) error_*.log excluded --------------------------------------
+    def test_25_error_log_is_excluded(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        self.assertNotIn("01-1_fetch_gmail/01_result/error_20260428_093528.log", paths)
+        self.assertFalse([p for p in paths if p.endswith(".log")])
+
+    # ---- (26) nohup*.log excluded ---------------------------------------
+    def test_26_nohup_log_is_excluded(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        for name in ("nohup_extract.log", "nohup.log"):
+            self.assertNotIn(
+                f"03-50_extract_project_required_skills/01_result/{name}", paths
+            )
+
+    # ---- (27) error JSONL remains included ------------------------------
+    def test_27_error_jsonl_remains_included(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        self.assertIn(
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "99_error_restore_requirement_skill_ai_matching.jsonl",
+            paths,
+        )
+        # "*error*" のような広い除外をしていないこと
+        self.assertTrue([p for p in paths if "error" in p])
+
+    # ---- (28) Success Cache excluded ------------------------------------
+    def test_28_success_cache_is_excluded(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        self.assertNotIn(
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "success_cache_requirement_skill_ai_matching.jsonl",
+            paths,
+        )
+        # 同一stepの他成果物は残ること
+        self.assertIn(
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "merged_requirement_skill_ai_matching.jsonl",
+            paths,
+        )
+
+    # ---- (29) *.bak_* remains excluded ----------------------------------
+    def test_29_bak_files_remain_excluded(self):
+        self.assertEqual(self.run_main(), 0)
+        self.assertNotIn(
+            "06-80_duplicate_proposal_check/01_result/dup.jsonl.bak_20260424",
+            self.manifest_paths(),
+        )
+
+    # ---- (30) mail master relative path preserved ------------------------
+    def test_30_mail_master_relative_path_is_ec2_mirror(self):
+        """RUN_DATE専用partitionを作らず、EC2成果物と同じrelative pathで載せる。"""
+        self.assertEqual(self.run_main(), 0)
+        records = read_jsonl_as_list(str(self.step_dir / "01_result" / target.MANIFEST_FILENAME))
+        record = [
+            r
+            for r in records
+            if r["relative_path"] == "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
+        ]
+        self.assertEqual(len(record), 1)
+        self.assertEqual(
+            record[0]["size"],
+            (self.root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl").stat().st_size,
+        )
 
     def test_self_steps_and_non_step_dirs_are_excluded(self):
         self.assertEqual(self.run_main(), 0)
@@ -137,6 +232,10 @@ class TestPositiveSelection(PrepareTestBase):
         self.assertEqual(summary["excluded_counts"]["gitkeep"], 1)
         self.assertEqual(summary["excluded_counts"]["bak"], 1)
         self.assertEqual(summary["excluded_counts"]["explicit_path"], 1)
+        self.assertEqual(summary["excluded_counts"]["historical_log"], 3)
+        self.assertEqual(
+            summary["excluded_log_basename_globs"], list(target.EXCLUDE_LOG_BASENAME_GLOBS)
+        )
         for name in target.SELF_STEP_DIRS:
             self.assertNotIn(name, summary["selected_step_dirs"])
 

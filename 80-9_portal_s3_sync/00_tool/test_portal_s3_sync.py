@@ -94,7 +94,7 @@ class SyncTestBase(unittest.TestCase):
         target.run_sync = self.original_run_sync
         target.build_s3_client = self.original_build
         for name in ("PORTAL_S3_VERIFY_WAIT_SEC", "PORTAL_S3_PREFIX", "PIPELINE_S3_BUCKET",
-                     "PIPELINE_S3_BASE_PREFIX"):
+                     "PIPELINE_S3_BASE_PREFIX", "RUN_ID", "RUN_DATE"):
             os.environ.pop(name, None)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -130,12 +130,14 @@ class SyncTestBase(unittest.TestCase):
         with open(result_dir / target.PREPARE_SUMMARY_FILENAME, "w", encoding="utf-8") as f:
             json.dump({"selected_step_dirs": self.step_dirs}, f)
 
-    def make_args(self, dry_run=False):
+    def make_args(self, dry_run=False, run_date=None, run_id=None):
         return argparse.Namespace(
             dry_run=dry_run,
             pipeline_root=str(self.root),
             step_dir=str(self.step_dir),
             prepare_dir=str(self.prepare_dir),
+            run_date=run_date,
+            run_id=run_id,
         )
 
     def stub_sync(self, fail=False, capture_tree=False):
@@ -469,6 +471,98 @@ class TestVerify(SyncTestBase):
         result = target.verify(self.expected, {}, self.logger)
         self.assertEqual(len(result["missing_samples"]), 3)
         self.assertFalse(result["verified"])
+
+
+# ---------------------------------------------------------------------------
+# (31)(32) provenance（80-75 rotation guardが参照する）
+# ---------------------------------------------------------------------------
+
+
+class TestProvenance(SyncTestBase):
+    PROVENANCE_KEYS = ("run_date", "run_date_source", "run_id", "run_id_source")
+
+    def test_31_provenance_fields_are_present_from_env(self):
+        os.environ["RUN_DATE"] = "20260818"
+        os.environ["RUN_ID"] = "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(self.make_args(), self.logger)
+        for key in self.PROVENANCE_KEYS:
+            self.assertIn(key, summary)
+        self.assertEqual(summary["run_date"], "20260818")
+        self.assertEqual(summary["run_date_source"], "env")
+        self.assertEqual(summary["run_id"], "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951")
+        self.assertEqual(summary["run_id_source"], "env")
+        # 80-75 guardが参照する既存フィールドも揃っていること
+        self.assertEqual(summary["s3_destination"], DESTINATION)
+        self.assertEqual(summary["sync_status"], "SUCCEEDED")
+        self.assertEqual(summary["mode"], "apply")
+        verify = summary["verify"]
+        for key in (
+            "verified",
+            "expected_file_count",
+            "actual_file_count",
+            "expected_total_bytes",
+            "actual_total_bytes",
+            "missing_count",
+            "extra_count",
+            "size_mismatch_count",
+        ):
+            self.assertIn(key, verify)
+
+    def test_31b_missing_env_uses_default_source(self):
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(self.make_args(), self.logger)
+        self.assertEqual(summary["run_date"], target.UNKNOWN_PROVENANCE)
+        self.assertEqual(summary["run_date_source"], "default")
+        self.assertEqual(summary["run_id"], target.UNKNOWN_PROVENANCE)
+        self.assertEqual(summary["run_id_source"], "default")
+
+    def test_31c_invalid_run_id_fails(self):
+        os.environ["RUN_ID"] = "bad id/with slash"
+        os.environ["RUN_DATE"] = "20260818"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        with self.assertRaises(target.SyncError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_31d_invalid_run_date_fails(self):
+        os.environ["RUN_DATE"] = "2026-08-18"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        with self.assertRaises(target.SyncError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_31e_failed_summary_keeps_provenance(self):
+        os.environ["RUN_DATE"] = "20260818"
+        os.environ["RUN_ID"] = "sfn-x"
+        summary = target.build_failed_summary(self.make_args(), "boom")
+        self.assertEqual(summary["sync_status"], "FAILED")
+        self.assertEqual(summary["run_date"], "20260818")
+        self.assertEqual(summary["run_id"], "sfn-x")
+
+    def test_32_existing_verify_behaviour_is_unchanged(self):
+        """provenance追加でverify判定・destination lockが変わっていないこと。"""
+        os.environ["RUN_DATE"] = "20260818"
+        os.environ["RUN_ID"] = "sfn-x"
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        summary = target.run(self.make_args(), self.logger)
+        self.assertTrue(summary["verify"]["verified"])
+        self.assertEqual(summary["verify"]["missing_count"], 0)
+        self.assertEqual(summary["verify"]["extra_count"], 0)
+        self.assertEqual(summary["verify"]["size_mismatch_count"], 0)
+        self.assertTrue(summary["s3_destination_locked"])
+        self.assertEqual(
+            summary["sync_method"], "staging tree + aws s3 sync --delete (no CLI filters)"
+        )
+        # extraがあればprovenanceがあってもFAILすること
+        self.stub_s3({**self.expected, "extra.jsonl": 1})
+        with self.assertRaises(target.SyncError):
+            target.run(self.make_args(), self.logger)
 
 
 # ---------------------------------------------------------------------------

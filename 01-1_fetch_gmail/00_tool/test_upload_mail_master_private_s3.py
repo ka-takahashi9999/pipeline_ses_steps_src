@@ -68,14 +68,17 @@ EXPECTED_URI = "s3://technoverse/" + EXPECTED_KEY
 # 下記digestは baseline commit dc9ea70（本対応の直前commit）のfile内容。
 # 「今回変更しない」と宣言した領域が実際に変わっていないことを検知するための固定値であり、
 # 意図的に変更する場合のみ、変更理由と影響範囲を明示したうえで更新する。
+#
+# 【変更理由】CURRENT + bk1 方式への移行に伴い、80-8 / 80-9 は意図的に変更した。
+#   80-8: mail masterをCURRENT対象へ変更 / historical log・Success Cacheを除外
+#   80-9: summaryへ provenance（run_date / run_id）を追加
+# そのため両fileはbaseline固定digestの対象から外す。
+# 【影響範囲】private mail master uploader本体（upload_mail_master_private_s3.py）と
+#   01-1 fetch_gmail.py は未変更のため、引き続き固定digestで凍結する。
 BASELINE_COMMIT = "dc9ea70"
 FROZEN_SHA256 = {
     "01-1_fetch_gmail/00_tool/fetch_gmail.py":
         "f4cf9a6e632abbd81807a37d3678fc1d18e09d6e7a0937666b9b3d26360bd44d",
-    "80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py":
-        "db45a0eb8893328b7572c47f39a09f91acad0dcb8001f02702b96113eceb7e74",
-    "80-9_portal_s3_sync/00_tool/portal_s3_sync.py":
-        "2cf99ed1118fc356c4f14086256da68f3952a350923430a72bb322c232519361",
 }
 # 01-1の起動行はGmail取得ロジックの入口。意図しない変更を検知するため固定する。
 FETCH_GMAIL_RUN_STEP_LINE = (
@@ -808,9 +811,35 @@ class TestRegression(unittest.TestCase):
                 mismatches.append(relative)
         self.assertEqual(mismatches, [], msg="固定digestがbaselineと不一致: {0}".format(mismatches))
 
-    def test_80_8_still_excludes_mail_master(self):
-        text = PREPARE_PY.read_text(encoding="utf-8")
-        self.assertIn('"01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"', text)
+    def test_80_8_now_includes_mail_master(self):
+        """
+        CURRENT + bk1 方式では mail master を通常の 01_result 成果物としてCURRENTへ載せる。
+        private uploader は cutover まで併存させるため、本testでは 80-8 側の除外解除のみ確認する。
+        """
+        sys.path.insert(0, str(PREPARE_PY.parent))
+        try:
+            prepare = load_module("portal_s3_prepare", PREPARE_PY)
+        finally:
+            sys.path.pop(0)
+        self.assertNotIn(
+            "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl",
+            prepare.EXCLUDE_RELATIVE_PATHS,
+        )
+        # Success Cache は STATE のため除外されたままであること
+        self.assertIn(
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "success_cache_requirement_skill_ai_matching.jsonl",
+            prepare.EXCLUDE_RELATIVE_PATHS,
+        )
+
+    def test_private_uploader_is_still_operational_until_cutover(self):
+        """cutover前は private uploader を production から外さない。"""
+        self.assertIn(
+            "01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py",
+            RUNNER.read_text(encoding="utf-8"),
+        )
+        self.assertTrue((STEP_DIR / "00_tool" / "upload_mail_master_private_s3.py").is_file())
+        self.assertTrue((STEP_DIR / "02_confirm" / "confirm_mail_master_private_s3.py").is_file())
 
     def test_80_9_destination_is_portal_only(self):
         text = SYNC_PY.read_text(encoding="utf-8")
