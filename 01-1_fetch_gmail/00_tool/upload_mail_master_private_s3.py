@@ -6,17 +6,24 @@
 01-1_fetch_gmail が生成した重要成果物 fetch_gmail_mail_master.jsonl を、
 Portalとは分離した private prefix へ 1 object だけ保存する。
 
-  ローカル : 01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl
+  ローカル : 01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl（唯一のsource）
   S3      : s3://technoverse/pipeline_ses_steps/private/mail_master/<RUN_DATE>/fetch_gmail_mail_master.jsonl
 
 方式:
 - 01-1本体（fetch_gmail.py）には手を入れず、01-1成功後に本utilityを呼ぶ責務分離とする。
+- source固定: upload元は本ファイル位置から導出する `_STEP_DIR`（= 01-1_fetch_gmail）配下の
+  01_result/fetch_gmail_mail_master.jsonl のみ。CLIからsource pathを差し替える引数は持たない。
+  path文字列一致に加え realpath一致・symlink不可・階層構造（step名 / 01_result / ファイル名）
+  も検証するため、symlinkで正規pathに見せる経路も拒否する。
 - destination安全ロック: bucket / base prefix / private prefix / mail master prefix /
   RUN_DATE / 最終key / 完全URI を期待値と完全一致比較し、1つでも異なれば upload開始前にFAILする
-  （startswith判定はしない）。設定値・環境変数の書き換えで Portal prefix・上位prefix・
-  別bucketへ向けることはできない。
-- upload前に local file を検査する（expected path完全一致 / regular file / symlink不可 /
-  size>0 / JSONL record>0）。record走査は1パスのみ（341MB級を何度も全scanしない）。
+  （startswith判定はしない）。
+- 最終ロック: subprocess実行の直前に、run_upload() が呼び出し元の値を信用せず
+  正本設定(pipeline_s3_config.env) と RUN_DATE から expected URI / expected source を
+  **独立して再構築** し、argv と完全一致比較してから実行する。
+  低レベル関数へ任意のdestinationを渡してもproduction applyでは危険な宛先へuploadできない。
+- upload前に local file を検査する（regular file / symlink不可 / size>0 / JSONL record>0）。
+  record走査は1パスのみ（341MB級を何度も全scanしない）。
 - AWS CLI は argv配列で subprocess 実行する（eval / bash -c / sh -c は使わない）。
   `aws s3 cp` で1 objectのみ。sync / --delete / --recursive / wildcard は使わない。
 - upload後は head-object で ContentLength == local bytes を確認する。
@@ -45,6 +52,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# production source の唯一の起点。CLIからは差し替えられない。
 _STEP_DIR = Path(__file__).resolve().parents[1]
 _PROJECT_ROOT = _STEP_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -57,6 +65,7 @@ from common.pipeline_s3_env import get_config_value, load_pipeline_s3_config  # 
 
 STEP_NAME = "01-1_fetch_gmail_private_s3_upload"
 
+PRODUCTION_STEP_DIR_NAME = "01-1_fetch_gmail"
 RESULT_DIR_NAME = "01_result"
 MAIL_MASTER_FILENAME = "fetch_gmail_mail_master.jsonl"
 SUMMARY_FILENAME = "mail_master_private_s3_summary.json"
@@ -95,6 +104,109 @@ SAMPLE_LIMIT = 3
 
 class UploadError(Exception):
     """S3へuploadせず / verify不成立で異常終了すべき状態。"""
+
+
+# ---------------------------------------------------------------------------
+# source安全ロック（production sourceを1ファイルに固定する）
+# ---------------------------------------------------------------------------
+
+
+def canonical_source_path() -> Path:
+    """upload対象として唯一許可するlocal path（`_STEP_DIR` から導出）。"""
+    return Path(_STEP_DIR) / RESULT_DIR_NAME / MAIL_MASTER_FILENAME
+
+
+def assert_canonical_source_path(path: Any) -> Path:
+    """
+    与えられたpathがproduction sourceそのものであることを確認する。
+    文字列一致 / 階層構造 / realpath一致 / symlink不可 をすべて満たさなければFAILさせる。
+    """
+    expected = canonical_source_path()
+    if not isinstance(path, (str, Path)):
+        raise UploadError("source pathが不正です: {0!r}".format(path))
+    text = str(path)
+    if not text.strip():
+        raise UploadError("source pathが空です")
+    if text != str(expected):
+        raise UploadError(
+            "source安全ロック違反: production source以外は指定できません "
+            "(actual={0!r} / expected={1!r})".format(text, str(expected))
+        )
+    if ".." in Path(text).parts:
+        raise UploadError("source安全ロック違反: pathに `..` が含まれています: {0}".format(text))
+    if expected.name != MAIL_MASTER_FILENAME:
+        raise UploadError("source安全ロック違反: ファイル名が不正です: {0}".format(expected.name))
+    if expected.parent.name != RESULT_DIR_NAME:
+        raise UploadError("source安全ロック違反: 出力ディレクトリが不正です: {0}".format(expected.parent))
+    if expected.parent.parent.name != PRODUCTION_STEP_DIR_NAME:
+        raise UploadError(
+            "source安全ロック違反: stepディレクトリが不正です: {0}".format(expected.parent.parent)
+        )
+    # symlinkで正規pathに見せる経路を拒否する（親ディレクトリのsymlinkも含む）
+    if os.path.realpath(text) != text:
+        raise UploadError("source安全ロック違反: symlink経由のpathです: {0}".format(text))
+    return expected
+
+
+def validate_local_file(path: Any) -> Dict[str, int]:
+    """
+    upload対象localファイルを検査する。
+    production source一致 / symlink不可 / regular file / size>0 を満たさなければFAILさせる。
+    戻り値: {"size": bytes, "mtime_ns": int}
+    """
+    source = assert_canonical_source_path(path)
+
+    if source.parent.is_symlink():
+        raise UploadError("01_resultがsymlinkです: {0}".format(source.parent))
+    if source.is_symlink():
+        raise UploadError("mail masterがsymlinkです: {0}".format(source))
+    if not source.exists():
+        raise UploadError("mail masterが存在しません: {0}".format(source))
+    if not source.is_file():
+        raise UploadError("mail masterがregular fileではありません: {0}".format(source))
+
+    stat_result = source.stat()
+    if stat_result.st_size <= 0:
+        raise UploadError("mail masterのsizeが0です: {0}".format(source))
+    return {"size": stat_result.st_size, "mtime_ns": stat_result.st_mtime_ns}
+
+
+def scan_mail_master(path: Path) -> Dict[str, int]:
+    """
+    mail masterを1パスだけ走査し、record数とmessage_id空件数を数える。
+    JSONLパース不能行は common.json_utils.read_jsonl が例外を送出するため握りつぶさない。
+    """
+    record_count = 0
+    empty_message_id_count = 0
+    try:
+        for record in read_jsonl(str(path)):
+            record_count += 1
+            if not str(record.get("message_id", "")).strip():
+                empty_message_id_count += 1
+    except UploadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - パース不能を黙って捨てない
+        raise UploadError("mail masterの走査に失敗しました: {0}: {1}".format(type(exc).__name__, exc)) from exc
+
+    if record_count <= 0:
+        raise UploadError("mail masterのrecordが0件です: {0}".format(path))
+    if empty_message_id_count > 0:
+        raise UploadError(
+            "message_idが空のrecordが {0} 件あります: {1}".format(empty_message_id_count, path)
+        )
+    return {"record_count": record_count, "empty_message_id_count": empty_message_id_count}
+
+
+def recheck_unchanged(path: Path, before: Dict[str, int]) -> None:
+    """走査・upload中にlocalファイルが差し替わっていないことを確認する。"""
+    if Path(path).is_symlink() or not Path(path).is_file():
+        raise UploadError("mail masterが処理中に変化しました: {0}".format(path))
+    stat_result = Path(path).stat()
+    if stat_result.st_size != before["size"] or stat_result.st_mtime_ns != before["mtime_ns"]:
+        raise UploadError(
+            "mail masterが処理中に変化しました: {0} "
+            "(size {1} -> {2})".format(path, before["size"], stat_result.st_size)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -202,85 +314,31 @@ def build_destination_uri(bucket: str, key: str, run_date: str) -> str:
     return destination_uri
 
 
-# ---------------------------------------------------------------------------
-# local file検査
-# ---------------------------------------------------------------------------
-
-
-def expected_mail_master_path(step_dir: Path) -> Path:
-    """01-1が出力する唯一のmail master pathを返す。"""
-    return Path(step_dir) / RESULT_DIR_NAME / MAIL_MASTER_FILENAME
-
-
-def validate_local_file(path: Path, expected_path: Path) -> Dict[str, int]:
+def rebuild_expected_destination(run_date: Any) -> Dict[str, str]:
     """
-    upload対象localファイルを検査する。
-    expected pathと完全一致 / symlink不可 / regular file / size>0 を満たさなければFAILさせる。
-    戻り値: {"size": bytes, "mtime_ns": int}
+    正本設定 (pipeline_s3_config.env) と RUN_DATE から、期待destinationを独立して再構築する。
+    呼び出し元から渡された bucket / prefix / URI は一切信用しない。
+    戻り値: {"bucket", "key", "uri", "region", "run_date"}
     """
-    if str(path) != str(expected_path):
-        raise UploadError(
-            "upload対象がexpected local pathと一致しません "
-            "(actual={0!r} / expected={1!r})".format(str(path), str(expected_path))
-        )
-    text = str(path)
-    if not text.strip():
-        raise UploadError("upload対象pathが空です")
-    if ".." in Path(text).parts:
-        raise UploadError("upload対象pathに `..` が含まれています: {0}".format(text))
+    validated_run_date = validate_run_date(run_date)
 
-    result_dir = Path(path).parent
-    if result_dir.is_symlink():
-        raise UploadError("01_resultがsymlinkです: {0}".format(result_dir))
-    if Path(path).is_symlink():
-        raise UploadError("mail masterがsymlinkです: {0}".format(path))
-    if not Path(path).exists():
-        raise UploadError("mail masterが存在しません: {0}".format(path))
-    if not Path(path).is_file():
-        raise UploadError("mail masterがregular fileではありません: {0}".format(path))
+    config = load_pipeline_s3_config()
+    bucket = get_config_value(config, "PIPELINE_S3_BUCKET")
+    base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
+    private_prefix = get_config_value(config, "PIPELINE_PRIVATE_PREFIX")
+    mail_master_prefix = get_config_value(config, "MAIL_MASTER_S3_PREFIX")
+    region = get_config_value(config, "PIPELINE_AWS_REGION")
 
-    stat_result = Path(path).stat()
-    if stat_result.st_size <= 0:
-        raise UploadError("mail masterのsizeが0です: {0}".format(path))
-    return {"size": stat_result.st_size, "mtime_ns": stat_result.st_mtime_ns}
-
-
-def scan_mail_master(path: Path) -> Dict[str, int]:
-    """
-    mail masterを1パスだけ走査し、record数とmessage_id空件数を数える。
-    JSONLパース不能行は common.json_utils.read_jsonl が例外を送出するため握りつぶさない。
-    """
-    record_count = 0
-    empty_message_id_count = 0
-    try:
-        for record in read_jsonl(str(path)):
-            record_count += 1
-            if not str(record.get("message_id", "")).strip():
-                empty_message_id_count += 1
-    except UploadError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - パース不能を黙って捨てない
-        raise UploadError("mail masterの走査に失敗しました: {0}: {1}".format(type(exc).__name__, exc)) from exc
-
-    if record_count <= 0:
-        raise UploadError("mail masterのrecordが0件です: {0}".format(path))
-    if empty_message_id_count > 0:
-        raise UploadError(
-            "message_idが空のrecordが {0} 件あります: {1}".format(empty_message_id_count, path)
-        )
-    return {"record_count": record_count, "empty_message_id_count": empty_message_id_count}
-
-
-def recheck_unchanged(path: Path, before: Dict[str, int]) -> None:
-    """走査・upload中にlocalファイルが差し替わっていないことを確認する。"""
-    if Path(path).is_symlink() or not Path(path).is_file():
-        raise UploadError("mail masterが処理中に変化しました: {0}".format(path))
-    stat_result = Path(path).stat()
-    if stat_result.st_size != before["size"] or stat_result.st_mtime_ns != before["mtime_ns"]:
-        raise UploadError(
-            "mail masterが処理中に変化しました: {0} "
-            "(size {1} -> {2})".format(path, before["size"], stat_result.st_size)
-        )
+    lock_destination(bucket, base_prefix, private_prefix, mail_master_prefix)
+    key = build_object_key(mail_master_prefix, validated_run_date)
+    uri = build_destination_uri(bucket, key, validated_run_date)
+    return {
+        "bucket": bucket,
+        "key": key,
+        "uri": uri,
+        "region": region,
+        "run_date": validated_run_date,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +355,7 @@ def build_metadata_value(run_date: str, run_id: str, record_count: int) -> str:
 
 
 def build_cp_argv(
-    local_path: Path,
+    source_path: Path,
     destination_uri: str,
     region: str,
     dry_run: bool,
@@ -308,7 +366,7 @@ def build_cp_argv(
         AWS_BIN,
         "s3",
         "cp",
-        str(local_path),
+        str(source_path),
         destination_uri,
         "--only-show-errors",
         "--region",
@@ -318,18 +376,28 @@ def build_cp_argv(
     ]
     if dry_run:
         argv.append("--dryrun")
-    assert_safe_argv(argv, local_path, destination_uri)
     return argv
 
 
-def assert_safe_argv(argv: List[str], local_path: Path, destination_uri: str) -> None:
-    """recursive / sync / delete / wildcard が混入していないことを実行直前に確認する。"""
+def assert_safe_argv(argv: List[str], expected_source: str, expected_uri: str) -> None:
+    """
+    argvが「正規sourceを期待URIへ cp する1 object操作」だけであることを確認する。
+    expected_source / expected_uri は呼び出し元の値ではなく、再構築済みの期待値を渡すこと。
+    """
+    if not isinstance(argv, list) or len(argv) < 5:
+        raise UploadError("argvが不正です: {0!r}".format(argv))
     if argv[:3] != [AWS_BIN, "s3", "cp"]:
         raise UploadError("aws s3 cp 以外のcommandは実行しません: {0!r}".format(argv[:3]))
-    if argv[3] != str(local_path):
-        raise UploadError("upload元が期待値と一致しません: {0!r}".format(argv[3]))
-    if argv[4] != destination_uri:
-        raise UploadError("destination安全ロック違反: {0!r}".format(argv[4]))
+    if argv[3] != expected_source:
+        raise UploadError(
+            "source安全ロック違反: upload元が期待値と一致しません "
+            "(actual={0!r} / expected={1!r})".format(argv[3], expected_source)
+        )
+    if argv[4] != expected_uri:
+        raise UploadError(
+            "destination安全ロック違反: upload先が期待値と一致しません "
+            "(actual={0!r} / expected={1!r})".format(argv[4], expected_uri)
+        )
     for token in argv[5:]:
         if token in FORBIDDEN_ARGV_TOKENS:
             raise UploadError("禁止オプションが含まれています: {0!r}".format(token))
@@ -338,9 +406,19 @@ def assert_safe_argv(argv: List[str], local_path: Path, destination_uri: str) ->
             raise UploadError("wildcardを含む引数は使用できません: {0!r}".format(token))
 
 
-def run_upload(argv: List[str], logger) -> None:
-    """aws s3 cp を argv配列で実行する（shell未使用）。非0終了は握りつぶさない。"""
-    logger.info("aws s3 cp 実行: dest={0}".format(argv[4]))
+def run_upload(argv: List[str], run_date: Any, logger) -> Dict[str, str]:
+    """
+    aws s3 cp を argv配列で実行する（shell未使用）。
+
+    subprocess直前の最終ロックとして、呼び出し元の値を信用せず
+    正規source path と 正本設定+RUN_DATE から再構築したexpected URI を独立に求め、
+    argv と完全一致しなければ実行しない。非0終了は握りつぶさない。
+    """
+    expected_source = str(assert_canonical_source_path(canonical_source_path()))
+    expected = rebuild_expected_destination(run_date)
+    assert_safe_argv(argv, expected_source, expected["uri"])
+
+    logger.info("aws s3 cp 実行: dest={0}".format(expected["uri"]))
     completed = subprocess.run(  # noqa: S603 - argv配列固定・shell未使用
         argv,
         stdout=subprocess.PIPE,
@@ -355,6 +433,7 @@ def run_upload(argv: List[str], logger) -> None:
     if completed.returncode != 0:
         raise UploadError("aws s3 cp が失敗しました (exit={0})".format(completed.returncode))
     logger.ok("aws s3 cp 成功")
+    return expected
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +487,10 @@ def verify_uploaded_object(
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """
+    production CLI。source pathを可変にする引数は意図的に持たない
+    （upload元は常に `_STEP_DIR`/01_result/fetch_gmail_mail_master.jsonl）。
+    """
     parser = argparse.ArgumentParser(description="01-1 mail masterのprivate S3保存")
     parser.add_argument("--run-date", default=os.environ.get("RUN_DATE", ""), help="RUN_DATE (YYYYMMDD)")
     parser.add_argument("--run-id", default=os.environ.get("RUN_ID", ""), help="RUN_ID（任意）")
@@ -416,7 +499,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="aws s3 cp --dryrun で実行し、S3を変更せず verify もしない",
     )
-    parser.add_argument("--step-dir", default=str(_STEP_DIR), help="01-1 stepディレクトリ（focused test用）")
     return parser.parse_args(argv)
 
 
@@ -424,25 +506,20 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     run_date = validate_run_date(args.run_date)
     run_id, run_id_source = validate_run_id(args.run_id)
 
-    config = load_pipeline_s3_config()
-    bucket = get_config_value(config, "PIPELINE_S3_BUCKET")
-    base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
-    private_prefix = get_config_value(config, "PIPELINE_PRIVATE_PREFIX")
-    mail_master_prefix = get_config_value(config, "MAIL_MASTER_S3_PREFIX")
-    region = get_config_value(config, "PIPELINE_AWS_REGION")
+    # destinationは正本設定から構築する（この後 subprocess直前に再構築して再確認する）
+    destination = rebuild_expected_destination(run_date)
+    bucket = destination["bucket"]
+    key = destination["key"]
+    destination_uri = destination["uri"]
+    region = destination["region"]
 
-    # upload開始前に destination を完全固定する
-    lock_destination(bucket, base_prefix, private_prefix, mail_master_prefix)
-    key = build_object_key(mail_master_prefix, run_date)
-    destination_uri = build_destination_uri(bucket, key, run_date)
-
-    step_dir = Path(args.step_dir)
-    local_path = expected_mail_master_path(step_dir)
-    stat_before = validate_local_file(local_path, expected_mail_master_path(step_dir))
+    local_path = canonical_source_path()
+    stat_before = validate_local_file(local_path)
     scan = scan_mail_master(local_path)
     recheck_unchanged(local_path, stat_before)
 
     logger.info("private S3 upload開始 (RUN_DATE={0} / run_id={1})".format(run_date, run_id))
+    logger.info("source(lock済): {0}".format(local_path))
     logger.info("保存先(lock済): {0} (region={1})".format(destination_uri, region))
     logger.info(
         "local: bytes={0} / records={1}".format(stat_before["size"], scan["record_count"])
@@ -464,6 +541,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "s3_key": key,
         "s3_uri": destination_uri,
         "s3_destination_locked": True,
+        "source_locked": True,
         "upload_method": "aws s3 cp (single object / no sync / no --delete / no recursive)",
         "s3_bytes": 0,
         "verified": False,
@@ -471,7 +549,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 
     metadata_value = build_metadata_value(run_date, run_id, scan["record_count"])
     argv = build_cp_argv(local_path, destination_uri, region, args.dry_run, metadata_value)
-    run_upload(argv, logger)
+    run_upload(argv, run_date, logger)
 
     if args.dry_run:
         logger.warn("dry-runのため verify は実施しません（S3未変更）")
@@ -492,7 +570,7 @@ def main() -> int:
     logger = get_logger(STEP_NAME)
     args = parse_args()
     started = time.time()
-    dirs = ensure_result_dirs(args.step_dir)
+    dirs = ensure_result_dirs(str(_STEP_DIR))
     summary_path = dirs["result"] / SUMMARY_FILENAME
 
     summary: Dict[str, Any]
