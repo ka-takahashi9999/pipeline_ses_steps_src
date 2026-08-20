@@ -1,0 +1,176 @@
+"""09-5 pair queue分類のfocused test。"""
+
+import copy
+import sys
+import unittest
+from pathlib import Path
+
+TOOL_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(TOOL_DIR))
+
+from classify_sales_candidate_queues import classify_candidate_pairs
+
+
+def candidate(project_id="project-1", resource_id="resource-1"):
+    return {
+        "project_message_id": project_id,
+        "resource_message_id": resource_id,
+        "pair_file_name": f"{project_id}_{resource_id}.json",
+        "score_band": "high",
+    }
+
+
+def recheck(
+    project_id="project-1",
+    resource_id="resource-1",
+    status="required_skill_confirmed",
+    confidence="confirmed",
+    category_match="match",
+):
+    confirmed = 1 if confidence == "confirmed" else 0
+    human_review = 1 if confidence == "human_review" else 0
+    not_confirmed = 1 if confidence == "not_confirmed" else 0
+    return {
+        "project_info": {"message_id": project_id},
+        "resource_info": {"message_id": resource_id},
+        "recheck_info": {
+            "recheck_status": status,
+            "required_skill_count": 1,
+            "confirmed_count": confirmed,
+            "human_review_count": human_review,
+            "not_confirmed_count": not_confirmed,
+        },
+        "required_skill_checks": [
+            {
+                "skill": "JavaまたはKotlin",
+                "confidence": confidence,
+                "reason": "fixture",
+                "evidence": "Java",
+            }
+        ],
+        "category_match": category_match,
+        "category_note": "fixture",
+    }
+
+
+def draft(direction, needs_review=False, notes=None, project_id="project-1", resource_id="resource-1"):
+    return {
+        "project_message_id": project_id,
+        "resource_message_id": resource_id,
+        "pair_file_name": f"{project_id}_{resource_id}.json",
+        "draft_direction": direction,
+        "mail_mode": direction,
+        "reply_subject": "subject",
+        "draft_mail_text": "draft",
+        "refined_mail_text": "refined",
+        "to_recipients": ["sales@example.com"],
+        "preview_file_path": f"preview/{direction}.txt",
+        "note_file_path": f"preview/note/{direction}.txt",
+        "needs_human_review": needs_review,
+        "review_notes": list(notes or []),
+    }
+
+
+def both_drafts():
+    return [draft("reply_to_project"), draft("reply_to_resource")]
+
+
+class SalesCandidateQueueClassifierTest(unittest.TestCase):
+    def classify(self, candidates=None, drafts=None, rechecks=None, errors=None):
+        return classify_candidate_pairs(
+            candidates or [candidate()],
+            drafts if drafts is not None else both_drafts(),
+            rechecks or [recheck()],
+            errors or [],
+        )
+
+    def test_matching_strict_and_both_sales_ready_is_proposal_ready(self):
+        proposal, human = self.classify()
+        self.assertEqual(1, len(proposal))
+        self.assertEqual([], human)
+        self.assertTrue(proposal[0]["matching_strict"])
+        self.assertTrue(proposal[0]["sales_ready"])
+
+    def test_category_unclear_is_human_review(self):
+        proposal, human = self.classify(rechecks=[recheck(category_match="unclear")])
+        self.assertEqual([], proposal)
+        self.assertIn("category_unclear", human[0]["review_reasons"])
+
+    def test_08_5_human_review_is_human_review(self):
+        proposal, human = self.classify(
+            rechecks=[recheck(status="required_skill_human_review", confidence="human_review")]
+        )
+        self.assertEqual([], proposal)
+        self.assertIn("required_skill_review_required", human[0]["review_reasons"])
+
+    def test_08_5_error_is_human_review(self):
+        proposal, human = self.classify(errors=[recheck()])
+        self.assertEqual([], proposal)
+        self.assertTrue(human[0]["has_08_5_error"])
+        self.assertIn("08_5_error", human[0]["review_reasons"])
+
+    def test_one_direction_review_required_is_pair_human_review(self):
+        drafts = [draft("reply_to_project", True, ["返信先を確認"]), draft("reply_to_resource")]
+        proposal, human = self.classify(drafts=drafts)
+        self.assertEqual([], proposal)
+        self.assertIn("sales_review_required", human[0]["review_reasons"])
+
+    def test_both_directions_without_review_are_proposal_ready(self):
+        proposal, human = self.classify(drafts=both_drafts())
+        self.assertEqual(1, len(proposal))
+        self.assertEqual(0, len(human))
+
+    def test_missing_one_direction_is_human_review(self):
+        proposal, human = self.classify(drafts=[draft("reply_to_project")])
+        self.assertEqual([], proposal)
+        self.assertIn("draft_missing", human[0]["review_reasons"])
+
+    def test_partition_has_no_duplicate_and_union_is_complete(self):
+        candidates = [candidate("p-1", "r-1"), candidate("p-2", "r-2")]
+        rechecks = [recheck("p-1", "r-1"), recheck("p-2", "r-2", category_match="unclear")]
+        drafts = [
+            draft("reply_to_project", project_id="p-1", resource_id="r-1"),
+            draft("reply_to_resource", project_id="p-1", resource_id="r-1"),
+            draft("reply_to_project", project_id="p-2", resource_id="r-2"),
+            draft("reply_to_resource", project_id="p-2", resource_id="r-2"),
+        ]
+        proposal, human = self.classify(candidates, drafts, rechecks)
+        proposal_keys = {(row["project_message_id"], row["resource_message_id"]) for row in proposal}
+        human_keys = {(row["project_message_id"], row["resource_message_id"]) for row in human}
+        self.assertEqual(2, len(proposal_keys | human_keys))
+        self.assertFalse(proposal_keys & human_keys)
+        self.assertEqual(len(proposal), len(proposal_keys))
+        self.assertEqual(len(human), len(human_keys))
+
+    def test_not_confirmed_is_not_resurrected_as_human_review(self):
+        with self.assertRaisesRegex(ValueError, "not_confirmed"):
+            self.classify(
+                rechecks=[
+                    recheck(
+                        status="required_skill_not_confirmed",
+                        confidence="not_confirmed",
+                    )
+                ]
+            )
+
+    def test_category_mismatch_never_becomes_proposal_ready(self):
+        proposal, human = self.classify(rechecks=[recheck(category_match="mismatch")])
+        self.assertEqual([], proposal)
+        self.assertIn("category_mismatch", human[0]["review_reasons"])
+
+    def test_empty_draft_body_is_human_review(self):
+        drafts = both_drafts()
+        drafts[1]["refined_mail_text"] = ""
+        proposal, human = self.classify(drafts=drafts)
+        self.assertEqual([], proposal)
+        self.assertIn("draft_missing", human[0]["review_reasons"])
+
+    def test_canonical_draft_records_are_not_modified(self):
+        drafts = both_drafts()
+        before = copy.deepcopy(drafts)
+        self.classify(drafts=drafts)
+        self.assertEqual(before, drafts)
+
+
+if __name__ == "__main__":
+    unittest.main()

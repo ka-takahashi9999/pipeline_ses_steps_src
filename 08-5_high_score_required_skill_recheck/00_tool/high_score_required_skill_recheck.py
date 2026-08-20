@@ -392,8 +392,8 @@ def _first_or_atom(value: str) -> str:
 def _extract_explicit_or_options(skill: str) -> List[str]:
     """required skill自身に明示されたOR選択肢だけを返す。
 
-    slash単独はORとみなさない。「等/など」は、複数項目が読点で列挙された
-    例示構文に限って候補化する。
+    slash単独および「等/など」の例示はoverride対象外とし、
+    simple explicit ORだけを候補化する。
     """
     normalized = _normalize_or_text(skill)
     options: List[str] = []
