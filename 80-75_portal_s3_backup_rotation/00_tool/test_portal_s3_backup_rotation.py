@@ -21,6 +21,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1128,22 +1129,114 @@ class TestLimitedRecovery(RotationTestBase):
 
 
 class TestTailRecoveryRunnerContract(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_path = Path(self.temp_dir.name)
+        self.runner = project_root / "00_pipeline" / "00_tool" / "run_tail_recovery.sh"
+        self.call_log = self.temp_path / "calls.log"
+        self.call_count = self.temp_path / "call_count"
+        fake_python = self.temp_path / "python3"
+        fake_python.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+count=0
+if [[ -f "$CALL_COUNT_FILE" ]]; then
+  read -r count < "$CALL_COUNT_FILE"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$CALL_COUNT_FILE"
+printf '%s\n' "$*" >> "$CALL_LOG"
+if [[ "${FAIL_CALL_INDEX:-0}" -eq "$count" ]]; then
+  exit 9
+fi
+""",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def run_runner(self, fail_call_index=0):
+        for path in (self.call_log, self.call_count):
+            if path.exists():
+                path.unlink()
+        env = os.environ.copy()
+        env.update({
+            "PATH": "{}:{}".format(self.temp_path, env["PATH"]),
+            "RUN_DATE": CURRENT_RUN_DATE,
+            "RUN_ID": "recovery-runner-test",
+            "RECOVERY_FAILED_RUN_DATE": CURRENT_RUN_DATE,
+            "RECOVERY_FAILED_RUN_ID": RECOVERY_FAILED_RUN_ID,
+            "PIPELINE_LOG": str(self.temp_path / "runner.log"),
+            "CALL_LOG": str(self.call_log),
+            "CALL_COUNT_FILE": str(self.call_count),
+            "FAIL_CALL_INDEX": str(fail_call_index),
+        })
+        env.pop("PIPELINE_CURRENT_STEP_FILE", None)
+        env.pop("PIPELINE_STATUS_WRITER", None)
+        result = subprocess.run(
+            ["bash", str(self.runner)],
+            cwd=str(project_root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        calls = []
+        if self.call_log.exists():
+            calls = self.call_log.read_text(encoding="utf-8").splitlines()
+        return result, calls
+
     def test_tail_runner_has_only_required_steps_in_order(self):
-        runner = project_root / "00_pipeline" / "00_tool" / "run_tail_recovery.sh"
-        text = runner.read_text(encoding="utf-8")
-        commands = [
-            "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py",
-            "portal_s3_backup_rotation.py",
-            "80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py",
-            "80-9_portal_s3_sync/00_tool/portal_s3_sync.py",
-        ]
-        positions = [text.index(command) for command in commands]
+        text = self.runner.read_text(encoding="utf-8")
+        preflight = text.index("portal_s3_backup_rotation.py")
+        retention = text.index(
+            "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py"
+        )
+        rotation = text.index("portal_s3_backup_rotation.py", preflight + 1)
+        prepare = text.index("80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py")
+        publish = text.index("80-9_portal_s3_sync/00_tool/portal_s3_sync.py")
+        positions = [preflight, retention, rotation, prepare, publish]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(text.count("run_step \\\n"), 4)
-        self.assertIn('--recovery-run-date "$RECOVERY_FAILED_RUN_DATE"', text)
-        self.assertIn('--recovery-run-id "$RECOVERY_FAILED_RUN_ID"', text)
+        self.assertEqual(text.count("run_step \\\n"), 5)
+        self.assertEqual(
+            text.count('--recovery-run-date "$RECOVERY_FAILED_RUN_DATE"'), 2
+        )
+        self.assertEqual(text.count('--recovery-run-id "$RECOVERY_FAILED_RUN_ID"'), 2)
         self.assertIn('--apply --run-date "$RUN_DATE"', text)
         self.assertNotIn("01-1_fetch_gmail", text)
+
+    def test_tail_runner_preflights_before_all_actual_steps(self):
+        result, calls = self.run_runner()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(len(calls), 5)
+        self.assertIn("portal_s3_backup_rotation.py --dry-run", calls[0])
+        self.assertIn("manage_09_result_retention.py --apply", calls[1])
+        self.assertIn("portal_s3_backup_rotation.py --recovery-run-date", calls[2])
+        self.assertNotIn("--dry-run", calls[2])
+        self.assertIn("portal_s3_prepare.py", calls[3])
+        self.assertIn("portal_s3_sync.py", calls[4])
+        for call in (calls[0], calls[2]):
+            self.assertIn("--recovery-run-date {}".format(CURRENT_RUN_DATE), call)
+            self.assertIn("--recovery-run-id {}".format(RECOVERY_FAILED_RUN_ID), call)
+
+    def test_tail_runner_stops_at_each_failed_step(self):
+        cases = (
+            (1, 1),  # preflight failure: no actual step starts
+            (2, 2),  # 80-7 failure: no 80-75 actual or later step starts
+            (3, 3),  # 80-75 actual failure: no 80-8 or 80-9 starts
+            (4, 4),  # 80-8 failure: no 80-9 starts
+        )
+        for fail_call_index, expected_calls in cases:
+            with self.subTest(fail_call_index=fail_call_index):
+                result, calls = self.run_runner(fail_call_index)
+                self.assertEqual(result.returncode, 9, result.stdout)
+                self.assertEqual(len(calls), expected_calls)
+                self.assertIn("portal_s3_backup_rotation.py --dry-run", calls[0])
+                if fail_call_index == 1:
+                    self.assertFalse(any("manage_09_result_retention.py" in c for c in calls))
 
 
 # ---------------------------------------------------------------------------

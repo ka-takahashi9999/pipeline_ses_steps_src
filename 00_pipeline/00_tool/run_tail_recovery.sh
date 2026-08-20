@@ -74,6 +74,13 @@ log "########## tail recovery start ##########"
 log "RUN_DATE=$RUN_DATE / failed_run=$RECOVERY_FAILED_RUN_DATE/$RECOVERY_FAILED_RUN_ID"
 
 run_step \
+  "80-75_portal_s3_backup_rotation_preflight(recovery=$RECOVERY_FAILED_RUN_DATE/$RECOVERY_FAILED_RUN_ID)" \
+  "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
+  --dry-run \
+  --recovery-run-date "$RECOVERY_FAILED_RUN_DATE" \
+  --recovery-run-id "$RECOVERY_FAILED_RUN_ID"
+
+run_step \
   "80-7_manage_09_result_retention(RUN_DATE=$RUN_DATE)" \
   "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" \
   --apply --run-date "$RUN_DATE"
