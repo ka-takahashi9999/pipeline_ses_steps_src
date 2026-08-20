@@ -25,7 +25,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # common モジュールのパス解決
 _STEP_DIR = Path(__file__).resolve().parent.parent
@@ -64,11 +64,15 @@ class CleanupRules:
         greeting_patterns: List[str],
         separator_regexes: List[re.Pattern],
         remove_with_adjacent_url_patterns: List[str],
+        auxiliary_section_patterns: Optional[List[str]] = None,
+        auxiliary_bridge_patterns: Optional[List[str]] = None,
     ):
         self.signature_starts = signature_starts      # 部分一致で署名開始を検出
         self.greeting_patterns = greeting_patterns    # 部分一致で挨拶行を除去
         self.separator_regexes = separator_regexes    # fullmatch で区切り行を除去
         self.remove_with_adjacent_url_patterns = remove_with_adjacent_url_patterns
+        self.auxiliary_section_patterns = auxiliary_section_patterns or []
+        self.auxiliary_bridge_patterns = auxiliary_bridge_patterns or []
 
 
 def normalize(s: str) -> str:
@@ -82,6 +86,8 @@ def load_cleanup_rules(path: str) -> CleanupRules:
     greeting_patterns: List[str] = []
     separator_regexes: List[re.Pattern] = []
     remove_with_adjacent_url_patterns: List[str] = []
+    auxiliary_section_patterns: List[str] = []
+    auxiliary_bridge_patterns: List[str] = []
 
     rules_path = Path(path)
     if not rules_path.exists():
@@ -91,6 +97,8 @@ def load_cleanup_rules(path: str) -> CleanupRules:
             greeting_patterns,
             separator_regexes,
             remove_with_adjacent_url_patterns,
+            auxiliary_section_patterns,
+            auxiliary_bridge_patterns,
         )
 
     current_section = None
@@ -117,6 +125,10 @@ def load_cleanup_rules(path: str) -> CleanupRules:
                     logger.warn(f"無効な正規表現をスキップ: {stripped!r} ({e})")
             elif current_section == "REMOVE_WITH_ADJACENT_URL":
                 remove_with_adjacent_url_patterns.append(normalize(stripped))
+            elif current_section == "HIGH_CONFIDENCE_AUXILIARY_SECTION":
+                auxiliary_section_patterns.append(normalize(stripped))
+            elif current_section == "AUXILIARY_BRIDGE_LINE":
+                auxiliary_bridge_patterns.append(normalize(stripped))
 
     logger.info(
         f"クリーニングルール読み込み完了: "
@@ -124,12 +136,16 @@ def load_cleanup_rules(path: str) -> CleanupRules:
         f"挨拶={len(greeting_patterns)}件, "
         f"区切り={len(separator_regexes)}件, "
         f"隣接URL除去={len(remove_with_adjacent_url_patterns)}件"
+        f", 補助section={len(auxiliary_section_patterns)}件"
+        f", 補助説明行={len(auxiliary_bridge_patterns)}件"
     )
     return CleanupRules(
         signature_starts,
         greeting_patterns,
         separator_regexes,
         remove_with_adjacent_url_patterns,
+        auxiliary_section_patterns,
+        auxiliary_bridge_patterns,
     )
 
 
@@ -214,6 +230,81 @@ def _find_lines_to_remove_with_adjacent_url(lines: List[str], rules: CleanupRule
     return remove_indexes
 
 
+def _matches_any(line: str, patterns: List[str]) -> bool:
+    """NFKC正規化済みの部分一致ルールに1件以上一致するか返す。"""
+    normed = normalize(line)
+    return bool(normed) and any(pattern in normed for pattern in patterns)
+
+
+def _is_primary_profile_field(line: str) -> bool:
+    """主提案fieldらしい行を検出し、補助sectionの越境削除を防ぐ。"""
+    normed = normalize(line)
+    if not normed:
+        return False
+    field_pattern = (
+        r"^[【\[（(■●・*＊\s]*"
+        r"(?:氏名|名前|イニシャル|年齢|最寄(?:駅)?|単価|"
+        r"スキル(?:シート)?(?:概要|URL)?|経験|案件名)"
+        r"(?:[】\]）)]+|\s*[：:]|\s+$|$)"
+    )
+    return re.search(field_pattern, normed, flags=re.IGNORECASE) is not None
+
+
+def find_high_confidence_auxiliary_sections(
+    lines: List[str],
+    rules: CleanupRules,
+) -> List[Tuple[Set[int], str]]:
+    """
+    HIGH_CONFIDENCE補助見出しと3物理行以内の最初のURLを組にして返す。
+
+    見出しだけ、URLだけ、未登録の非空行や主提案fieldをまたぐ組は成立させない。
+    戻り値の各要素は (削除行index集合, 対象URL) 。
+    """
+    sections: List[Tuple[Set[int], str]] = []
+
+    for heading_index, line in enumerate(lines):
+        if not _matches_any(line, rules.auxiliary_section_patterns):
+            continue
+
+        same_line_urls = re.findall(r'https?://[^\s\)\]\}\"\'<>]+', line)
+        if same_line_urls:
+            sections.append(({heading_index}, same_line_urls[0].rstrip(".,;:!?")))
+            continue
+
+        intermediate_indexes: Set[int] = set()
+        for offset in range(1, 4):
+            index = heading_index + offset
+            if index >= len(lines):
+                break
+            candidate = lines[index]
+            if _is_primary_profile_field(candidate):
+                break
+            if _contains_url(candidate):
+                url_match = re.search(r'https?://[^\s\)\]\}\"\'<>]+', candidate)
+                if url_match is not None:
+                    indexes = {heading_index, index} | intermediate_indexes
+                    sections.append((indexes, url_match.group(0).rstrip(".,;:!?")))
+                break
+            if not candidate.strip():
+                intermediate_indexes.add(index)
+                continue
+            if _matches_any(candidate, rules.auxiliary_bridge_patterns):
+                intermediate_indexes.add(index)
+                continue
+            # 未登録の非空行はfail-closedでcleanup不成立。
+            break
+
+    return sections
+
+
+def _find_high_confidence_auxiliary_lines(lines: List[str], rules: CleanupRules) -> Set[int]:
+    """成立した補助sectionの削除対象行indexをまとめて返す。"""
+    remove_indexes: Set[int] = set()
+    for indexes, _url in find_high_confidence_auxiliary_sections(lines, rules):
+        remove_indexes.update(indexes)
+    return remove_indexes
+
+
 def cleanup_body(body_text: str, rules: CleanupRules) -> Tuple[str, int]:
     """
     メール本文をクリーニングして返す。
@@ -235,11 +326,12 @@ def cleanup_body(body_text: str, rules: CleanupRules) -> Tuple[str, int]:
 
     # ①-2 特定文言 + 隣接URL をまとめて除去
     remove_with_url_indexes = _find_lines_to_remove_with_adjacent_url(lines, rules)
+    auxiliary_indexes = _find_high_confidence_auxiliary_lines(lines, rules)
 
     # ② 挨拶文・③ 区切り線 を行ごと除去
     kept_lines = []
     for i, line in enumerate(lines):
-        if i in remove_with_url_indexes:
+        if i in remove_with_url_indexes or i in auxiliary_indexes:
             continue
         if _is_greeting_line(line, rules):
             continue

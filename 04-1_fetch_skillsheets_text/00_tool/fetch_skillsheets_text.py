@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import time
 import html
+import unicodedata
 from dataclasses import dataclass
 import requests
 import warnings
@@ -135,6 +136,29 @@ URL_CONTEXT_NEGATIVE_KEYWORDS = (
     "配信停止",
     "会社HP",
     "URL :",
+)
+
+HTML_LINK_NEGATIVE_KEYWORDS = (
+    "注力人材",
+    "注力要員",
+    "注力案件",
+    "人材一覧",
+    "要員一覧",
+    "営業中人材",
+    "営業中要員",
+    "案件一覧",
+    "その他の人材",
+    "その他の要員",
+    "その他案件",
+    "共有人材一覧",
+    "共有人材",
+)
+
+NON_SKILLSHEET_ATTACHMENT_KEYWORDS = (
+    "会社案内",
+    "会社概要",
+    "資格証",
+    "参考資料",
 )
 
 # HTTP ダウンロード共通ヘッダー
@@ -660,22 +684,29 @@ def sort_urls_by_priority(urls: List[str], body_text: str = "") -> List[Tuple[st
 
 
 def is_skillsheet_link_text(text: str) -> bool:
-    """HTMLリンク表示テキストがスキルシート系かを判定する。"""
-    normalized = (text or "").lower()
-    return any(keyword.lower() in normalized for keyword in URL_CONTEXT_POSITIVE_KEYWORDS)
+    """HTML anchorがpositiveに一致し、negativeには一致しないか判定する。"""
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    has_negative = any(keyword.casefold() in normalized for keyword in HTML_LINK_NEGATIVE_KEYWORDS)
+    if has_negative:
+        return False
+    return any(keyword.casefold() in normalized for keyword in URL_CONTEXT_POSITIVE_KEYWORDS)
 
 
 def extract_skillsheet_urls_from_html_links(
     mail_record: Optional[Dict[str, Any]],
+    excluded_urls: Optional[Set[str]] = None,
 ) -> List[str]:
     """mail_master.html_links からスキルシート系リンクの href を出現順に抽出する。"""
     html_links = (mail_record or {}).get("html_links") or []
     urls: List[str] = []
+    excluded = excluded_urls or set()
     for link in html_links:
         if not isinstance(link, dict):
             continue
         href = (link.get("href") or "").strip()
         if not href:
+            continue
+        if href in excluded:
             continue
         if is_skillsheet_link_text(link.get("text", "") or ""):
             urls.append(href)
@@ -691,8 +722,11 @@ def build_url_candidates(
     HTMLリンク由来のスキルシート系 href を本文URLより優先し、同じURLは1回だけ試す。
     """
     body_text = (cleanup_record or {}).get("body_text", "") or ""
-    html_urls = extract_skillsheet_urls_from_html_links(mail_record)
     body_urls = extract_urls_from_text(body_text)
+    raw_body_text = (mail_record or {}).get("body_text", "") or ""
+    raw_body_urls = extract_urls_from_text(raw_body_text)
+    removed_body_urls = set(raw_body_urls) - set(body_urls)
+    html_urls = extract_skillsheet_urls_from_html_links(mail_record, removed_body_urls)
 
     ordered: List[Tuple[str, str]] = []
     seen: Set[str] = set()
@@ -709,6 +743,19 @@ def build_url_candidates(
         ordered.append((url, category))
 
     return ordered, html_urls, body_urls
+
+
+def is_eligible_attachment(attachment: Dict[str, Any]) -> bool:
+    """現行対応形式のうち、明示的に無関係な添付をskillsheet候補外にする。"""
+    filename = unicodedata.normalize("NFKC", attachment.get("filename", "") or "")
+    if any(keyword in filename for keyword in NON_SKILLSHEET_ATTACHMENT_KEYWORDS):
+        return False
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    mime = (attachment.get("mime_type", "") or "").lower()
+    return ext in SKILLSHEET_EXTENSIONS or any(
+        keyword in mime
+        for keyword in ("pdf", "excel", "word", "spreadsheet", "document", "officedocument")
+    )
 
 
 def is_probable_file_url(url: str) -> bool:
@@ -1349,13 +1396,8 @@ def fetch_skillsheet(
         classified_errors: List[str] = []
         for att in attachments:
             filename = att.get("filename", "")
-            # スキルシートらしい添付ファイルのみ対象（PDF/Excel/Word）
-            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            mime = att.get("mime_type", "").lower()
-            if ext not in ("pdf", "xlsx", "xls", "docx", "doc") and not any(
-                k in mime for k in ("pdf", "excel", "word", "spreadsheet", "document", "officedocument")
-            ):
-                # 添付がスキルシート対象外（画像等）の場合はスキップ
+            if not is_eligible_attachment(att):
+                # 画像や会社案内等、skillsheet候補外の添付はURL利用を妨げない。
                 continue
             try:
                 logger.info(f"添付ファイル抽出開始: {filename}", message_id)
