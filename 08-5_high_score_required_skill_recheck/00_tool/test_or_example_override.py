@@ -147,6 +147,55 @@ class OrExampleOverrideTest(unittest.TestCase):
                 self.assertEqual(target._apply_or_example_override(checks), 0)
                 self.assertEqual(checks[0]["confidence"], "human_review")
 
+    def test_shared_condition_requires_direct_evidence(self):
+        blocked_cases = [
+            check(
+                "PMまたはPLとして一貫担当した経験",
+                "PM経験はあるがPL経験は不明",
+                "PM補佐として進捗管理",
+            ),
+            check(
+                "JavaまたはKotlinで詳細設計経験",
+                "Java経験はあるがKotlin経験は不明",
+                "Java製造・単体テスト",
+            ),
+            check(
+                "Java、Kotlin等による詳細設計経験",
+                "Java経験はあるがKotlin経験は不明",
+                "Java製造・単体テスト",
+            ),
+            check(
+                "JavaまたはKotlinで高度な顧客課題対応経験",
+                "Java経験はあるがKotlin経験は不明",
+                "Java問い合わせ対応",
+            ),
+        ]
+        for fixture_check in blocked_cases:
+            with self.subTest(skill=fixture_check["skill"]):
+                checks = [fixture_check]
+                self.assertEqual(target._apply_or_example_override(checks), 0)
+                self.assertEqual(checks[0]["confidence"], "human_review")
+
+        direct = [check(
+            "JavaまたはKotlinで詳細設計経験",
+            "Java詳細設計経験はあるがKotlin経験は不明",
+            "Java詳細設計を担当",
+        )]
+        self.assertEqual(target._apply_or_example_override(direct), 1)
+        self.assertEqual(direct[0]["confidence"], "confirmed")
+
+    def test_category_mismatch_blocks_override(self):
+        checks = [check(
+            "JavaまたはKotlinでの開発経験",
+            "Javaでの開発経験は明確だが、Kotlin経験は不明",
+            "Javaによる業務システム開発",
+        )]
+        self.assertEqual(
+            target._apply_or_example_override(checks, category_match="mismatch"),
+            0,
+        )
+        self.assertEqual(checks[0]["confidence"], "human_review")
+
     def test_existing_ai_confirmed_and_unrelated_pairs_are_unchanged(self):
         checks = [
             check("Windows/Linux運用経験", "両方の経験あり", "WindowsとLinux", True, "confirmed"),

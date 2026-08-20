@@ -459,6 +459,103 @@ def _has_experience_duration_requirement(skill: str) -> bool:
     )
 
 
+def _extract_shared_condition_tail(skill: str) -> str:
+    """OR選択肢の後ろに共通して掛かる条件部分を限定的に取り出す。"""
+    normalized = _normalize_or_text(skill)
+
+    marker_match = re.search(r"または|又は", normalized)
+    if marker_match:
+        right = normalized[marker_match.end() :]
+        right_option = _first_or_atom(right)
+        if right_option and right.startswith(right_option):
+            return right[len(right_option) :].strip()
+        return ""
+
+    marker_match = re.search(r"いずれか(?:一つ|1つ)?|どちらか", normalized)
+    if marker_match:
+        return normalized[marker_match.end() :].strip()
+
+    marker_match = re.search(r"(?:など|等)", normalized)
+    if marker_match:
+        return normalized[marker_match.end() :].strip()
+    return ""
+
+
+def _has_evidence_marker(evidence: str, markers: Tuple[str, ...]) -> bool:
+    normalized = _normalize_or_text(evidence)
+    return any(re.search(marker, normalized, re.IGNORECASE) for marker in markers)
+
+
+def _shared_condition_has_direct_evidence(skill: str, evidence: str) -> bool:
+    """OR共通条件を限定語彙で検証する。解釈不能な条件は安全側でFalse。"""
+    tail = _extract_shared_condition_tail(skill)
+    compact_tail = re.sub(r"[\s()（）・/／、,~〜\-]", "", tail)
+    if not compact_tail:
+        return False
+    if re.fullmatch(r"(?:の)?(?:利用|使用)?経験", compact_tail):
+        # WMS等の「選択肢いずれかの経験」。選択肢のdirect evidenceを経験根拠とする。
+        return True
+
+    recognized = False
+    specific_design = False
+    phase_conditions = (
+        ("要件定義", (r"要件定義",)),
+        ("基本設計", (r"基本設計", r"外部設計")),
+        ("詳細設計", (r"詳細設計", r"内部設計")),
+        ("運用設計", (r"運用設計",)),
+    )
+    for required_marker, evidence_markers in phase_conditions:
+        if required_marker not in tail:
+            continue
+        recognized = True
+        specific_design = True
+        if not _has_evidence_marker(evidence, evidence_markers):
+            return False
+
+    direct_conditions = (
+        ("構築", (r"構築", r"セットアップ", r"導入")),
+        ("保守", (r"保守", r"運用保守")),
+        ("開発", (r"開発", r"実装")),
+        ("リード", (r"リード", r"リーダー", r"主導")),
+        ("実務", (r"実務", r"業務で", r"案件で", r"プロジェクトで", r"担当")),
+        ("担当", (r"担当", r"主導")),
+    )
+    for required_marker, evidence_markers in direct_conditions:
+        if required_marker not in tail:
+            continue
+        recognized = True
+        if not _has_evidence_marker(evidence, evidence_markers):
+            return False
+
+    if "一貫" in tail:
+        recognized = True
+        if not _has_evidence_marker(
+            evidence,
+            (
+                r"一貫",
+                r"(?:企画|要件定義).{0,80}(?:リリース|本番|運用)",
+            ),
+        ):
+            return False
+
+    if "設計" in tail and not specific_design:
+        recognized = True
+        if not _has_evidence_marker(
+            evidence,
+            (
+                r"設計",
+                r"刷新",
+                r"アーキテクチャ",
+                r"方式(?:策定|設計|検討)",
+                r"構成(?:策定|設計|検討)",
+            ),
+        ):
+            return False
+
+    # allowlistで共有条件を説明できない場合はoverrideしない。
+    return recognized
+
+
 def _reason_is_only_other_option_unmet(
     reason: str,
     options: List[str],
@@ -516,8 +613,13 @@ def _reason_is_only_other_option_unmet(
     )
 
 
-def _apply_or_example_override(checks: List[Dict[str, Any]]) -> int:
+def _apply_or_example_override(
+    checks: List[Dict[str, Any]],
+    category_match: str = "unclear",
+) -> int:
     """明示ORの別選択肢だけが未確認の場合に限りconfirmedへ補正する。"""
+    if _normalize_or_text(category_match).lower() == "mismatch":
+        return 0
     count = 0
     for check in checks:
         if check.get("confidence") != "human_review":
@@ -536,6 +638,8 @@ def _apply_or_example_override(checks: List[Dict[str, Any]]) -> int:
             i for i, option in enumerate(options) if _contains_option_term(evidence, option)
         ]
         if not evidence_matched_indexes:
+            continue
+        if not _shared_condition_has_direct_evidence(skill, evidence):
             continue
         if not _reason_is_only_other_option_unmet(
             reason, options, evidence_matched_indexes
@@ -569,7 +673,9 @@ def _replay_postprocessing_record(
         raise ValueError("required_skill_checksがlistでない")
 
     restored_count = sum(1 for check in checks if _restore_pre_override_check(check))
-    override_count = _apply_or_example_override(checks)
+    override_count = _apply_or_example_override(
+        checks, str(result.get("category_match") or "unclear")
+    )
     status = _decide_recheck_status(checks)
     recheck_info = result.get("recheck_info")
     if not isinstance(recheck_info, dict):
@@ -611,7 +717,7 @@ def _add_recheck_result(
     # LLM正常応答かつschema検証済みの経路に限り confidence=confirmed 固定へ上書きする。
     if apply_auto_true_override:
         _apply_auto_true_override(checks)
-        _apply_or_example_override(checks)
+        _apply_or_example_override(checks, category_match)
     status = _decide_recheck_status(checks)
     result["source_score_band"] = source_score_band
     result["recheck_info"] = {
