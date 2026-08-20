@@ -20,6 +20,9 @@ CURRENT + bk1 の 2 set 構成（backup 1世代）。将来 bk2 / bk3 へ拡張�
   missing=extra=size mismatch=0 / canonical destination）と pipeline-status 上の
   SUCCEEDED run を照合し、さらに CURRENT実体のcount/bytesが 80-9 の actual と
   一致することまで確認する。partial CURRENT を backup しない。
+- 限定recovery: date / run_idをCLIで明示した既知80-7 FAILED runだけを対象とし、
+  previous verified success確定後にCURRENT objectが1件も変更されていない場合だけ
+  BK1 rotation元として許可する。FAILED statusを無条件に無視する経路ではない。
 - backup本体: `aws s3 sync CURRENT BK1 --delete`（argv配列 / shell未使用 /
   include-excludeフィルタ未使用）
 - backup後 PORTAL_S3_VERIFY_WAIT_SEC 秒待ち、CURRENT と bk1 を全件LISTして
@@ -31,6 +34,7 @@ backup対象外prefixのため一切変更しない（pipeline-status は read-o
 
 usage:
   portal_s3_backup_rotation.py [--bootstrap] [--dry-run]
+  portal_s3_backup_rotation.py --recovery-run-date YYYYMMDD --recovery-run-id RUN_ID [--dry-run]
 """
 
 import argparse
@@ -57,6 +61,9 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 SYNC_STEP_DIR_NAME = "80-9_portal_s3_sync"
 SYNC_SUMMARY_FILENAME = "portal_s3_sync_summary.json"
 BACKUP_SUMMARY_FILENAME = "portal_s3_backup_rotation_summary.json"
+PREPARE_STEP_DIR_NAME = "80-8_portal_s3_prepare"
+PREVIOUS_MANIFEST_FILENAME = "portal_s3_manifest.jsonl"
+RECOVERY_FAILED_STEP_NAME = "80-7_manage_09_result_retention"
 
 AWS_BIN = "/usr/bin/aws"
 RESULT_DIR_NAME = "01_result"
@@ -498,6 +505,189 @@ def _validate_running_current_document(
         raise RotationError("RUNNING status.jsonのexit_code_sourceが不正です")
 
 
+def resolve_recovery_target(args: argparse.Namespace) -> Optional[Dict[str, str]]:
+    """date / run_idを両方明示した場合だけ限定recoveryを有効にする。"""
+    run_date = getattr(args, "recovery_run_date", None)
+    run_id = getattr(args, "recovery_run_id", None)
+    if run_date is None and run_id is None:
+        return None
+    if not run_date or not run_id:
+        raise RotationError("recoveryは --recovery-run-date と --recovery-run-id の両方が必要です")
+    if not isinstance(run_date, str) or not RUN_DATE_RE.fullmatch(run_date):
+        raise RotationError(f"recovery RUN_DATEの形式が不正です: {run_date!r}")
+    try:
+        datetime.strptime(run_date, "%Y%m%d")
+    except ValueError as exc:
+        raise RotationError(f"recovery RUN_DATEが実在日ではありません: {run_date!r}") from exc
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise RotationError(f"recovery RUN_IDの形式が不正です: {run_id!r}")
+    return {"run_date": run_date, "run_id": run_id}
+
+
+def _validate_terminal_status_document(
+    run: Dict[str, Any], document: Dict[str, Any], label: str
+) -> None:
+    """recovery判定に使うterminal statusをschema 1.0完全一致で検証する。"""
+    actual_keys = set(document)
+    missing_keys = sorted(STATUS_REQUIRED_KEYS - actual_keys)
+    extra_keys = sorted(actual_keys - STATUS_REQUIRED_KEYS)
+    if missing_keys or extra_keys:
+        raise RotationError(
+            f"{label} statusのschema keyが13 key完全一致ではありません "
+            f"(missing={missing_keys} / extra={extra_keys})"
+        )
+    if document["schema_version"] != STATUS_SCHEMA_VERSION:
+        raise RotationError(f"{label} statusのschema_versionが不正です")
+    if document["run_date"] != run["run_date"] or document["run_id"] != run["run_id"]:
+        raise RotationError(f"{label} statusのkey identityとdocumentが一致しません")
+    if not RUN_DATE_RE.fullmatch(document["run_date"] or ""):
+        raise RotationError(f"{label} statusのrun_dateが不正です")
+    try:
+        datetime.strptime(document["run_date"], "%Y%m%d")
+    except ValueError as exc:
+        raise RotationError(f"{label} statusのrun_dateが実在日ではありません") from exc
+    if not RUN_ID_RE.fullmatch(document["run_id"] or ""):
+        raise RotationError(f"{label} statusのrun_idが不正です")
+
+    parsed_timestamps = {}
+    for name in ("started_at", "finished_at", "updated_at"):
+        value = document[name]
+        if not isinstance(value, str) or not value:
+            raise RotationError(f"{label} statusの{name}が不正です: {value!r}")
+        candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise RotationError(f"{label} statusの{name}がISO 8601形式ではありません") from exc
+        if parsed.tzinfo is None:
+            raise RotationError(f"{label} statusの{name}にtimezoneがありません")
+        parsed_timestamps[name] = parsed
+    if parsed_timestamps["finished_at"] < parsed_timestamps["started_at"]:
+        raise RotationError(f"{label} statusのfinished_atがstarted_atより前です")
+    if document["finished_at_source"] != "managed_wrapper":
+        raise RotationError(f"{label} statusのfinished_at_sourceが不正です")
+    if document["exit_code_source"] != "managed_wrapper":
+        raise RotationError(f"{label} statusのexit_code_sourceが不正です")
+    if not isinstance(document["exit_code"], int) or isinstance(document["exit_code"], bool):
+        raise RotationError(f"{label} statusのexit_codeが整数ではありません")
+    for key in ("current_step", "log_s3_uri"):
+        if not isinstance(document[key], str) or not document[key].strip():
+            raise RotationError(f"{label} statusの{key}が空または文字列ではありません")
+    if not isinstance(document["error_message"], str):
+        raise RotationError(f"{label} statusのerror_messageが文字列ではありません")
+
+
+def _guard_recovery_pipeline_status(
+    s3_client,
+    bucket: str,
+    runs: List[Dict[str, Any]],
+    provenance: Dict[str, Any],
+    recovery_target: Dict[str, str],
+    logger,
+) -> Dict[str, Any]:
+    """
+    FAILEDを無視せず、明示targetが最新terminalの既知80-7 failureであることと、
+    previous 80-9 summaryが指すrunが直前successfulであることを検証する。
+    """
+    if any(run.get("last_modified") is None for run in runs):
+        raise RotationError("pipeline-status LISTにLastModifiedがありません（recovery順序判定不能）")
+    latest_modified = max(run["last_modified"] for run in runs)
+    latest_runs = [run for run in runs if run["last_modified"] == latest_modified]
+    if len(latest_runs) != 1:
+        raise RotationError(
+            f"recovery対象の最新pipeline-status runを一意に特定できません (matches={len(latest_runs)})"
+        )
+    latest = latest_runs[0]
+    if (
+        latest["run_date"] != recovery_target["run_date"]
+        or latest["run_id"] != recovery_target["run_id"]
+    ):
+        raise RotationError(
+            "latest FAILED runが明示recovery targetと一致しません "
+            f"(latest={latest['run_date']}/{latest['run_id']} / "
+            f"target={recovery_target['run_date']}/{recovery_target['run_id']})"
+        )
+
+    failed_document = get_status_document(s3_client, bucket, latest["key"])
+    _validate_terminal_status_document(latest, failed_document, "recovery target FAILED")
+    if failed_document["status"] != "FAILED" or failed_document["exit_code"] == 0:
+        raise RotationError(
+            "recovery targetが非正常FAILED terminalではありません "
+            f"(status={failed_document['status']!r} / exit={failed_document['exit_code']!r})"
+        )
+    expected_failed_step = (
+        f"{RECOVERY_FAILED_STEP_NAME}(RUN_DATE={recovery_target['run_date']})"
+    )
+    if failed_document["current_step"] != expected_failed_step:
+        raise RotationError(
+            "recoveryを許可しないfailure stepです "
+            f"(actual={failed_document['current_step']!r} / expected={expected_failed_step!r})"
+        )
+
+    if provenance["run_date"] >= recovery_target["run_date"]:
+        raise RotationError(
+            "previous verified runがrecovery targetより前ではありません "
+            f"({provenance['run_date']} >= {recovery_target['run_date']})"
+        )
+    previous_matches = [
+        run
+        for run in runs
+        if run["run_date"] == provenance["run_date"] and run["run_id"] == provenance["run_id"]
+    ]
+    if len(previous_matches) != 1:
+        raise RotationError(
+            "previous verified runのpipeline-statusを一意に特定できません "
+            f"(matches={len(previous_matches)})"
+        )
+    previous_run = previous_matches[0]
+    previous_document = get_status_document(s3_client, bucket, previous_run["key"])
+    _validate_terminal_status_document(previous_run, previous_document, "previous verified SUCCEEDED")
+    if previous_document["status"] != "SUCCEEDED" or previous_document["exit_code"] != 0:
+        raise RotationError("previous verified runがSUCCEEDED/exit=0ではありません")
+
+    successful_before_target = []
+    for run in runs:
+        if run["run_date"] >= recovery_target["run_date"]:
+            continue
+        document = get_status_document(s3_client, bucket, run["key"])
+        if document.get("status") == "SUCCEEDED":
+            _validate_terminal_status_document(run, document, "previous successful candidate")
+            if document["exit_code"] != 0:
+                raise RotationError("SUCCEEDED statusのexit_codeが0ではありません")
+            successful_before_target.append(run)
+    if not successful_before_target:
+        raise RotationError("recovery targetより前のsuccessful runを解決できません")
+    previous_successful = sorted(successful_before_target, key=_sort_key)[-1]
+    if previous_successful["key"] != previous_run["key"]:
+        raise RotationError(
+            "80-9 summaryのrunが直前successful runではありません "
+            f"(status={previous_successful['run_date']}/{previous_successful['run_id']} / "
+            f"summary={provenance['run_date']}/{provenance['run_id']})"
+        )
+
+    logger.info(
+        "recovery pipeline-status照合OK: "
+        f"failed={latest['run_date']}/{latest['run_id']} / "
+        f"previous={previous_run['run_date']}/{previous_run['run_id']}"
+    )
+    return {
+        "status_key": previous_run["key"],
+        "status": "SUCCEEDED",
+        "exit_code": 0,
+        "recovery": {
+            "enabled": True,
+            "eligible": True,
+            "target_run_date": latest["run_date"],
+            "target_run_id": latest["run_id"],
+            "failed_status_key": latest["key"],
+            "failed_step": failed_document["current_step"],
+            "previous_verified_run_date": previous_run["run_date"],
+            "previous_verified_run_id": previous_run["run_id"],
+            "previous_verified_finished_at": previous_document["finished_at"],
+        },
+    }
+
+
 def guard_pipeline_status(
     s3_client,
     bucket: str,
@@ -506,6 +696,7 @@ def guard_pipeline_status(
     provenance: Dict[str, Any],
     current_identity: Optional[Dict[str, str]],
     logger,
+    recovery_target: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     pipeline-status を照合し、直前の terminal run が
@@ -537,6 +728,10 @@ def guard_pipeline_status(
         )
     if not runs:
         raise RotationError("自runを除くpipeline-status runが存在しません")
+    if recovery_target is not None:
+        return _guard_recovery_pipeline_status(
+            s3_client, bucket, runs, provenance, recovery_target, logger
+        )
     if any(run.get("last_modified") is None for run in runs):
         raise RotationError("pipeline-status LISTにLastModifiedがありません（順序判定不能）")
 
@@ -565,6 +760,63 @@ def guard_pipeline_status(
 
     logger.info(f"pipeline-status照合OK: {latest['run_date']}/{latest['run_id']} SUCCEEDED")
     return {"status_key": latest["key"], "status": document.get("status"), "exit_code": 0}
+
+
+def validate_recovery_manifest_reference(
+    manifest_path: Path,
+    summary_manifest_path: Any,
+) -> Dict[str, Any]:
+    """80-9 summaryがcanonical previous manifestを参照していることを検証する。"""
+    resolved_manifest = manifest_path.resolve()
+    if not isinstance(summary_manifest_path, str) or not summary_manifest_path:
+        raise RotationError("previous 80-9 summaryにmanifest_pathがありません")
+    if Path(summary_manifest_path).resolve() != resolved_manifest:
+        raise RotationError(
+            "previous 80-9 summaryのmanifest_pathがcanonical pathと一致しません "
+            f"(actual={summary_manifest_path!r} / expected={str(resolved_manifest)!r})"
+        )
+    if not resolved_manifest.is_file():
+        raise RotationError(f"previous verified manifestが存在しません: {resolved_manifest}")
+    return {
+        "manifest_path": str(resolved_manifest),
+        "manifest_reference_verified": True,
+    }
+
+
+def validate_recovery_current_unchanged(
+    current_fingerprints: Dict[str, Dict[str, Any]], previous_finished_at: Any
+) -> Dict[str, Any]:
+    """previous SUCCEEDED確定後に変更されたCURRENT objectが1件もないことを検証する。"""
+    if not isinstance(previous_finished_at, str) or not previous_finished_at:
+        raise RotationError("previous verified statusのfinished_atが不正です")
+    candidate = (
+        previous_finished_at[:-1] + "+00:00"
+        if previous_finished_at.endswith("Z")
+        else previous_finished_at
+    )
+    try:
+        cutoff = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise RotationError("previous verified statusのfinished_atがISO 8601形式ではありません") from exc
+    if cutoff.tzinfo is None:
+        raise RotationError("previous verified statusのfinished_atにtimezoneがありません")
+
+    changed = []
+    for relative_path, fingerprint in current_fingerprints.items():
+        last_modified = fingerprint.get("last_modified")
+        if not isinstance(last_modified, datetime) or last_modified.tzinfo is None:
+            raise RotationError(f"CURRENT objectのLastModifiedが不正です: {relative_path}")
+        if last_modified > cutoff:
+            changed.append(relative_path)
+    if changed:
+        raise RotationError(
+            "previous verified SUCCEEDED後にCURRENTが変更されています "
+            f"(count={len(changed)} / samples={sorted(changed)[:SAMPLE_LIMIT]})"
+        )
+    return {
+        "current_unchanged_since_previous_success": True,
+        "previous_success_finished_at": previous_finished_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +938,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="互換確認用。環境変数RUN_IDと一致する場合のみ受理し、除外identityには使用しない。",
     )
+    parser.add_argument(
+        "--recovery-run-date",
+        default=None,
+        help="限定recovery対象のFAILED RUN_DATE。--recovery-run-idとの同時指定が必須。",
+    )
+    parser.add_argument(
+        "--recovery-run-id",
+        default=None,
+        help="限定recovery対象のFAILED RUN_ID。--recovery-run-dateとの同時指定が必須。",
+    )
+    parser.add_argument(
+        "--prepare-dir",
+        default=None,
+        help="previous verified manifestの80-8 stepディレクトリ（focused test用）",
+    )
     return parser.parse_args()
 
 
@@ -705,6 +972,13 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 
     sync_dir = Path(args.sync_dir) if args.sync_dir else (project_root / SYNC_STEP_DIR_NAME)
     sync_summary_path = sync_dir / RESULT_DIR_NAME / SYNC_SUMMARY_FILENAME
+    prepare_dir = (
+        Path(args.prepare_dir)
+        if getattr(args, "prepare_dir", None)
+        else (project_root / PREPARE_STEP_DIR_NAME)
+    )
+    previous_manifest_path = prepare_dir / RESULT_DIR_NAME / PREVIOUS_MANIFEST_FILENAME
+    recovery_target = resolve_recovery_target(args)
 
     operation = "bootstrap" if args.bootstrap else "rotation"
     logger.info(f"operation={operation} / mode={'dry-run' if args.dry_run else 'apply'}")
@@ -737,10 +1011,23 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     s3_client = build_s3_client(region)
     current_identity = resolve_current_managed_identity(args)
     status_info = guard_pipeline_status(
-        s3_client, bucket, base_prefix, status_prefix, provenance, current_identity, logger
+        s3_client,
+        bucket,
+        base_prefix,
+        status_prefix,
+        provenance,
+        current_identity,
+        logger,
+        recovery_target=recovery_target,
     )
 
     current_before_fingerprint = list_source_fingerprints(s3_client, bucket, current_prefix)
+    unchanged_info = None
+    if recovery_target is not None:
+        unchanged_info = validate_recovery_current_unchanged(
+            current_before_fingerprint,
+            status_info["recovery"]["previous_verified_finished_at"],
+        )
     current_before = {
         path: fingerprint["size"] for path, fingerprint in current_before_fingerprint.items()
     }
@@ -754,6 +1041,26 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             f"summary {provenance['file_count']}件/{provenance['total_bytes']}bytes)"
         )
     logger.info(f"CURRENT実体照合OK: files={len(current_before)} / bytes={current_bytes}")
+
+    if recovery_target is not None:
+        manifest_info = validate_recovery_manifest_reference(
+            previous_manifest_path,
+            previous_summary.get("manifest_path"),
+        )
+        recovery_info = dict(status_info["recovery"])
+        recovery_info.update(manifest_info)
+        recovery_info.update(unchanged_info or {})
+        recovery_info["file_count"] = len(current_before)
+        recovery_info["total_bytes"] = current_bytes
+        recovery_info["inventory_verified"] = True
+        summary["recovery"] = recovery_info
+        logger.info(
+            "recovery eligibility=true: "
+            f"target={recovery_info['target_run_date']}/{recovery_info['target_run_id']} / "
+            f"previous={recovery_info['previous_verified_run_date']}/"
+            f"{recovery_info['previous_verified_run_id']} / "
+            f"CURRENT files={recovery_info['file_count']} bytes={recovery_info['total_bytes']}"
+        )
 
     backup_before = list_prefix_objects(s3_client, bucket, backup_prefix)
     if args.bootstrap:

@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parents[2]
@@ -65,6 +66,7 @@ PREV_RUN_DATE = "20260818"
 PREV_RUN_ID = "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951"
 CURRENT_RUN_ID = "sfn-current-run"
 CURRENT_RUN_DATE = "20260819"
+RECOVERY_FAILED_RUN_ID = "sfn-recovery-target-failed"
 
 
 class FakeS3Client:
@@ -181,7 +183,9 @@ class RotationTestBase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="test_80_75_"))
         self.step_dir = self.tmp / "out"
         self.sync_dir = self.tmp / "sync"
+        self.prepare_dir = self.tmp / "prepare"
         (self.sync_dir / "01_result").mkdir(parents=True)
+        (self.prepare_dir / "01_result").mkdir(parents=True)
         self.step_dir.mkdir(parents=True)
         self.logger = get_logger("test_80-75")
         self.sleep_calls = []
@@ -196,7 +200,13 @@ class RotationTestBase(unittest.TestCase):
         self.current_etags = {path: '"etag-v1"' for path in self.current}
         self.current_last_modified = {path: 100 for path in self.current}
         self.backup = dict(self.current)
-        self.write_sync_summary(make_sync_summary())
+        self.manifest_path = (
+            self.prepare_dir / "01_result" / target.PREVIOUS_MANIFEST_FILENAME
+        )
+        self.write_manifest()
+        self.write_sync_summary(
+            make_sync_summary(manifest_path=str(self.manifest_path.resolve()))
+        )
 
         self.original_sleep = target.time.sleep
         target.time.sleep = self._fake_sleep
@@ -231,13 +241,35 @@ class RotationTestBase(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False)
 
-    def make_args(self, bootstrap=False, dry_run=False, current_run_id=None):
+    def write_manifest(self, entries=None):
+        records = entries if entries is not None else self.current
+        with open(self.manifest_path, "w", encoding="utf-8") as f:
+            for relative_path, size in sorted(records.items()):
+                f.write(
+                    json.dumps(
+                        {"relative_path": relative_path, "size": size},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+    def make_args(
+        self,
+        bootstrap=False,
+        dry_run=False,
+        current_run_id=None,
+        recovery_run_date=None,
+        recovery_run_id=None,
+    ):
         return argparse.Namespace(
             bootstrap=bootstrap,
             dry_run=dry_run,
             step_dir=str(self.step_dir),
             sync_dir=str(self.sync_dir),
             current_run_id=current_run_id,
+            recovery_run_date=recovery_run_date,
+            recovery_run_id=recovery_run_id,
+            prepare_dir=str(self.prepare_dir),
         )
 
     def stub_sync(self, fail=False, apply_to_backup=True, mutate_current=None):
@@ -303,6 +335,29 @@ class RotationTestBase(unittest.TestCase):
             ]
         )
         key = f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/{CURRENT_RUN_ID}/status.json"
+        return client, key
+
+    def stub_recovery_s3(
+        self,
+        failed_run_date=CURRENT_RUN_DATE,
+        failed_run_id=RECOVERY_FAILED_RUN_ID,
+        failed_step=None,
+        include_previous=True,
+    ):
+        for path, last_modified in list(self.current_last_modified.items()):
+            if not isinstance(last_modified, datetime):
+                self.current_last_modified[path] = datetime(
+                    2026, 8, 19, 0, 30, tzinfo=timezone.utc
+                )
+        status_runs = []
+        if include_previous:
+            status_runs.append((PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0))
+        status_runs.append((failed_run_date, failed_run_id, "FAILED", 1))
+        client = self.stub_s3(status_runs=status_runs)
+        key = f"{BASE_PREFIX}/pipeline-status/{failed_run_date}/{failed_run_id}/status.json"
+        client.status_docs[key]["current_step"] = failed_step or (
+            f"{target.RECOVERY_FAILED_STEP_NAME}(RUN_DATE={failed_run_date})"
+        )
         return client, key
 
 
@@ -950,6 +1005,145 @@ class TestPreviousCurrentGuard(RotationTestBase):
         with self.assertRaises(target.RotationError):
             target.run(self.make_args(), self.logger)
         self.assertEqual(self.sync_calls, [])
+
+
+# ---------------------------------------------------------------------------
+# 限定tail recovery
+# ---------------------------------------------------------------------------
+
+
+class TestLimitedRecovery(RotationTestBase):
+    def recovery_args(self, **overrides):
+        values = {
+            "dry_run": True,
+            "recovery_run_date": CURRENT_RUN_DATE,
+            "recovery_run_id": RECOVERY_FAILED_RUN_ID,
+        }
+        values.update(overrides)
+        return self.make_args(**values)
+
+    def test_recovery_a_normal_mode_latest_failed_still_fails(self):
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(dry_run=True), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_b_exact_failed_run_and_verified_current_pass(self):
+        self.stub_sync()
+        self.stub_recovery_s3()
+        summary = target.run(self.recovery_args(), self.logger)
+        recovery = summary["recovery"]
+        self.assertTrue(recovery["eligible"])
+        self.assertTrue(recovery["inventory_verified"])
+        self.assertEqual(recovery["target_run_date"], CURRENT_RUN_DATE)
+        self.assertEqual(recovery["target_run_id"], RECOVERY_FAILED_RUN_ID)
+        self.assertEqual(recovery["previous_verified_run_date"], PREV_RUN_DATE)
+        self.assertEqual(len(self.sync_calls), 1)
+        self.assertIn("--dryrun", self.sync_calls[0]["argv"])
+
+    def test_recovery_c_run_date_mismatch_fails(self):
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(
+                self.recovery_args(recovery_run_date="20260820"),
+                self.logger,
+            )
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_d_failed_run_id_mismatch_fails(self):
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(
+                self.recovery_args(recovery_run_id="sfn-other-failed-run"),
+                self.logger,
+            )
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_e_failure_step_mismatch_fails(self):
+        self.stub_sync()
+        self.stub_recovery_s3(failed_step="80-8_portal_s3_prepare")
+        with self.assertRaises(target.RotationError):
+            target.run(self.recovery_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_f_current_summary_count_or_size_mismatch_fails(self):
+        self.current["01-1_fetch_gmail/01_result/fetch_gmail.jsonl"] = 11
+        self.backup = dict(self.current)
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.recovery_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_g_manifest_inventory_mismatch_fails(self):
+        self.write_sync_summary(
+            make_sync_summary(manifest_path=str(self.tmp / "wrong_manifest.jsonl"))
+        )
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.recovery_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_g2_current_modified_after_previous_success_fails(self):
+        path = "01-1_fetch_gmail/01_result/fetch_gmail.jsonl"
+        self.current_last_modified[path] = datetime(
+            2026, 8, 19, 2, 0, tzinfo=timezone.utc
+        )
+        self.stub_sync()
+        self.stub_recovery_s3()
+        with self.assertRaises(target.RotationError):
+            target.run(self.recovery_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_h_previous_successful_run_unresolvable_fails(self):
+        self.stub_sync()
+        self.stub_recovery_s3(include_previous=False)
+        with self.assertRaises(target.RotationError):
+            target.run(self.recovery_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_recovery_i_no_option_does_not_enter_manifest_exception_path(self):
+        self.write_manifest({"unrelated/path.txt": sum(self.current.values())})
+        self.stub_sync()
+        self.stub_s3()
+        summary = target.run(self.make_args(dry_run=True), self.logger)
+        self.assertNotIn("recovery", summary)
+        self.assertEqual(len(self.sync_calls), 1)
+
+    def test_recovery_requires_date_and_run_id_together(self):
+        self.stub_sync()
+        self.stub_recovery_s3()
+        for args in (
+            self.make_args(dry_run=True, recovery_run_date=CURRENT_RUN_DATE),
+            self.make_args(dry_run=True, recovery_run_id=RECOVERY_FAILED_RUN_ID),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises(target.RotationError):
+                    target.run(args, self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+
+class TestTailRecoveryRunnerContract(unittest.TestCase):
+    def test_tail_runner_has_only_required_steps_in_order(self):
+        runner = project_root / "00_pipeline" / "00_tool" / "run_tail_recovery.sh"
+        text = runner.read_text(encoding="utf-8")
+        commands = [
+            "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py",
+            "portal_s3_backup_rotation.py",
+            "80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py",
+            "80-9_portal_s3_sync/00_tool/portal_s3_sync.py",
+        ]
+        positions = [text.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(text.count("run_step \\\n"), 4)
+        self.assertIn('--recovery-run-date "$RECOVERY_FAILED_RUN_DATE"', text)
+        self.assertIn('--recovery-run-id "$RECOVERY_FAILED_RUN_ID"', text)
+        self.assertIn('--apply --run-date "$RUN_DATE"', text)
+        self.assertNotIn("01-1_fetch_gmail", text)
 
 
 # ---------------------------------------------------------------------------
