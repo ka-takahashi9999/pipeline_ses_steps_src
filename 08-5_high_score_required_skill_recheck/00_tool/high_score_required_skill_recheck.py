@@ -8,8 +8,10 @@
 
 import argparse
 import json
+import re
 import sys
 import time
+import unicodedata
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +20,7 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_execution_time
-from common.json_utils import append_jsonl, read_jsonl
+from common.json_utils import append_jsonl, read_jsonl, read_jsonl_as_list
 from common.llm_client import call_llm
 from common.logger import get_logger
 from common.skill_policy import AUTO_TRUE_RECHECK_REASON, is_auto_true_skill
@@ -65,6 +67,11 @@ VALID_CONFIDENCES = {"confirmed", "human_review", "not_confirmed"}
 STATUS_CONFIRMED = "required_skill_confirmed"
 STATUS_HUMAN_REVIEW = "required_skill_human_review"
 STATUS_NOT_CONFIRMED = "required_skill_not_confirmed"
+
+LEGACY_OR_OVERRIDE_SUFFIX = " / OR・例示条件の一部に根拠があるためconfirmed補正"
+EXPLICIT_OR_OVERRIDE_SUFFIX = (
+    " / 明示ORの他選択肢のみ未確認で、選択肢の直接根拠があるためconfirmed補正"
+)
 
 SYSTEM_PROMPT = """あなたはIT人材評価の専門家です。
 このstepは、07-1の判定を否定する目的ではなく、高スコア候補について必須スキル充足の確認粒度を上げる目的です。
@@ -333,18 +340,183 @@ def _apply_auto_true_override(checks: List[Dict[str, Any]]) -> int:
     return count
 
 
-def _is_or_or_example_skill(skill: str) -> bool:
-    return any(marker in skill for marker in ("または", "又は", "/", "／", "いずれか", "など", "等"))
+def _normalize_or_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+
+def _clean_or_option(value: str) -> str:
+    option = _normalize_or_text(value).strip(" \t\r\n()（）[]【】・-~〜")
+    option = re.sub(r"^(?:以下|次の|下記)", "", option)
+    option = re.split(
+        r"(?:を用いた|を利用した|として|における|に関する|のうち|の経験)",
+        option,
+        maxsplit=1,
+    )[0]
+    option = re.sub(r"の$", "", option).strip()
+    return option
+
+
+def _deduplicate_options(options: List[str]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for option in options:
+        cleaned = _clean_or_option(option)
+        key = cleaned.lower()
+        if len(cleaned) < 2 or key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+    return result
+
+
+def _last_or_atom(value: str) -> str:
+    value = _normalize_or_text(value).rstrip()
+    ascii_match = re.search(r"[A-Za-z][A-Za-z0-9+.#_-]*$", value)
+    if ascii_match:
+        return ascii_match.group(0)
+    return re.split(r"[、,。:：()（）\s]", value)[-1]
+
+
+def _first_or_atom(value: str) -> str:
+    value = _normalize_or_text(value).lstrip()
+    ascii_match = re.match(r"[A-Za-z][A-Za-z0-9+.#_-]*", value)
+    if ascii_match:
+        return ascii_match.group(0)
+    return re.split(
+        r"(?:を用いた|を利用した|として|における|に関する|の経験|[、,。:：()（）\s])",
+        value,
+        maxsplit=1,
+    )[0]
+
+
+def _extract_explicit_or_options(skill: str) -> List[str]:
+    """required skill自身に明示されたOR選択肢だけを返す。
+
+    slash単独はORとみなさない。「等/など」は、複数項目が読点で列挙された
+    例示構文に限って候補化する。
+    """
+    normalized = _normalize_or_text(skill)
+    options: List[str] = []
+
+    marker_match = re.search(r"いずれか(?:一つ|1つ)?|どちらか", normalized)
+    if marker_match:
+        prefix = normalized[: marker_match.start()].rstrip(" の")
+        fragment = re.split(r"[。:：\n]", prefix)[-1]
+        parts = re.split(r"[、,/／]", fragment)
+        if len(parts) >= 2:
+            options.extend(parts)
+
+    for marker_match in re.finditer(r"または|又は", normalized):
+        left = normalized[: marker_match.start()]
+        right = normalized[marker_match.end() :]
+        options.extend((_last_or_atom(left), _first_or_atom(right)))
+
+    example_match = re.search(r"(?:など|等)", normalized)
+    if example_match:
+        prefix = normalized[: example_match.start()]
+        open_positions = [prefix.rfind("("), prefix.rfind("（")]
+        open_pos = max(open_positions)
+        fragment = prefix[open_pos + 1 :] if open_pos >= 0 else re.split(r"[。:：\n]", prefix)[-1]
+        # 「A/B等」のようなslashだけの列挙は対象外。読点による複数例示を必須とする。
+        if "、" in fragment or "," in fragment:
+            parts = re.split(r"[、,]", fragment)
+            if len(parts) >= 2:
+                options.extend(parts)
+
+    return _deduplicate_options(options)
+
+
+def _option_variants(option: str) -> List[str]:
+    normalized = _normalize_or_text(option).replace(" ", "")
+    variants = [normalized]
+    for suffix in ("システム", "サービス", "プロダクト", "技術", "経験", "環境"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+            variants.append(normalized[: -len(suffix)])
+    return _deduplicate_options(variants)
+
+
+def _contains_option_term(text: str, option: str) -> bool:
+    normalized_text = _normalize_or_text(text).replace(" ", "").lower()
+    for variant in _option_variants(option):
+        term = variant.lower()
+        if re.fullmatch(r"[a-z0-9+.#_-]+", term):
+            if re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", normalized_text):
+                return True
+        elif term in normalized_text:
+            return True
+    return False
+
+
+def _has_experience_duration_requirement(skill: str) -> bool:
+    normalized = _normalize_or_text(skill)
+    return bool(
+        re.search(
+            r"(?:\d+(?:\.\d+)?\s*(?:年以上|年未満|年|ヶ月|か月|カ月)|[一二三四五六七八九十]+\s*年以上)",
+            normalized,
+        )
+    )
+
+
+def _reason_is_only_other_option_unmet(
+    reason: str,
+    options: List[str],
+    evidence_matched_indexes: List[int],
+) -> bool:
+    normalized = _normalize_or_text(reason)
+    if not any(marker in normalized for marker in ("不明", "不明確", "明確でない", "不足", "確認")):
+        return False
+    if any(
+        marker in normalized
+        for marker in (
+            "根拠なし",
+            "根拠がない",
+            "記載なし",
+            "記載がない",
+            "記載されていない",
+            "スキルシート欠",
+            "取得不可",
+            "LLM",
+            "エラー",
+            "年数",
+            "役割",
+            "職種",
+            "工程不足",
+        )
+    ):
+        return False
+
+    matched_set = set(evidence_matched_indexes)
+    if not any(_contains_option_term(normalized, options[i]) for i in matched_set):
+        return False
+
+    uncertainty_positions = [
+        normalized.find(marker)
+        for marker in ("不明", "不明確", "明確でない", "不足", "確認")
+        if marker in normalized
+    ]
+    uncertainty_clause = normalized[: min(uncertainty_positions) + 4]
+    clause_splits = list(
+        re.finditer(r"(?:あるが|あったが|だが)[、,]?|ものの|一方で|[、,]", uncertainty_clause)
+    )
+    if clause_splits:
+        uncertainty_clause = uncertainty_clause[clause_splits[-1].end() :]
+
+    # 未確認節にevidence側の選択肢も含まれるなら、役割・工程などOR以外の
+    # 本体条件が不足している可能性があるため補正しない。
+    if any(
+        _contains_option_term(uncertainty_clause, options[i]) for i in matched_set
+    ):
+        return False
+    return any(
+        _contains_option_term(uncertainty_clause, option)
+        for i, option in enumerate(options)
+        if i not in matched_set
+    )
 
 
 def _apply_or_example_override(checks: List[Dict[str, Any]]) -> int:
-    """OR/例示条件で根拠がある human_review を confirmed に寄せる。
-
-    LLMが「AWSはあるがOCI不明」「JavaはあるがKotlin不明」のように、
-    OR/例示条件の未経験側だけを理由に human_review としたケースを補正する。
-    """
+    """明示ORの別選択肢だけが未確認の場合に限りconfirmedへ補正する。"""
     count = 0
-    uncertainty_markers = ("不明", "不明確", "明確でない", "不足", "記載なし", "確認")
     for check in checks:
         if check.get("confidence") != "human_review":
             continue
@@ -353,15 +525,65 @@ def _apply_or_example_override(checks: List[Dict[str, Any]]) -> int:
         reason = str(check.get("reason") or "")
         if not evidence:
             continue
-        if not _is_or_or_example_skill(skill):
+        if _has_experience_duration_requirement(skill):
             continue
-        if not any(marker in reason for marker in uncertainty_markers):
+        options = _extract_explicit_or_options(skill)
+        if len(options) < 2:
+            continue
+        evidence_matched_indexes = [
+            i for i, option in enumerate(options) if _contains_option_term(evidence, option)
+        ]
+        if not evidence_matched_indexes:
+            continue
+        if not _reason_is_only_other_option_unmet(
+            reason, options, evidence_matched_indexes
+        ):
             continue
         check["confidence"] = "confirmed"
         check["recheck_match"] = True
-        check["reason"] = f"{reason} / OR・例示条件の一部に根拠があるためconfirmed補正"
+        check["reason"] = f"{reason}{EXPLICIT_OR_OVERRIDE_SUFFIX}"
         count += 1
     return count
+
+
+def _restore_pre_override_check(check: Dict[str, Any]) -> bool:
+    reason = str(check.get("reason") or "")
+    for suffix in (LEGACY_OR_OVERRIDE_SUFFIX, EXPLICIT_OR_OVERRIDE_SUFFIX):
+        if reason.endswith(suffix):
+            check["reason"] = reason[: -len(suffix)]
+            check["confidence"] = "human_review"
+            check["recheck_match"] = True
+            return True
+    return False
+
+
+def _replay_postprocessing_record(
+    record: Dict[str, Any],
+) -> Tuple[Dict[str, Any], int, int]:
+    """保存済みAI出力からOR補正だけを再計算する（LLM呼び出しなし）。"""
+    result = deepcopy(record)
+    checks = result.get("required_skill_checks")
+    if not isinstance(checks, list):
+        raise ValueError("required_skill_checksがlistでない")
+
+    restored_count = sum(1 for check in checks if _restore_pre_override_check(check))
+    override_count = _apply_or_example_override(checks)
+    status = _decide_recheck_status(checks)
+    recheck_info = result.get("recheck_info")
+    if not isinstance(recheck_info, dict):
+        raise ValueError("recheck_infoがdictでない")
+    recheck_info["recheck_status"] = status
+    recheck_info["required_skill_count"] = len(checks)
+    recheck_info["confirmed_count"] = sum(
+        1 for check in checks if check.get("confidence") == "confirmed"
+    )
+    recheck_info["human_review_count"] = sum(
+        1 for check in checks if check.get("confidence") == "human_review"
+    )
+    recheck_info["not_confirmed_count"] = sum(
+        1 for check in checks if check.get("confidence") == "not_confirmed"
+    )
+    return result, restored_count, override_count
 
 
 def _decide_recheck_status(checks: List[Dict[str, Any]]) -> str:
@@ -566,6 +788,51 @@ def _write_result(record: Dict[str, Any]) -> None:
         append_jsonl(str(OUTPUT_HUMAN_REVIEW), record)
 
 
+def _run_postprocessing_replay(
+    replay_source: Path,
+    logger: Any,
+    execution_time_dir: str,
+) -> None:
+    """保存済み08-5出力へOR補正だけを再適用し、分類出力を作り直す。"""
+    if not replay_source.exists():
+        raise FileNotFoundError(f"replay入力が見つかりません: {replay_source}")
+
+    # OUTPUT_ALL自身を入力にできるよう、初期化前に全件をメモリへ読み込む。
+    records = read_jsonl_as_list(str(replay_source))
+    replay_error_source = replay_source.parent / OUTPUT_ERROR.name
+    error_records = (
+        read_jsonl_as_list(str(replay_error_source))
+        if replay_error_source.exists()
+        else []
+    )
+    _init_output_files()
+    for error_record in error_records:
+        append_jsonl(str(OUTPUT_ERROR), error_record)
+
+    restored_total = 0
+    override_total = 0
+    start_time = time.time()
+    for record in records:
+        replayed, restored_count, override_count = _replay_postprocessing_record(record)
+        _write_result(replayed)
+        restored_total += restored_count
+        override_total += override_count
+
+    elapsed = time.time() - start_time
+    write_execution_time(
+        execution_time_dir,
+        "high_score_required_skill_recheck_postprocessing_replay",
+        elapsed,
+        len(records),
+    )
+    logger.info(
+        "post-processing replay完了: "
+        f"processed={len(records)} restored_old_overrides={restored_total} "
+        f"new_overrides={override_total} errors_preserved={len(error_records)} "
+        f"elapsed={elapsed:.1f}s"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="08-5 High Score Required Skill Recheck")
     parser.add_argument(
@@ -574,10 +841,28 @@ def main() -> None:
         default=None,
         help="処理件数上限（小規模テスト用）。省略時は全件処理",
     )
+    parser.add_argument(
+        "--postprocess-replay-from",
+        type=Path,
+        default=None,
+        help="既存08-5 all JSONLへOR補正だけを再適用（LLM呼び出しなし）",
+    )
     args = parser.parse_args()
 
     logger = get_logger(STEP_NAME)
     dirs = ensure_result_dirs(str(STEP_DIR))
+
+    if args.postprocess_replay_from is not None:
+        try:
+            _run_postprocessing_replay(
+                args.postprocess_replay_from,
+                logger,
+                str(dirs["execution_time"]),
+            )
+        except Exception as error:
+            logger.error(f"post-processing replay失敗: {error}")
+            sys.exit(1)
+        return
 
     for _, path in INPUT_SCORE_FILES:
         if not path.exists():
