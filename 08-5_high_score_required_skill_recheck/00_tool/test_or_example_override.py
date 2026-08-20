@@ -84,14 +84,24 @@ PRODUCTION_CASES = [
 
 class OrExampleOverrideTest(unittest.TestCase):
     def test_explicit_or_with_direct_evidence_can_override(self):
-        checks = [check(
-            "JavaまたはKotlinでの開発経験",
-            "Javaでの開発経験は明確だが、Kotlin経験は不明",
-            "Javaによる業務システム開発",
-        )]
-        self.assertEqual(target._apply_or_example_override(checks), 1)
-        self.assertEqual(checks[0]["confidence"], "confirmed")
-        self.assertTrue(checks[0]["reason"].endswith(target.EXPLICIT_OR_OVERRIDE_SUFFIX))
+        cases = [
+            check(
+                "JavaまたはKotlinでの開発経験",
+                "Javaでの開発経験は明確だが、Kotlin経験は不明",
+                "Javaによる業務システム開発",
+            ),
+            check(
+                "JavaとKotlinのどちらかの開発経験",
+                "Javaでの開発経験は明確だが、Kotlin経験は不明",
+                "Javaによる業務システム開発",
+            ),
+        ]
+        for fixture_check in cases:
+            with self.subTest(skill=fixture_check["skill"]):
+                checks = [fixture_check]
+                self.assertEqual(target._apply_or_example_override(checks), 1)
+                self.assertEqual(checks[0]["confidence"], "confirmed")
+                self.assertTrue(checks[0]["reason"].endswith(target.EXPLICIT_OR_OVERRIDE_SUFFIX))
 
     def test_production_cases_match_human_labels(self):
         counts = {"VALID": 0, "INVALID": 0, "AMBIGUOUS": 0}

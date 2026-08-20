@@ -403,6 +403,8 @@ def _extract_explicit_or_options(skill: str) -> List[str]:
         prefix = normalized[: marker_match.start()].rstrip(" の")
         fragment = re.split(r"[。:：\n]", prefix)[-1]
         parts = re.split(r"[、,/／]", fragment)
+        if len(parts) < 2 and marker_match.group(0) == "どちらか":
+            parts = re.split(r"と", fragment)
         if len(parts) >= 2:
             options.extend(parts)
 
