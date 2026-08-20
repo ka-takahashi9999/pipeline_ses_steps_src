@@ -98,6 +98,13 @@ def test_heading_and_url_on_same_line_remain_supported():
     assert cleaned == "後続本文"
 
 
+def test_sales_active_resource_list_phrase_is_high_confidence():
+    body = f"また、営業中の要員一覧 [{AUX_URL}]も合わせて確認ください。\n本人本文"
+    cleaned, _removed = cleanup.cleanup_body(body, RULES)
+    assert AUX_URL not in cleaned
+    assert cleaned == "本人本文"
+
+
 if __name__ == "__main__":
     tests = sorted(
         (name, value)

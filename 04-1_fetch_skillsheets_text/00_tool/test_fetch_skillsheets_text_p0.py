@@ -70,6 +70,42 @@ def test_auxiliary_html_anchor_is_not_eligible():
     assert candidates == []
 
 
+def test_negative_html_href_is_denied_from_body_and_html_sources():
+    mail = {
+        "body_text": f"営業中の要員一覧\n{AUX_SHEET}",
+        "attachments": [],
+        "html_links": [
+            {"text": "営業中の要員一覧", "href": AUX_SHEET, "source": "text/html"}
+        ],
+    }
+    candidates, html_urls, body_urls = fetch.build_url_candidates(
+        mail,
+        {"body_text": f"営業中の要員一覧\n{AUX_SHEET}"},
+    )
+    assert candidates == []
+    assert html_urls == []
+    assert body_urls == []
+
+
+def test_syusodo_structure_never_tries_or_adopts_negative_href():
+    mail = {
+        "body_text": (
+            f"また、営業中の要員一覧 [{AUX_SHEET}]も合わせて確認ください。\n"
+            "スキルシートなし"
+        ),
+        "attachments": [],
+        "html_links": [
+            {"text": "営業中の要員一覧", "href": AUX_SHEET, "source": "text/html"}
+        ],
+    }
+    result = fetch.fetch_skillsheet("synthetic", mail, {"body_text": mail["body_text"]})
+    assert result["success"] is False
+    assert result["skillsheet"] is None
+    assert result["source"] is None
+    assert result["urls"] is False
+    assert "tried_urls" not in result
+
+
 def test_ambiguous_html_anchor_is_not_eligible():
     mail = {"body_text": "", "html_links": [{"text": "こちら", "href": PERSONAL_DRIVE, "source": "text/html"}]}
     candidates, _html_urls, _body_urls = fetch.build_url_candidates(mail, {"body_text": ""})
@@ -106,6 +142,42 @@ def test_company_brochure_attachment_does_not_block_personal_url():
     attachment_extract.assert_not_called()
     assert result["success"] is True
     assert result["urls"] == PERSONAL_DRIVE
+
+
+def test_generic_reference_with_work_history_is_eligible_attachment():
+    assert fetch.is_eligible_attachment(
+        {"filename": "参考資料_山田_職務経歴書.pdf", "mime_type": "application/pdf"}
+    )
+
+
+def test_generic_supplement_with_skillsheet_is_eligible_attachment():
+    assert fetch.is_eligible_attachment(
+        {"filename": "補足資料_ABC_スキルシート.xlsx", "mime_type": "application/vnd.ms-excel"}
+    )
+
+
+def test_company_brochure_is_ineligible_attachment():
+    assert not fetch.is_eligible_attachment(
+        {"filename": "会社案内.pdf", "mime_type": "application/pdf"}
+    )
+
+
+def test_resource_list_is_ineligible_attachment():
+    assert not fetch.is_eligible_attachment(
+        {"filename": "要員一覧.xlsx", "mime_type": "application/vnd.ms-excel"}
+    )
+
+
+def test_resource_list_negative_wins_over_work_history_positive():
+    assert not fetch.is_eligible_attachment(
+        {"filename": "要員一覧_職務経歴書.xlsx", "mime_type": "application/vnd.ms-excel"}
+    )
+
+
+def test_certificate_is_ineligible_attachment():
+    assert not fetch.is_eligible_attachment(
+        {"filename": "資格証.pdf", "mime_type": "application/pdf"}
+    )
 
 
 def test_valid_attachment_wins_and_auxiliary_url_is_not_adopted():

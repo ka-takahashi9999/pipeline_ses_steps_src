@@ -146,6 +146,7 @@ HTML_LINK_NEGATIVE_KEYWORDS = (
     "要員一覧",
     "営業中人材",
     "営業中要員",
+    "営業中の要員一覧",
     "案件一覧",
     "その他の人材",
     "その他の要員",
@@ -154,11 +155,28 @@ HTML_LINK_NEGATIVE_KEYWORDS = (
     "共有人材",
 )
 
-NON_SKILLSHEET_ATTACHMENT_KEYWORDS = (
+ATTACHMENT_EXPLICIT_NEGATIVE_KEYWORDS = (
+    "人材一覧",
+    "要員一覧",
+    "案件一覧",
     "会社案内",
     "会社概要",
     "資格証",
+)
+
+ATTACHMENT_STRONG_POSITIVE_KEYWORDS = (
+    "スキルシート",
+    "職務経歴書",
+    "技術経歴書",
+    "経歴書",
+    "resume",
+    "curriculum vitae",
+)
+
+ATTACHMENT_GENERIC_NEGATIVE_KEYWORDS = (
     "参考資料",
+    "補足資料",
+    "その他資料",
 )
 
 # HTTP ダウンロード共通ヘッダー
@@ -686,10 +704,29 @@ def sort_urls_by_priority(urls: List[str], body_text: str = "") -> List[Tuple[st
 def is_skillsheet_link_text(text: str) -> bool:
     """HTML anchorがpositiveに一致し、negativeには一致しないか判定する。"""
     normalized = unicodedata.normalize("NFKC", text or "").casefold()
-    has_negative = any(keyword.casefold() in normalized for keyword in HTML_LINK_NEGATIVE_KEYWORDS)
-    if has_negative:
+    if is_auxiliary_link_text(normalized):
         return False
     return any(keyword.casefold() in normalized for keyword in URL_CONTEXT_POSITIVE_KEYWORDS)
+
+
+def is_auxiliary_link_text(text: str) -> bool:
+    """HTML anchor textがHIGH_CONFIDENCE auxiliary / negativeか判定する。"""
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    return any(keyword.casefold() in normalized for keyword in HTML_LINK_NEGATIVE_KEYWORDS)
+
+
+def extract_auxiliary_hrefs_from_html_links(
+    mail_record: Optional[Dict[str, Any]],
+) -> Set[str]:
+    """negative HTML anchorからsource横断deny対象hrefを抽出する。"""
+    auxiliary_hrefs: Set[str] = set()
+    for link in (mail_record or {}).get("html_links") or []:
+        if not isinstance(link, dict):
+            continue
+        href = (link.get("href") or "").strip()
+        if href and is_auxiliary_link_text(link.get("text", "") or ""):
+            auxiliary_hrefs.add(href)
+    return auxiliary_hrefs
 
 
 def extract_skillsheet_urls_from_html_links(
@@ -726,7 +763,9 @@ def build_url_candidates(
     raw_body_text = (mail_record or {}).get("body_text", "") or ""
     raw_body_urls = extract_urls_from_text(raw_body_text)
     removed_body_urls = set(raw_body_urls) - set(body_urls)
-    html_urls = extract_skillsheet_urls_from_html_links(mail_record, removed_body_urls)
+    auxiliary_hrefs = removed_body_urls | extract_auxiliary_hrefs_from_html_links(mail_record)
+    html_urls = extract_skillsheet_urls_from_html_links(mail_record, auxiliary_hrefs)
+    eligible_body_urls = [url for url in body_urls if url not in auxiliary_hrefs]
 
     ordered: List[Tuple[str, str]] = []
     seen: Set[str] = set()
@@ -736,26 +775,43 @@ def build_url_candidates(
         seen.add(url)
         ordered.append((url, classify_url_candidate(url)))
 
-    for url, category in sort_urls_by_priority(body_urls, body_text):
+    for url, category in sort_urls_by_priority(eligible_body_urls, body_text):
         if url in seen:
             continue
         seen.add(url)
         ordered.append((url, category))
 
-    return ordered, html_urls, body_urls
+    return ordered, html_urls, eligible_body_urls
 
 
 def is_eligible_attachment(attachment: Dict[str, Any]) -> bool:
     """現行対応形式のうち、明示的に無関係な添付をskillsheet候補外にする。"""
-    filename = unicodedata.normalize("NFKC", attachment.get("filename", "") or "")
-    if any(keyword in filename for keyword in NON_SKILLSHEET_ATTACHMENT_KEYWORDS):
-        return False
+    filename = unicodedata.normalize(
+        "NFKC", attachment.get("filename", "") or ""
+    ).casefold()
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime = (attachment.get("mime_type", "") or "").lower()
-    return ext in SKILLSHEET_EXTENSIONS or any(
+    is_supported = ext in SKILLSHEET_EXTENSIONS or any(
         keyword in mime
         for keyword in ("pdf", "excel", "word", "spreadsheet", "document", "officedocument")
     )
+    if not is_supported:
+        return False
+
+    if any(keyword.casefold() in filename for keyword in ATTACHMENT_EXPLICIT_NEGATIVE_KEYWORDS):
+        return False
+
+    has_strong_positive = any(
+        keyword.casefold() in filename
+        for keyword in ATTACHMENT_STRONG_POSITIVE_KEYWORDS
+    ) or re.search(r"(?<![a-z0-9])cv(?![a-z0-9])", filename) is not None
+    if has_strong_positive:
+        return True
+
+    if any(keyword.casefold() in filename for keyword in ATTACHMENT_GENERIC_NEGATIVE_KEYWORDS):
+        return False
+
+    return True
 
 
 def is_probable_file_url(url: str) -> bool:
