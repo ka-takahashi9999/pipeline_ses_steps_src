@@ -81,6 +81,8 @@ RETENTION_TARGETS: Tuple[Tuple[str, str, str], ...] = (
         r"^99_excluded_category_mismatch_sales_candidates_(\d{8})\.jsonl$",
     ),
     ("09-5_generate_sales_reply_draft", "file", r"^generate_sales_reply_draft_(\d{8})\.jsonl$"),
+    ("09-5_generate_sales_reply_draft", "file", r"^proposal_ready_(\d{8})\.jsonl$"),
+    ("09-5_generate_sales_reply_draft", "file", r"^human_review_(\d{8})\.jsonl$"),
     ("09-5_generate_sales_reply_draft", "dir", r"^reply_preview_(\d{8})$"),
 )
 

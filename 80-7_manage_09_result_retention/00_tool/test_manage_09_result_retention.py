@@ -205,6 +205,16 @@ class RetentionTestBase(unittest.TestCase):
                 "09-5_generate_sales_reply_draft",
                 f"generate_sales_reply_draft_{run_date}.jsonl",
             )
+            self._make_file(
+                root,
+                "09-5_generate_sales_reply_draft",
+                f"proposal_ready_{run_date}.jsonl",
+            )
+            self._make_file(
+                root,
+                "09-5_generate_sales_reply_draft",
+                f"human_review_{run_date}.jsonl",
+            )
             self._make_dir(root, "09-5_generate_sales_reply_draft", f"reply_preview_{run_date}")
 
         # HOLD対象の運用ログ
@@ -866,7 +876,7 @@ class TestStatusFailureDoesNotDelete(RetentionTestBase):
 class TestScanValidation(RetentionTestBase):
     def setUp(self):
         super().setUp()
-        self.root = self.build_fixture()
+        self.root = self.build_fixture(run_dates=ALL_RUN_DATES + ["20260817"])
         self.set_s3(status_objects([("20260814", "a", "SUCCEEDED", 0, {})]))
 
     def test_unknown_entry_fails_before_delete(self):
@@ -877,6 +887,37 @@ class TestScanValidation(RetentionTestBase):
             target.run(self.make_args(self.root, "20260817", apply_mode=True), self.logger)
         unknown.unlink()
         self.assertEqual(self.present_run_dates(self.root, "20260817"), before)
+
+    def test_09_5_new_and_existing_series_share_retention_contract(self):
+        current = "20260817"
+        previous = "20260814"
+        summary = target.run(self.make_args(self.root, current), self.logger)
+        artifacts, _holds = target.scan_artifacts(self.root, current, self.logger)
+        by_name = {artifact["path"].name: artifact for artifact in artifacts}
+
+        self.assertEqual(summary["keep_run_dates"], [previous, current])
+        for prefix in (
+            "proposal_ready",
+            "human_review",
+            "generate_sales_reply_draft",
+            "reply_preview",
+        ):
+            with self.subTest(prefix=prefix):
+                suffix = "" if prefix == "reply_preview" else ".jsonl"
+                self.assertIn(f"{prefix}_{current}{suffix}", by_name)
+                self.assertIn(f"{prefix}_{previous}{suffix}", by_name)
+                self.assertIn(f"{prefix}_20260813{suffix}", by_name)
+
+                classified = {
+                    artifact["run_date"]: (
+                        "KEEP" if artifact["run_date"] in summary["keep_run_dates"] else "DELETE"
+                    )
+                    for artifact in artifacts
+                    if artifact["path"].name.startswith(f"{prefix}_")
+                }
+                self.assertEqual(classified[current], "KEEP")
+                self.assertEqual(classified[previous], "KEEP")
+                self.assertEqual(classified["20260813"], "DELETE")
 
     def test_invalid_date_fails_before_delete(self):
         (
