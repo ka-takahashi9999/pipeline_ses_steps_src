@@ -4,7 +4,10 @@
 Step 01-3: 個別除外処理スクリプト
 
 複数要員メール・キャンペーンメール等を個別除外する。
-除外条件は 10_assistance_tool/exclude_list.txt で管理する。
+手動除外条件は 10_assistance_tool/exclude_list.txt で管理する。
+
+手動除外に該当しないメールだけ、SubjectからHIGH_CONFIDENCEに判定できる
+明示的な複数要員・複数案件・一覧そのものをdeterministicに除外する。
 
 除外リスト形式（1行につき）:
   from のみ    → そのアドレスからの全メールを除外
@@ -27,7 +30,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # common モジュールのパス解決
 _STEP_DIR = Path(__file__).resolve().parent.parent
@@ -53,10 +56,135 @@ EXCLUDE_LIST_PATH = str(_STEP_DIR / "10_assistance_tool" / "exclude_list.txt")
 OUTPUT_FILTERED = "remove_individual_emails_raw.jsonl"
 OUTPUT_REMOVED = "99_removed_individual_emails_raw.jsonl"
 
+RESOURCE_NOUN_PATTERN = r"(?:要員|人材|エンジニア|技術者|プロパー)"
+RESOURCE_COUNT_PATTERNS = (
+    re.compile(
+        rf"(?P<count>[0-9]+)名の{RESOURCE_NOUN_PATTERN}"
+        rf"|{RESOURCE_NOUN_PATTERN}(?:[ :])?(?P<count_after>[0-9]+)名"
+    ),
+    re.compile(r"(?P<count>[0-9]+)名で1人月"),
+)
+PROJECT_COUNT_PATTERNS = (
+    re.compile(r"案件(?P<count>[0-9]+)件"),
+    re.compile(r"(?P<count>[0-9]+)件の案件"),
+)
+
+RECRUITMENT_VETO_WORDS = (
+    "募集",
+    "募集枠",
+    "増員",
+    "必要人数",
+    "急募",
+    "求人",
+    "採用",
+)
+MANAGEMENT_VETO_WORDS = (
+    "マネジメント実績",
+    "管理実績",
+    "管理経験",
+    "マネジメント経験",
+)
+
+_LEADING_REPLY_PREFIX_RE = re.compile(r"^(?:re|fw|fwd)\s*:\s*", re.IGNORECASE)
+_LEADING_CATEGORY_TAG_RE = re.compile(r"^(?:【[^】]+】|\[[^\]]+\])\s*")
+_LIST_DATE_PATTERN = (
+    r"(?:(?:20[0-9]{2}[/-])?[0-9]{1,2}[/-][0-9]{1,2}"
+    r"|(?:20[0-9]{2}年)?[0-9]{1,2}月[0-9]{1,2}日)"
+)
+_LIST_AS_PRIMARY_RE = re.compile(
+    r"(?:弊社)?(?:営業中)?"
+    r"(?:要員一覧|要員リスト|要員共有|人材一覧|人材リスト|人材共有|"
+    r"案件一覧|案件リスト|案件・要員まとめ|案件/要員まとめ)"
+    r"(?:の送付|送付|の共有|共有|のご案内|ご案内|案内|更新)?"
+    rf"(?:\s*{_LIST_DATE_PATTERN})?"
+)
+
 
 def normalize(s: str) -> str:
     """比較用に正規化（NFKC + 小文字 + 前後空白除去）。"""
     return unicodedata.normalize("NFKC", s or "").strip().lower()
+
+
+def normalize_detector_subject(subject: str) -> str:
+    """P1 Subject判定用にNFKC正規化し、連続空白を1文字へ圧縮する。"""
+    normalized = unicodedata.normalize("NFKC", subject or "").strip().lower()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _match_count(match: re.Match) -> int:
+    """count/count_afterのうち一致したASCII数字をintで返す。"""
+    value = match.groupdict().get("count") or match.groupdict().get("count_after")
+    return int(value)
+
+
+def _has_explicit_multiple_resource(subject: str) -> bool:
+    """狭いSubject grammarで明示された複数要員提案だけを判定する。"""
+    if any(word in subject for word in RECRUITMENT_VETO_WORDS):
+        return False
+    if any(word in subject for word in MANAGEMENT_VETO_WORDS):
+        return False
+
+    for pattern in RESOURCE_COUNT_PATTERNS:
+        for match in pattern.finditer(subject):
+            if _match_count(match) < 2:
+                continue
+            if subject[match.end() :].startswith("規模"):
+                continue
+            return True
+    return False
+
+
+def _strip_list_leading_markers(subject: str) -> str:
+    """一覧判定時だけ、先頭に連続するreply prefix/category tagを除去する。"""
+    stripped = subject
+    while stripped:
+        reply_match = _LEADING_REPLY_PREFIX_RE.match(stripped)
+        if reply_match:
+            stripped = stripped[reply_match.end() :].strip()
+            continue
+
+        tag_match = _LEADING_CATEGORY_TAG_RE.match(stripped)
+        if tag_match:
+            stripped = stripped[tag_match.end() :].strip()
+            continue
+        break
+    return re.sub(r"\s+", " ", stripped)
+
+
+def _list_as_primary_reason(subject: str) -> Optional[str]:
+    """前処理後Subject全体が狭い一覧grammarへfullmatchした場合だけ理由を返す。"""
+    list_subject = _strip_list_leading_markers(subject)
+    if not _LIST_AS_PRIMARY_RE.fullmatch(list_subject):
+        return None
+    if "案件" in list_subject:
+        return "project_list_as_primary_subject"
+    return "resource_list_as_primary_subject"
+
+
+def _has_explicit_multiple_project(subject: str) -> bool:
+    """案件N件/N件の案件の2形式だけで明示的な複数案件を判定する。"""
+    for pattern in PROJECT_COUNT_PATTERNS:
+        for match in pattern.finditer(subject):
+            if _match_count(match) >= 2:
+                return True
+    return False
+
+
+def detect_p1_exclusion_reason(subject: str) -> Optional[str]:
+    """Subjectだけを使うconservativeなP1 detector。非該当(TYPE D)はNone。"""
+    normalized_subject = normalize_detector_subject(subject)
+
+    if _has_explicit_multiple_resource(normalized_subject):
+        return "multiple_resource_explicit_subject_count"
+
+    list_reason = _list_as_primary_reason(normalized_subject)
+    if list_reason:
+        return list_reason
+
+    if _has_explicit_multiple_project(normalized_subject):
+        return "multiple_project_explicit_subject_count"
+
+    return None
 
 
 def extract_email(s: str) -> str:
@@ -136,6 +264,17 @@ def is_excluded(
     return False
 
 
+def determine_exclusion_reason(
+    record: Dict,
+    from_only_set: Set[str],
+    from_subj_rules: List[Tuple[str, str]],
+) -> Optional[str]:
+    """manualを先に評価し、manual survivorだけをP1 detectorへ渡す。"""
+    if is_excluded(record, from_only_set, from_subj_rules):
+        return "manual_exclude_list"
+    return detect_p1_exclusion_reason(record.get("subject") or "")
+
+
 def main() -> None:
     dirs = ensure_result_dirs(str(_STEP_DIR))
     result_dir = str(dirs["result"])
@@ -143,6 +282,7 @@ def main() -> None:
     start_time = time.time()
     filtered_records: List[Dict] = []
     removed_records: List[Dict] = []
+    exclusion_reason_counts: Dict[str, int] = {}
 
     try:
         # 除外リスト読み込み
@@ -170,8 +310,14 @@ def main() -> None:
                 filtered_records.append({"message_id": mid})
                 continue
 
-            if is_excluded(master_rec, from_only_set, from_subj_rules):
+            exclusion_reason = determine_exclusion_reason(
+                master_rec, from_only_set, from_subj_rules
+            )
+            if exclusion_reason:
                 removed_records.append({"message_id": mid})
+                exclusion_reason_counts[exclusion_reason] = (
+                    exclusion_reason_counts.get(exclusion_reason, 0) + 1
+                )
             else:
                 filtered_records.append({"message_id": mid})
 
@@ -182,6 +328,7 @@ def main() -> None:
             f"個別除外: {input_count}件 → {len(filtered_records)}件 "
             f"（除外: {len(removed_records)}件）"
         )
+        logger.info(f"除外理由別件数: {exclusion_reason_counts}")
 
         # 出力①: 除外後 message_id
         out_filtered = str(dirs["result"] / OUTPUT_FILTERED)
