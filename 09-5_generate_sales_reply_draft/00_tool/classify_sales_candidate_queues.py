@@ -35,6 +35,7 @@ EXPLICIT_REVIEW_REASON_PATTERNS = (
     re.compile(r"要確認(?!済み|済)"),
     re.compile(r"確認(?:が)?必要"),
     re.compile(r"未確認(?!ではない|でない)"),
+    re.compile(r"限定的な不明"),
     re.compile(
         r"(?:^|[はが、。:：\s])不明"
         r"(?:$|[、。:：\s]|です|である|のため)"

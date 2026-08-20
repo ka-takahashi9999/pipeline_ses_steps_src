@@ -8,7 +8,10 @@ from pathlib import Path
 TOOL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOL_DIR))
 
-from classify_sales_candidate_queues import classify_candidate_pairs
+from classify_sales_candidate_queues import (
+    classify_candidate_pairs,
+    has_explicit_review_reason,
+)
 
 
 def candidate(project_id="project-1", resource_id="resource-1"):
@@ -131,13 +134,32 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
                     "matching_evidence_review_required", human[0]["review_reasons"]
                 )
 
+    def test_limited_unknown_is_explicit_review_reason_and_human_review(self):
+        for reason in (
+            "限定的な不明",
+            "一部条件は限定的な不明",
+        ):
+            with self.subTest(reason=reason):
+                self.assertTrue(has_explicit_review_reason(reason))
+                proposal, human = self.classify(rechecks=[recheck(reason=reason)])
+                self.assertEqual([], proposal)
+                self.assertFalse(human[0]["evidence_ready"])
+                self.assertIn(
+                    "matching_evidence_review_required", human[0]["review_reasons"]
+                )
+
     def test_positive_confirmation_phrase_is_not_review_reason(self):
         for reason in (
+            "確認済み",
+            "確認できた",
             "要件を確認済み",
             "スキルシートで確認できた",
             "不明点を確認済み",
+            "不明点は確認済み",
+            "不明点は解消済み",
         ):
             with self.subTest(reason=reason):
+                self.assertFalse(has_explicit_review_reason(reason))
                 proposal, human = self.classify(rechecks=[recheck(reason=reason)])
                 self.assertEqual(1, len(proposal))
                 self.assertEqual([], human)
