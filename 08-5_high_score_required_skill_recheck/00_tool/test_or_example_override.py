@@ -22,9 +22,9 @@ def check(skill, reason, evidence, original_match=False, confidence="human_revie
 
 
 # 20260819 productionで旧OR・例示補正がfalse→confirmedにした27 pair / 28 checks。
-# 人手確認結果（VALID=2 / INVALID=18 / AMBIGUOUS=7）を固定fixtureとして保持する。
+# 人手確認結果を固定fixtureとして保持する。旧VALIDのうち「等」例示は今回対象外。
 PRODUCTION_CASES = [
-    ("VALID", "1a017f765b3fe445", "1a01860b51df663c", [
+    ("EXAMPLE", "1a017f765b3fe445", "1a01860b51df663c", [
         check("複数システム間の連携(API、バッチ等)を考慮したシステム設計経験", "バッチ処理の刷新経験はあるが、API連携の具体的な記載が不足", "受注処理を時間起動バッチからイベントドリブンへ刷新")]),
     ("INVALID", "1a017ee0d09b85eb", "1a0175dd9787f10f", [
         check("IF(API連携等)の設計・構築経験", "API連携の具体的な設計・構築経験が不明", "AWS (EC2, S3, RDS, Lambda, IAM, ECS)")]),
@@ -86,14 +86,14 @@ class OrExampleOverrideTest(unittest.TestCase):
     def test_explicit_or_with_direct_evidence_can_override(self):
         cases = [
             check(
-                "JavaまたはKotlinでの開発経験",
-                "Javaでの開発経験は明確だが、Kotlin経験は不明",
-                "Javaによる業務システム開発",
+                "JavaまたはKotlin",
+                "Java経験はあるが、Kotlin経験は不明",
+                "Java経験",
             ),
             check(
-                "JavaとKotlinのどちらかの開発経験",
-                "Javaでの開発経験は明確だが、Kotlin経験は不明",
-                "Javaによる業務システム開発",
+                "JavaとKotlinのどちらかの経験",
+                "Java経験はあるが、Kotlin経験は不明",
+                "Java",
             ),
         ]
         for fixture_check in cases:
@@ -104,7 +104,7 @@ class OrExampleOverrideTest(unittest.TestCase):
                 self.assertTrue(checks[0]["reason"].endswith(target.EXPLICIT_OR_OVERRIDE_SUFFIX))
 
     def test_production_cases_match_human_labels(self):
-        counts = {"VALID": 0, "INVALID": 0, "AMBIGUOUS": 0}
+        counts = {"VALID": 0, "EXAMPLE": 0, "INVALID": 0, "AMBIGUOUS": 0}
         for label, project_id, resource_id, fixture_checks in PRODUCTION_CASES:
             counts[label] += 1
             with self.subTest(label=label, project=project_id, resource=resource_id):
@@ -114,7 +114,10 @@ class OrExampleOverrideTest(unittest.TestCase):
                 self.assertEqual(applied, expected)
                 expected_confidence = "confirmed" if label == "VALID" else "human_review"
                 self.assertTrue(all(item["confidence"] == expected_confidence for item in replay_checks))
-        self.assertEqual(counts, {"VALID": 2, "INVALID": 18, "AMBIGUOUS": 7})
+        self.assertEqual(
+            counts,
+            {"VALID": 1, "EXAMPLE": 1, "INVALID": 18, "AMBIGUOUS": 7},
+        )
 
     def test_slash_and_ambiguous_example_markers_never_suffice(self):
         cases = [
@@ -126,6 +129,8 @@ class OrExampleOverrideTest(unittest.TestCase):
             ("TCP/IPの基礎知識", "TCP経験はあるがIPは不明", "TCP"),
             ("AWS等クラウド設計", "AWS経験はあるが他は不明", "AWS設計"),
             ("AWSなどクラウド設計", "AWS経験はあるが他は不明", "AWS設計"),
+            ("Java、Kotlin等による詳細設計経験", "Java経験はあるがKotlinは不明", "Java"),
+            ("Java、Kotlinなどの経験", "Java経験はあるがKotlinは不明", "Java"),
         ]
         for skill, reason, evidence in cases:
             with self.subTest(skill=skill):
@@ -147,12 +152,12 @@ class OrExampleOverrideTest(unittest.TestCase):
                 self.assertEqual(target._apply_or_example_override(checks), 0)
                 self.assertEqual(checks[0]["confidence"], "human_review")
 
-    def test_shared_condition_requires_direct_evidence(self):
+    def test_shared_condition_always_blocks_override(self):
         blocked_cases = [
             check(
                 "PMまたはPLとして一貫担当した経験",
                 "PM経験はあるがPL経験は不明",
-                "PM補佐として進捗管理",
+                "PM補佐として要件定義からリリースまで担当",
             ),
             check(
                 "JavaまたはKotlinで詳細設計経験",
@@ -160,9 +165,14 @@ class OrExampleOverrideTest(unittest.TestCase):
                 "Java製造・単体テスト",
             ),
             check(
-                "Java、Kotlin等による詳細設計経験",
+                "JavaまたはKotlinで詳細設計経験",
                 "Java経験はあるがKotlin経験は不明",
-                "Java製造・単体テスト",
+                "詳細設計書を参照してJava製造",
+            ),
+            check(
+                "Java、Kotlin等による詳細設計経験",
+                "Java詳細設計経験はあるがKotlin経験は不明",
+                "Java詳細設計経験",
             ),
             check(
                 "JavaまたはKotlinで高度な顧客課題対応経験",
@@ -176,19 +186,11 @@ class OrExampleOverrideTest(unittest.TestCase):
                 self.assertEqual(target._apply_or_example_override(checks), 0)
                 self.assertEqual(checks[0]["confidence"], "human_review")
 
-        direct = [check(
-            "JavaまたはKotlinで詳細設計経験",
-            "Java詳細設計経験はあるがKotlin経験は不明",
-            "Java詳細設計を担当",
-        )]
-        self.assertEqual(target._apply_or_example_override(direct), 1)
-        self.assertEqual(direct[0]["confidence"], "confirmed")
-
     def test_category_mismatch_blocks_override(self):
         checks = [check(
-            "JavaまたはKotlinでの開発経験",
-            "Javaでの開発経験は明確だが、Kotlin経験は不明",
-            "Javaによる業務システム開発",
+            "JavaまたはKotlin",
+            "Java経験はあるが、Kotlin経験は不明",
+            "Java経験",
         )]
         self.assertEqual(
             target._apply_or_example_override(checks, category_match="mismatch"),

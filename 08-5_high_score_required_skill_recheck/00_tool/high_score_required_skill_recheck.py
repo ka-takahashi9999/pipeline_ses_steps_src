@@ -413,18 +413,6 @@ def _extract_explicit_or_options(skill: str) -> List[str]:
         right = normalized[marker_match.end() :]
         options.extend((_last_or_atom(left), _first_or_atom(right)))
 
-    example_match = re.search(r"(?:など|等)", normalized)
-    if example_match:
-        prefix = normalized[: example_match.start()]
-        open_positions = [prefix.rfind("("), prefix.rfind("（")]
-        open_pos = max(open_positions)
-        fragment = prefix[open_pos + 1 :] if open_pos >= 0 else re.split(r"[。:：\n]", prefix)[-1]
-        # 「A/B等」のようなslashだけの列挙は対象外。読点による複数例示を必須とする。
-        if "、" in fragment or "," in fragment:
-            parts = re.split(r"[、,]", fragment)
-            if len(parts) >= 2:
-                options.extend(parts)
-
     return _deduplicate_options(options)
 
 
@@ -474,86 +462,35 @@ def _extract_shared_condition_tail(skill: str) -> str:
     marker_match = re.search(r"いずれか(?:一つ|1つ)?|どちらか", normalized)
     if marker_match:
         return normalized[marker_match.end() :].strip()
-
-    marker_match = re.search(r"(?:など|等)", normalized)
-    if marker_match:
-        return normalized[marker_match.end() :].strip()
     return ""
 
 
-def _has_evidence_marker(evidence: str, markers: Tuple[str, ...]) -> bool:
-    normalized = _normalize_or_text(evidence)
-    return any(re.search(marker, normalized, re.IGNORECASE) for marker in markers)
-
-
-def _shared_condition_has_direct_evidence(skill: str, evidence: str) -> bool:
-    """OR共通条件を限定語彙で検証する。解釈不能な条件は安全側でFalse。"""
+def _has_only_generic_shared_condition(skill: str) -> bool:
+    """共有条件が無いか、選択肢自体の経験を表す定型suffixだけならTrue。"""
     tail = _extract_shared_condition_tail(skill)
     compact_tail = re.sub(r"[\s()（）・/／、,~〜\-]", "", tail)
     if not compact_tail:
-        return False
-    if re.fullmatch(r"(?:の)?(?:利用|使用)?経験", compact_tail):
-        # WMS等の「選択肢いずれかの経験」。選択肢のdirect evidenceを経験根拠とする。
         return True
+    return bool(re.fullmatch(r"(?:の)?(?:利用|使用)?経験", compact_tail))
 
-    recognized = False
-    specific_design = False
-    phase_conditions = (
-        ("要件定義", (r"要件定義",)),
-        ("基本設計", (r"基本設計", r"外部設計")),
-        ("詳細設計", (r"詳細設計", r"内部設計")),
-        ("運用設計", (r"運用設計",)),
-    )
-    for required_marker, evidence_markers in phase_conditions:
-        if required_marker not in tail:
-            continue
-        recognized = True
-        specific_design = True
-        if not _has_evidence_marker(evidence, evidence_markers):
-            return False
 
-    direct_conditions = (
-        ("構築", (r"構築", r"セットアップ", r"導入")),
-        ("保守", (r"保守", r"運用保守")),
-        ("開発", (r"開発", r"実装")),
-        ("リード", (r"リード", r"リーダー", r"主導")),
-        ("実務", (r"実務", r"業務で", r"案件で", r"プロジェクトで", r"担当")),
-        ("担当", (r"担当", r"主導")),
-    )
-    for required_marker, evidence_markers in direct_conditions:
-        if required_marker not in tail:
-            continue
-        recognized = True
-        if not _has_evidence_marker(evidence, evidence_markers):
-            return False
-
-    if "一貫" in tail:
-        recognized = True
-        if not _has_evidence_marker(
-            evidence,
-            (
-                r"一貫",
-                r"(?:企画|要件定義).{0,80}(?:リリース|本番|運用)",
-            ),
-        ):
-            return False
-
-    if "設計" in tail and not specific_design:
-        recognized = True
-        if not _has_evidence_marker(
-            evidence,
-            (
-                r"設計",
-                r"刷新",
-                r"アーキテクチャ",
-                r"方式(?:策定|設計|検討)",
-                r"構成(?:策定|設計|検討)",
-            ),
-        ):
-            return False
-
-    # allowlistで共有条件を説明できない場合はoverrideしない。
-    return recognized
+def _evidence_is_direct_option(evidence: str, option: str) -> bool:
+    """自由文を解釈せず、evidence全体が選択肢名の定型表現ならTrue。"""
+    normalized_evidence = re.sub(
+        r"\s+", "", _normalize_or_text(evidence)
+    ).strip("()（）[]【】・、,。:：")
+    for variant in _option_variants(option):
+        normalized_option = re.sub(
+            r"\s+", "", _normalize_or_text(variant)
+        ).lower()
+        allowed = {
+            normalized_option,
+            normalized_option + "経験",
+            normalized_option + "の経験",
+        }
+        if normalized_evidence.lower() in allowed:
+            return True
+    return False
 
 
 def _reason_is_only_other_option_unmet(
@@ -635,11 +572,11 @@ def _apply_or_example_override(
         if len(options) < 2:
             continue
         evidence_matched_indexes = [
-            i for i, option in enumerate(options) if _contains_option_term(evidence, option)
+            i for i, option in enumerate(options) if _evidence_is_direct_option(evidence, option)
         ]
         if not evidence_matched_indexes:
             continue
-        if not _shared_condition_has_direct_evidence(skill, evidence):
+        if not _has_only_generic_shared_condition(skill):
             continue
         if not _reason_is_only_other_option_unmet(
             reason, options, evidence_matched_indexes
