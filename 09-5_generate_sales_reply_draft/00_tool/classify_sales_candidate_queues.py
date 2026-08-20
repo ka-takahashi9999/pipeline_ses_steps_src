@@ -6,6 +6,7 @@ sales review状態から追加queueだけを生成する。
 """
 
 import argparse
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -28,6 +29,19 @@ DRAFT_TEMPLATE = "generate_sales_reply_draft_{date}.jsonl"
 PROPOSAL_READY_TEMPLATE = "proposal_ready_{date}.jsonl"
 HUMAN_REVIEW_TEMPLATE = "human_review_{date}.jsonl"
 EXPECTED_DIRECTIONS = {"reply_to_project", "reply_to_resource"}
+
+EXPLICIT_REVIEW_REASON_PATTERNS = (
+    re.compile(r"営業確認前提"),
+    re.compile(r"要確認(?!済み|済)"),
+    re.compile(r"確認(?:が)?必要"),
+    re.compile(r"未確認(?!ではない|でない)"),
+    re.compile(
+        r"(?:^|[はが、。:：\s])不明"
+        r"(?:$|[、。:：\s]|です|である|のため)"
+    ),
+    re.compile(r"根拠なし(?!ではない|でない)"),
+    re.compile(r"記載なし(?!ではない|でない)"),
+)
 
 PairKey = Tuple[str, str]
 
@@ -181,7 +195,37 @@ def _sales_status(drafts: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _review_reasons(matching: Dict[str, Any], sales: Dict[str, Any]) -> List[str]:
+def has_explicit_review_reason(reason: Any) -> bool:
+    """営業・人手確認が必要と明示する狭いphraseだけを検出する。"""
+    normalized_reason = normalize_text(reason)
+    return any(pattern.search(normalized_reason) for pattern in EXPLICIT_REVIEW_REASON_PATTERNS)
+
+
+def _evidence_status(checks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """全required skillが非空evidenceかつ明示review理由なしであるか判定する。"""
+    empty_evidence_count = sum(not normalize_text(check.get("evidence")) for check in checks)
+    review_required_count = sum(
+        has_explicit_review_reason(check.get("reason")) for check in checks
+    )
+    all_confirmed = bool(checks) and all(
+        normalize_text(check.get("confidence")) == "confirmed" for check in checks
+    )
+    return {
+        "evidence_ready": (
+            all_confirmed
+            and empty_evidence_count == 0
+            and review_required_count == 0
+        ),
+        "empty_evidence_count": empty_evidence_count,
+        "review_required_count": review_required_count,
+    }
+
+
+def _review_reasons(
+    matching: Dict[str, Any],
+    sales: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> List[str]:
     reasons: List[str] = []
     status = matching["required_skill_recheck_status"]
     category_match = matching["category_match"]
@@ -199,6 +243,10 @@ def _review_reasons(matching: Dict[str, Any], sales: Dict[str, Any]) -> List[str
         reasons.append("draft_missing")
     if sales["needs_human_review"] or any(sales["review_notes_by_direction"].values()):
         reasons.append("sales_review_required")
+    if evidence["empty_evidence_count"]:
+        reasons.append("matching_evidence_empty")
+    if evidence["review_required_count"]:
+        reasons.append("matching_evidence_review_required")
     return reasons
 
 
@@ -230,7 +278,12 @@ def classify_candidate_pairs(
                 f"08-5 not_confirmedが09-4候補に混入しています: {key[0]} / {key[1]}"
             )
         sales = _sales_status(draft_groups.get(key, []))
-        is_proposal_ready = matching["matching_strict"] and sales["sales_ready"]
+        evidence = _evidence_status(matching["required_skill_checks"])
+        is_proposal_ready = (
+            matching["matching_strict"]
+            and sales["sales_ready"]
+            and evidence["evidence_ready"]
+        )
         queue = "proposal_ready" if is_proposal_ready else "human_review"
         output_record = {
             "project_message_id": key[0],
@@ -240,6 +293,7 @@ def classify_candidate_pairs(
             "queue": queue,
             "matching_strict": matching["matching_strict"],
             "sales_ready": sales["sales_ready"],
+            "evidence_ready": evidence["evidence_ready"],
             "required_skill_recheck_status": matching["required_skill_recheck_status"],
             "required_skill_recheck_info": matching["required_skill_recheck_info"],
             "required_skill_checks": matching["required_skill_checks"],
@@ -252,7 +306,11 @@ def classify_candidate_pairs(
                 if key_name not in {"sales_ready", "draft_refs"}
             },
             "draft_refs": sales["draft_refs"],
-            "review_reasons": [] if is_proposal_ready else _review_reasons(matching, sales),
+            "review_reasons": (
+                []
+                if is_proposal_ready
+                else _review_reasons(matching, sales, evidence)
+            ),
         }
         if is_proposal_ready:
             proposal_ready.append(output_record)
@@ -286,6 +344,7 @@ def generate_candidate_queues(date_part: str) -> Dict[str, int]:
         "final_candidates": len(candidates),
         "matching_strict": sum(record["matching_strict"] for record in proposal_ready + human_review),
         "sales_ready": sum(record["sales_ready"] for record in proposal_ready + human_review),
+        "evidence_ready": sum(record["evidence_ready"] for record in proposal_ready + human_review),
         "proposal_ready": len(proposal_ready),
         "human_review": len(human_review),
     }
@@ -307,6 +366,7 @@ def main() -> None:
             f"final={summary['final_candidates']} "
             f"matching_strict={summary['matching_strict']} "
             f"sales_ready={summary['sales_ready']} "
+            f"evidence_ready={summary['evidence_ready']} "
             f"proposal_ready={summary['proposal_ready']} "
             f"human_review={summary['human_review']}"
         )

@@ -26,6 +26,9 @@ def recheck(
     status="required_skill_confirmed",
     confidence="confirmed",
     category_match="match",
+    evidence="Java",
+    reason="fixture",
+    original_match=True,
 ):
     confirmed = 1 if confidence == "confirmed" else 0
     human_review = 1 if confidence == "human_review" else 0
@@ -44,8 +47,9 @@ def recheck(
             {
                 "skill": "JavaまたはKotlin",
                 "confidence": confidence,
-                "reason": "fixture",
-                "evidence": "Java",
+                "reason": reason,
+                "evidence": evidence,
+                "original_match": original_match,
             }
         ],
         "category_match": category_match,
@@ -90,6 +94,84 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertEqual([], human)
         self.assertTrue(proposal[0]["matching_strict"])
         self.assertTrue(proposal[0]["sales_ready"])
+        self.assertTrue(proposal[0]["evidence_ready"])
+
+    def test_empty_string_evidence_is_human_review(self):
+        proposal, human = self.classify(rechecks=[recheck(evidence="")])
+        self.assertEqual([], proposal)
+        self.assertFalse(human[0]["evidence_ready"])
+        self.assertIn("matching_evidence_empty", human[0]["review_reasons"])
+
+    def test_null_evidence_is_human_review(self):
+        proposal, human = self.classify(rechecks=[recheck(evidence=None)])
+        self.assertEqual([], proposal)
+        self.assertIn("matching_evidence_empty", human[0]["review_reasons"])
+
+    def test_whitespace_evidence_is_human_review(self):
+        proposal, human = self.classify(rechecks=[recheck(evidence="   ")])
+        self.assertEqual([], proposal)
+        self.assertIn("matching_evidence_empty", human[0]["review_reasons"])
+
+    def test_explicit_review_reason_is_human_review(self):
+        for reason in (
+            "営業確認前提",
+            "要確認",
+            "確認必要",
+            "確認が必要",
+            "未確認",
+            "不明",
+            "根拠なし",
+            "記載なし",
+        ):
+            with self.subTest(reason=reason):
+                proposal, human = self.classify(rechecks=[recheck(reason=reason)])
+                self.assertEqual([], proposal)
+                self.assertFalse(human[0]["evidence_ready"])
+                self.assertIn(
+                    "matching_evidence_review_required", human[0]["review_reasons"]
+                )
+
+    def test_positive_confirmation_phrase_is_not_review_reason(self):
+        for reason in (
+            "要件を確認済み",
+            "スキルシートで確認できた",
+            "不明点を確認済み",
+        ):
+            with self.subTest(reason=reason):
+                proposal, human = self.classify(rechecks=[recheck(reason=reason)])
+                self.assertEqual(1, len(proposal))
+                self.assertEqual([], human)
+
+    def test_one_empty_check_makes_pair_human_review(self):
+        record = recheck()
+        record["required_skill_checks"].append(
+            {
+                "skill": "AWS",
+                "confidence": "confirmed",
+                "reason": "fixture",
+                "evidence": " ",
+                "original_match": True,
+            }
+        )
+        record["recheck_info"].update(
+            {"required_skill_count": 2, "confirmed_count": 2}
+        )
+        proposal, human = self.classify(rechecks=[record])
+        self.assertEqual([], proposal)
+        self.assertIn("matching_evidence_empty", human[0]["review_reasons"])
+
+    def test_original_match_false_with_strong_evidence_stays_proposal_ready(self):
+        proposal, human = self.classify(
+            rechecks=[
+                recheck(
+                    original_match=False,
+                    evidence="Javaで詳細設計を5年間担当",
+                    reason="Javaの詳細設計経験を確認できた",
+                )
+            ]
+        )
+        self.assertEqual(1, len(proposal))
+        self.assertEqual([], human)
 
     def test_category_unclear_is_human_review(self):
         proposal, human = self.classify(rechecks=[recheck(category_match="unclear")])
@@ -166,10 +248,12 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertIn("draft_missing", human[0]["review_reasons"])
 
     def test_canonical_draft_records_are_not_modified(self):
+        candidates = [candidate()]
         drafts = both_drafts()
-        before = copy.deepcopy(drafts)
-        self.classify(drafts=drafts)
-        self.assertEqual(before, drafts)
+        rechecks = [recheck()]
+        before = copy.deepcopy((candidates, drafts, rechecks))
+        self.classify(candidates=candidates, drafts=drafts, rechecks=rechecks)
+        self.assertEqual(before, (candidates, drafts, rechecks))
 
 
 if __name__ == "__main__":
