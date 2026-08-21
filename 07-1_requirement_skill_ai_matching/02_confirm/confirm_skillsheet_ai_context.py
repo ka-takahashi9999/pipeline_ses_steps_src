@@ -143,8 +143,17 @@ def main() -> None:
     )
     after_08 = sum(len(_truncate_08(context_map.get(mid, ""))) for mid in ids_08)
 
-    fallback_07 = sum(1 for mid in ids_07 if fallback_map.get(mid, False))
-    fallback_08 = sum(1 for mid in ids_08 if fallback_map.get(mid, False))
+    def is_runtime_fallback(message_id: str) -> bool:
+        record = normalized_map.get(message_id)
+        return bool(
+            record
+            and record.get("success") is True
+            and str(record.get("skillsheet") or "").strip()
+            and fallback_map.get(message_id, False)
+        )
+
+    fallback_07 = sum(1 for mid in ids_07 if is_runtime_fallback(mid))
+    fallback_08 = sum(1 for mid in ids_08 if is_runtime_fallback(mid))
 
     source_backed = 0
     retained_valid = 0
