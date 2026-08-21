@@ -39,6 +39,9 @@ def recheck(
     evidence="Java",
     reason="fixture",
     original_match=True,
+    required_score=1.0,
+    total_score=2.0,
+    skillsheet_chars=100,
 ):
     confirmed = 1 if confidence == "confirmed" else 0
     human_review = 1 if confidence == "human_review" else 0
@@ -52,6 +55,7 @@ def recheck(
             "confirmed_count": confirmed,
             "human_review_count": human_review,
             "not_confirmed_count": not_confirmed,
+            "skillsheet_chars_used": skillsheet_chars,
         },
         "required_skill_checks": [
             {
@@ -64,6 +68,10 @@ def recheck(
         ],
         "category_match": category_match,
         "category_note": "fixture",
+        "match_info": {
+            "required_skills_match_rate": required_score,
+            "total_skills_match_rate": total_score,
+        },
     }
 
 
@@ -89,6 +97,62 @@ def both_drafts():
     return [draft("reply_to_project"), draft("reply_to_resource")]
 
 
+def priority_recheck(
+    project_id,
+    resource_id,
+    confirmed_count=0,
+    required_score=1.0,
+    total_score=2.0,
+):
+    record = recheck(
+        project_id=project_id,
+        resource_id=resource_id,
+        status="required_skill_human_review",
+        confidence="human_review",
+        required_score=required_score,
+        total_score=total_score,
+    )
+    confirmed_checks = [
+        {
+            "skill": f"confirmed-{index}",
+            "confidence": "confirmed",
+            "reason": "確認済み",
+            "evidence": "evidence",
+            "original_match": True,
+        }
+        for index in range(confirmed_count)
+    ]
+    record["required_skill_checks"] = confirmed_checks + record["required_skill_checks"]
+    record["recheck_info"].update(
+        {
+            "required_skill_count": confirmed_count + 1,
+            "confirmed_count": confirmed_count,
+            "human_review_count": 1,
+        }
+    )
+    return record
+
+
+def pair_drafts(project_id, resource_id, notes=None):
+    needs_review = bool(notes)
+    return [
+        draft(
+            "reply_to_project",
+            needs_review,
+            notes,
+            project_id=project_id,
+            resource_id=resource_id,
+        ),
+        draft(
+            "reply_to_resource",
+            needs_review,
+            notes,
+            project_id=project_id,
+            resource_id=resource_id,
+        ),
+    ]
+
+
 class SalesCandidateQueueClassifierTest(unittest.TestCase):
     def classify(self, candidates=None, drafts=None, rechecks=None, errors=None):
         return classify_candidate_pairs(
@@ -105,12 +169,71 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertTrue(proposal[0]["matching_strict"])
         self.assertTrue(proposal[0]["sales_ready"])
         self.assertTrue(proposal[0]["evidence_ready"])
+        self.assertNotIn("review_priority", proposal[0])
+        self.assertNotIn("normalized_review_items", proposal[0])
+
+    def test_generic_sales_reason_from_required_skill_is_one_normalized_item(self):
+        drafts = pair_drafts(
+            "project-1",
+            "resource-1",
+            ["必須スキルに人間確認項目があります"],
+        )
+        proposal, human = self.classify(
+            drafts=drafts,
+            rechecks=[
+                recheck(
+                    status="required_skill_human_review",
+                    confidence="human_review",
+                )
+            ],
+        )
+        self.assertEqual([], proposal)
+        self.assertEqual(1, human[0]["normalized_review_item_count"])
+        self.assertEqual(["technology_semantic"], human[0]["normalized_review_items"])
+
+    def test_all_high_conditions_make_high_priority(self):
+        proposal, human = self.classify(
+            rechecks=[
+                recheck(
+                    status="required_skill_human_review",
+                    confidence="human_review",
+                    required_score=0.8,
+                )
+            ]
+        )
+        self.assertEqual([], proposal)
+        self.assertEqual("HIGH", human[0]["review_priority"])
+        self.assertEqual(1, human[0]["high_project_rank"])
+        self.assertTrue(human[0]["initial_review"])
+
+    def test_two_normalized_items_make_other_priority(self):
+        drafts = pair_drafts(
+            "project-1",
+            "resource-1",
+            [
+                "必須スキルに人間確認項目があります",
+                "案件本文に開始時期シグナルがありますがproject_start_dateを抽出できませんでした",
+            ],
+        )
+        proposal, human = self.classify(
+            drafts=drafts,
+            rechecks=[
+                recheck(
+                    status="required_skill_human_review",
+                    confidence="human_review",
+                )
+            ],
+        )
+        self.assertEqual([], proposal)
+        self.assertEqual(2, human[0]["normalized_review_item_count"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
 
     def test_empty_string_evidence_is_human_review(self):
         proposal, human = self.classify(rechecks=[recheck(evidence="")])
         self.assertEqual([], proposal)
         self.assertFalse(human[0]["evidence_ready"])
         self.assertIn("matching_evidence_empty", human[0]["review_reasons"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
 
     def test_null_evidence_is_human_review(self):
         proposal, human = self.classify(rechecks=[recheck(evidence=None)])
@@ -206,6 +329,7 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         proposal, human = self.classify(rechecks=[recheck(category_match="unclear")])
         self.assertEqual([], proposal)
         self.assertIn("category_unclear", human[0]["review_reasons"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
 
     def test_08_5_human_review_is_human_review(self):
         proposal, human = self.classify(
@@ -219,6 +343,21 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertEqual([], proposal)
         self.assertTrue(human[0]["has_08_5_error"])
         self.assertIn("08_5_error", human[0]["review_reasons"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
+
+    def test_missing_skillsheet_is_other_priority(self):
+        proposal, human = self.classify(
+            rechecks=[
+                recheck(
+                    status="required_skill_human_review",
+                    confidence="human_review",
+                    skillsheet_chars=0,
+                )
+            ]
+        )
+        self.assertEqual([], proposal)
+        self.assertIn("skillsheet", human[0]["normalized_review_items"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
 
     def test_one_direction_review_required_is_pair_human_review(self):
         drafts = [draft("reply_to_project", True, ["返信先を確認"]), draft("reply_to_resource")]
@@ -235,6 +374,7 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         proposal, human = self.classify(drafts=[draft("reply_to_project")])
         self.assertEqual([], proposal)
         self.assertIn("draft_missing", human[0]["review_reasons"])
+        self.assertEqual("OTHER", human[0]["review_priority"])
 
     def test_partition_has_no_duplicate_and_union_is_complete(self):
         candidates = [candidate("p-1", "r-1"), candidate("p-2", "r-2")]
@@ -276,6 +416,56 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertEqual([], proposal)
         self.assertIn("draft_missing", human[0]["review_reasons"])
 
+    def test_high_ranking_uses_confirmed_rate_then_required_and_total_score(self):
+        project_id = "project-ranking"
+        resources = ["resource-rate", "resource-required", "resource-total"]
+        candidates = [candidate(project_id, resource_id) for resource_id in resources]
+        rechecks = [
+            priority_recheck(project_id, "resource-rate", 3, 0.8, 1.0),
+            priority_recheck(project_id, "resource-required", 1, 1.0, 1.0),
+            priority_recheck(project_id, "resource-total", 1, 0.8, 2.0),
+        ]
+        drafts = [
+            row
+            for resource_id in resources
+            for row in pair_drafts(project_id, resource_id)
+        ]
+        proposal, human = self.classify(candidates, drafts, rechecks)
+        ranks = {row["resource_message_id"]: row["high_project_rank"] for row in human}
+        self.assertEqual([], proposal)
+        self.assertEqual(
+            {"resource-rate": 1, "resource-required": 2, "resource-total": 3},
+            ranks,
+        )
+
+    def test_high_ranking_tie_is_stable_by_resource_message_id(self):
+        project_id = "project-tie"
+        resources = ["resource-c", "resource-a", "resource-b"]
+        candidates = [candidate(project_id, resource_id) for resource_id in resources]
+        rechecks = [priority_recheck(project_id, resource_id) for resource_id in resources]
+        drafts = [
+            row
+            for resource_id in resources
+            for row in pair_drafts(project_id, resource_id)
+        ]
+        _, human = self.classify(candidates, drafts, rechecks)
+        ordered = sorted(human, key=lambda row: row["high_project_rank"])
+        self.assertEqual(sorted(resources), [row["resource_message_id"] for row in ordered])
+
+    def test_five_high_candidates_rank_all_and_initial_review_only_top_three(self):
+        project_id = "project-five"
+        resources = [f"resource-{index}" for index in range(5, 0, -1)]
+        candidates = [candidate(project_id, resource_id) for resource_id in resources]
+        rechecks = [priority_recheck(project_id, resource_id) for resource_id in resources]
+        drafts = [
+            row
+            for resource_id in resources
+            for row in pair_drafts(project_id, resource_id)
+        ]
+        _, human = self.classify(candidates, drafts, rechecks)
+        self.assertEqual([1, 2, 3, 4, 5], sorted(row["high_project_rank"] for row in human))
+        self.assertEqual(3, sum(row["initial_review"] for row in human))
+
     def test_canonical_draft_records_are_not_modified(self):
         candidates = [candidate()]
         drafts = both_drafts()
@@ -300,6 +490,13 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertEqual([], proposal)
         self.assertTrue(human[0]["previous_candidate"])
         self.assertEqual("20260819", human[0]["previous_candidate_date"])
+
+    def test_success_cache_marker_pair_file_name_is_preserved(self):
+        marked = candidate()
+        marked["pair_file_name"] = "pair_前回出力済.json"
+        proposal, human = self.classify(candidates=[marked])
+        self.assertEqual([], human)
+        self.assertEqual("pair_前回出力済.json", proposal[0]["pair_file_name"])
 
 
 if __name__ == "__main__":

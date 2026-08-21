@@ -34,6 +34,9 @@ DRAFT_TEMPLATE = "generate_sales_reply_draft_{date}.jsonl"
 PROPOSAL_READY_TEMPLATE = "proposal_ready_{date}.jsonl"
 HUMAN_REVIEW_TEMPLATE = "human_review_{date}.jsonl"
 EXPECTED_DIRECTIONS = {"reply_to_project", "reply_to_resource"}
+REVIEW_PRIORITY_HIGH = "HIGH"
+REVIEW_PRIORITY_OTHER = "OTHER"
+REQUIRED_SKILL_REVIEW_NOTE = "必須スキルに人間確認項目があります"
 
 EXPLICIT_REVIEW_REASON_PATTERNS = (
     re.compile(r"営業確認前提"),
@@ -256,6 +259,148 @@ def _review_reasons(
     return reasons
 
 
+def _required_skill_item_type(check: Dict[str, Any]) -> str:
+    """08-5の原子的なrequired skill確認1件を営業向けの短い分類へ寄せる。"""
+    text = f"{normalize_text(check.get('skill'))} {normalize_text(check.get('reason'))}"
+    if re.search(r"\d+\s*年|年以上|年程度|経験年数", text):
+        return "years"
+    if re.search(r"(?:^|[^A-Za-z])(?:PL|PM|PMO|TL)(?:[^A-Za-z]|$)|リーダ|マネジメント|管理経験|顧客(?:折衝|調整)", text, re.IGNORECASE):
+        return "role"
+    if re.search(r"要件定義|基本設計|詳細設計|構築|製造|実装|テスト設計|テスト実施|保守|運用", text):
+        return "phase"
+    return "technology_semantic"
+
+
+def _sales_note_item_type(note: str) -> str:
+    if "開始" in note or "稼働" in note:
+        return "start_timing"
+    if "精算" in note or "契約" in note:
+        return "work_terms"
+    if "最寄駅" in note or "勤務地" in note or "場所" in note:
+        return "location"
+    if "単価" in note or "価格" in note:
+        return "price"
+    if any(token in note for token in ("返信先", "TO候補", "CC候補", "宛先")):
+        return "sales_recipient"
+    return "sales_field"
+
+
+def _normalized_review_items(
+    matching: Dict[str, Any],
+    sales: Dict[str, Any],
+) -> List[str]:
+    """raw reasonを維持したまま、同一原因の派生noteだけを除いた確認項目を返す。"""
+    items: List[str] = []
+    required_skill_items: List[str] = []
+    for check in matching["required_skill_checks"]:
+        confidence = normalize_text(check.get("confidence"))
+        if (
+            confidence != "confirmed"
+            or not normalize_text(check.get("evidence"))
+        ):
+            required_skill_items.append(_required_skill_item_type(check))
+    items.extend(required_skill_items)
+
+    if matching["category_match"] != "match":
+        items.append("category")
+    if matching["has_08_5_error"]:
+        items.append("error")
+    skillsheet_chars = matching["required_skill_recheck_info"].get("skillsheet_chars_used")
+    if (
+        not isinstance(skillsheet_chars, int)
+        or isinstance(skillsheet_chars, bool)
+        or skillsheet_chars <= 0
+    ):
+        items.append("skillsheet")
+    if not sales["both_directions_present"] or not sales["all_drafts_generated"]:
+        items.append("sales_field")
+
+    seen_notes: Set[str] = set()
+    for direction in sorted(sales["review_notes_by_direction"]):
+        for note in sales["review_notes_by_direction"][direction]:
+            if note in seen_notes:
+                continue
+            seen_notes.add(note)
+            if note == REQUIRED_SKILL_REVIEW_NOTE and required_skill_items:
+                continue
+            items.append(_sales_note_item_type(note))
+    return items
+
+
+def _numeric_score(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _is_high_priority(
+    record: Dict[str, Any],
+    match_info: Dict[str, Any],
+) -> bool:
+    recheck_info = record["required_skill_recheck_info"]
+    required_score = _numeric_score(match_info.get("required_skills_match_rate"))
+    skillsheet_chars = recheck_info.get("skillsheet_chars_used")
+    checks = record["required_skill_checks"]
+    return (
+        record["normalized_review_item_count"] == 1
+        and required_score is not None
+        and required_score >= 0.8
+        and record["category_match"] == "match"
+        and record["has_08_5_error"] is False
+        and isinstance(skillsheet_chars, int)
+        and not isinstance(skillsheet_chars, bool)
+        and skillsheet_chars > 0
+        and bool(checks)
+        and all(normalize_text(check.get("evidence")) for check in checks)
+        and record["sales_status"]["both_directions_present"] is True
+        and record["sales_status"]["all_drafts_generated"] is True
+    )
+
+
+def _confirmed_required_skill_rate(record: Dict[str, Any]) -> float:
+    info = record["required_skill_recheck_info"]
+    required_count = info.get("required_skill_count")
+    confirmed_count = info.get("confirmed_count")
+    if (
+        not isinstance(required_count, int)
+        or isinstance(required_count, bool)
+        or required_count <= 0
+        or not isinstance(confirmed_count, int)
+        or isinstance(confirmed_count, bool)
+    ):
+        return -1.0
+    return confirmed_count / required_count
+
+
+def _apply_human_review_priority(
+    records: List[Dict[str, Any]],
+    match_info_by_pair: Dict[PairKey, Dict[str, Any]],
+) -> None:
+    high_by_project: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        info = match_info_by_pair.get(pair_key(record), {})
+        if _is_high_priority(record, info):
+            record["review_priority"] = REVIEW_PRIORITY_HIGH
+            high_by_project[record["project_message_id"]].append(record)
+        else:
+            record["review_priority"] = REVIEW_PRIORITY_OTHER
+        record["high_project_rank"] = 0
+        record["initial_review"] = False
+
+    for project_records in high_by_project.values():
+        project_records.sort(
+            key=lambda record: (
+                -_confirmed_required_skill_rate(record),
+                -(_numeric_score(match_info_by_pair[pair_key(record)].get("required_skills_match_rate")) or 0.0),
+                -(_numeric_score(match_info_by_pair[pair_key(record)].get("total_skills_match_rate")) or 0.0),
+                record["resource_message_id"],
+            )
+        )
+        for rank, record in enumerate(project_records, 1):
+            record["high_project_rank"] = rank
+            record["initial_review"] = rank <= 3
+
+
 def classify_candidate_pairs(
     candidate_records: List[Dict[str, Any]],
     draft_records: List[Dict[str, Any]],
@@ -276,6 +421,7 @@ def classify_candidate_pairs(
 
     proposal_ready: List[Dict[str, Any]] = []
     human_review: List[Dict[str, Any]] = []
+    match_info_by_pair: Dict[PairKey, Dict[str, Any]] = {}
     for key, candidate in candidate_index.items():
         recheck = recheck_index.get(key)
         matching = _matching_status(recheck, key in error_keys)
@@ -285,6 +431,8 @@ def classify_candidate_pairs(
             )
         sales = _sales_status(draft_groups.get(key, []))
         evidence = _evidence_status(matching["required_skill_checks"])
+        match_info = (recheck or {}).get("match_info") or {}
+        match_info_by_pair[key] = match_info
         is_proposal_ready = (
             matching["matching_strict"]
             and sales["sales_ready"]
@@ -325,8 +473,16 @@ def classify_candidate_pairs(
         if is_proposal_ready:
             proposal_ready.append(output_record)
         else:
+            normalized_items = _normalized_review_items(matching, sales)
+            output_record.update(
+                {
+                    "normalized_review_items": normalized_items,
+                    "normalized_review_item_count": len(normalized_items),
+                }
+            )
             human_review.append(output_record)
 
+    _apply_human_review_priority(human_review, match_info_by_pair)
     return proposal_ready, human_review
 
 
@@ -361,6 +517,13 @@ def generate_candidate_queues(date_part: str) -> Dict[str, Any]:
         "evidence_ready": sum(record["evidence_ready"] for record in all_queues),
         "proposal_ready": len(proposal_ready),
         "human_review": len(human_review),
+        "review_priority_high": sum(
+            record["review_priority"] == REVIEW_PRIORITY_HIGH for record in human_review
+        ),
+        "review_priority_other": sum(
+            record["review_priority"] == REVIEW_PRIORITY_OTHER for record in human_review
+        ),
+        "initial_review": sum(record["initial_review"] for record in human_review),
         "previous_candidate": sum(
             record[PREVIOUS_CANDIDATE_FIELD] for record in all_queues
         ),
@@ -387,6 +550,9 @@ def main() -> None:
             f"evidence_ready={summary['evidence_ready']} "
             f"proposal_ready={summary['proposal_ready']} "
             f"human_review={summary['human_review']} "
+            f"HIGH={summary['review_priority_high']} "
+            f"OTHER={summary['review_priority_other']} "
+            f"initial_review={summary['initial_review']} "
             f"previous_candidate={summary['previous_candidate']} "
             f"comparison_date={summary['previous_candidate_date'] or 'none'}"
         )

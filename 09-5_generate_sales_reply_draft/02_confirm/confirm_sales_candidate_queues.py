@@ -25,6 +25,8 @@ from common.previous_candidate import (
 from classify_sales_candidate_queues import (
     RECHECK_ALL_PATH,
     RECHECK_ERROR_PATH,
+    REVIEW_PRIORITY_HIGH,
+    REVIEW_PRIORITY_OTHER,
     classify_candidate_pairs,
     has_explicit_review_reason,
     pair_key,
@@ -160,6 +162,13 @@ def main() -> None:
         drafts = read_jsonl_as_list(str(draft_path))
         drafts_before = copy.deepcopy(drafts)
         rechecks = read_jsonl_as_list(str(RECHECK_ALL_PATH))
+        recheck_match_info = {
+            (
+                str((record.get("project_info") or {}).get("message_id") or "").strip(),
+                str((record.get("resource_info") or {}).get("message_id") or "").strip(),
+            ): record.get("match_info") or {}
+            for record in rechecks
+        }
         error_records = read_jsonl_as_list(str(RECHECK_ERROR_PATH)) if RECHECK_ERROR_PATH.exists() else []
         expected_proposal, expected_human = classify_candidate_pairs(
             candidates, drafts, rechecks, error_records
@@ -180,6 +189,7 @@ def main() -> None:
             pair_key(record): record for record in expected_proposal + expected_human
         }
         actual_queues = proposal + human
+        expected_human_index = {pair_key(record): record for record in expected_human}
         previous_keys = {
             pair_key(record)
             for record in actual_queues
@@ -206,6 +216,31 @@ def main() -> None:
         neither_keys = candidate_keys - (previous_keys | cache_marker_keys)
         proposal_previous_count = len(previous_keys & proposal_keys)
         human_previous_count = len(previous_keys & human_keys)
+        candidate_duplicate_count = len(candidates) - len(candidate_keys)
+        proposal_duplicate_count = len(proposal) - len(proposal_keys)
+        human_duplicate_count = len(human) - len(human_keys)
+        overlap_count = len(proposal_keys & human_keys)
+        candidate_loss_count = len(candidate_keys - (proposal_keys | human_keys))
+        high_records = [
+            record for record in human if record.get("review_priority") == REVIEW_PRIORITY_HIGH
+        ]
+        other_records = [
+            record for record in human if record.get("review_priority") == REVIEW_PRIORITY_OTHER
+        ]
+        initial_records = [record for record in human if record.get("initial_review") is True]
+        priority_fields = (
+            "review_priority",
+            "normalized_review_items",
+            "normalized_review_item_count",
+            "high_project_rank",
+            "initial_review",
+        )
+        priority_fields_match = all(
+            key in expected_human_index
+            and all(record.get(field) == expected_human_index[key].get(field) for field in priority_fields)
+            for record in human
+            for key in [pair_key(record)]
+        )
 
         lines.extend(
             [
@@ -216,6 +251,13 @@ def main() -> None:
                 f"evidence_ready count: {sum(bool(row.get('evidence_ready')) for row in proposal + human)}",
                 f"proposal_ready count: {len(proposal)}",
                 f"human_review count: {len(human)}",
+                f"HIGH count: {len(high_records)}",
+                f"OTHER count: {len(other_records)}",
+                f"initial review count: {len(initial_records)}",
+                f"initial sales target count: {len(proposal) + len(initial_records)}",
+                f"candidate loss count: {candidate_loss_count}",
+                f"duplicate count: {candidate_duplicate_count + proposal_duplicate_count + human_duplicate_count}",
+                f"proposal/human overlap count: {overlap_count}",
                 f"previous candidate date: {previous_candidate_date or 'none'}",
                 f"previous candidate count: {len(previous_keys)}",
                 f"proposal previous candidate count: {proposal_previous_count}",
@@ -291,6 +333,116 @@ def main() -> None:
             "cache onlyにはprevious candidate badgeを付与しない",
             "cache onlyにprevious candidate marker混入",
         )
+        append_check(
+            lines,
+            errors,
+            len(high_records) + len(other_records) == len(human),
+            "HIGH + OTHER = human_review",
+            "HIGH / OTHER partitionの件数不整合",
+        )
+        append_check(
+            lines,
+            errors,
+            priority_fields_match,
+            "priority fieldがcanonical入力からの再計算結果と一致",
+            "priority fieldがcanonical入力からの再計算結果と不一致",
+        )
+        append_check(
+            lines,
+            errors,
+            all(
+                isinstance(record.get("normalized_review_items"), list)
+                and record.get("normalized_review_item_count")
+                == len(record["normalized_review_items"])
+                and isinstance(record.get("high_project_rank"), int)
+                and not isinstance(record.get("high_project_rank"), bool)
+                and isinstance(record.get("initial_review"), bool)
+                for record in human
+            ),
+            "human_review priority fieldの型・件数整合OK",
+            "human_review priority fieldの型・件数不整合",
+        )
+        append_check(
+            lines,
+            errors,
+            all(record.get("normalized_review_item_count") == 1 for record in high_records),
+            "HIGHはnormalized review itemが実質1個",
+            "HIGHにnormalized review item 1個以外が混入",
+        )
+        append_check(
+            lines,
+            errors,
+            all(
+                isinstance(
+                    recheck_match_info.get(pair_key(record), {}).get(
+                        "required_skills_match_rate"
+                    ),
+                    (int, float),
+                )
+                and not isinstance(
+                    recheck_match_info[pair_key(record)]["required_skills_match_rate"],
+                    bool,
+                )
+                and recheck_match_info[pair_key(record)]["required_skills_match_rate"] >= 0.8
+                for record in high_records
+            ),
+            "HIGHのrequired score >= 80%",
+            "HIGHにrequired score 80%未満または不正値が混入",
+        )
+        append_check(
+            lines,
+            errors,
+            all(
+                record.get("category_match") == "match"
+                and record.get("has_08_5_error") is False
+                and (record.get("required_skill_recheck_info") or {}).get("skillsheet_chars_used", 0) > 0
+                and all(
+                    str(check.get("evidence") or "").strip()
+                    for check in record.get("required_skill_checks") or []
+                )
+                and (record.get("sales_status") or {}).get("both_directions_present") is True
+                and (record.get("sales_status") or {}).get("all_drafts_generated") is True
+                for record in high_records
+            ),
+            "HIGHのcategory/error/skillsheet/evidence/draft contract OK",
+            "HIGH contract違反あり",
+        )
+        high_project_groups = defaultdict(list)
+        for record in high_records:
+            high_project_groups[record["project_message_id"]].append(record)
+        append_check(
+            lines,
+            errors,
+            all(
+                sorted(record["high_project_rank"] for record in records)
+                == list(range(1, len(records) + 1))
+                for records in high_project_groups.values()
+            ),
+            "HIGHの案件内rankは1始まりで一意・連続",
+            "HIGHの案件内rankに重複または欠番あり",
+        )
+        append_check(
+            lines,
+            errors,
+            all(
+                record.get("initial_review") is (record.get("high_project_rank", 0) <= 3)
+                for record in high_records
+            )
+            and all(
+                record.get("high_project_rank") == 0
+                and record.get("initial_review") is False
+                for record in other_records
+            ),
+            "initial_reviewは各案件のHIGH rank 1..3のみ",
+            "initial_review / high_project_rank contract違反あり",
+        )
+        append_check(
+            lines,
+            errors,
+            all(not any(field in record for field in priority_fields) for record in proposal),
+            "proposal_ready schema/contractはpriority追加前のまま",
+            "proposal_readyへpriority fieldが混入",
+        )
         if date_part == "20260820":
             expected_20260820 = {
                 "final": 618,
@@ -299,6 +451,10 @@ def main() -> None:
                 "previous": 146,
                 "proposal_previous": 9,
                 "human_previous": 137,
+                "high": 114,
+                "other": 468,
+                "initial": 55,
+                "initial_sales_target": 91,
                 "cache_marker": 201,
                 "both": 146,
                 "cache_only": 55,
@@ -312,6 +468,10 @@ def main() -> None:
                 "previous": len(previous_keys),
                 "proposal_previous": proposal_previous_count,
                 "human_previous": human_previous_count,
+                "high": len(high_records),
+                "other": len(other_records),
+                "initial": len(initial_records),
+                "initial_sales_target": len(proposal) + len(initial_records),
                 "cache_marker": len(cache_marker_keys),
                 "both": len(both_keys),
                 "cache_only": len(cache_only_keys),
@@ -404,6 +564,44 @@ def main() -> None:
                 f"5人以上案件数: {sum(count >= 5 for count in counts)}",
                 f"10人以上案件数: {sum(count >= 10 for count in counts)}",
             ]
+        )
+
+        human_project_counts = Counter(record["project_message_id"] for record in human)
+        max_human_count = max(human_project_counts.values()) if human_project_counts else 0
+        max_human_projects = {
+            project_id
+            for project_id, count in human_project_counts.items()
+            if count == max_human_count
+        }
+        max_project_high = [
+            record for record in high_records if record["project_message_id"] in max_human_projects
+        ]
+        max_project_initial = [
+            record for record in initial_records if record["project_message_id"] in max_human_projects
+        ]
+        lines.extend(
+            [
+                "",
+                "【human_review priority 分布】",
+                f"max project human_review count: {max_human_count}",
+                f"max project HIGH count: {len(max_project_high)}",
+                f"max project initial_review count: {len(max_project_initial)}",
+            ]
+        )
+        if date_part == "20260820":
+            append_check(
+                lines,
+                errors,
+                max_human_count == 59,
+                "20260820 最大案件のhuman_review=59",
+                f"20260820 最大案件のhuman_review={max_human_count}",
+            )
+        append_check(
+            lines,
+            errors,
+            len(max_project_initial) <= 3 * len(max_human_projects),
+            "最大案件も全候補保持・initial_reviewはHIGH上位最大3件",
+            "最大案件のinitial_reviewがHIGH上位3件を超過",
         )
 
         if args.simulate_read_only and date_part == "20260819":
