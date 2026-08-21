@@ -3,10 +3,11 @@
 
 確認内容:
 ① run_full_pipeline.sh / run_full_pipeline_master.sh が完全一致していること
-② assistant処理（run_suggest_and_cleanup）の後に 80-7 → 80-75 → 80-8 → 80-9 の順で並ぶこと
-③ 80-7 / 80-75 / 80-8 / 80-9 が run_step 経由（失敗時にPipelineをexitさせる経路）であること
-④ 80-7のproduction code path・local retention対象・summary contractを直接検証すること
-⑤ 設定が pipeline_s3_config.env に統合され、bucketを二重管理していないこと
+② nightly main flowから辞書suggestion AIが外れていること
+③ 80-7 → 80-75 → 80-8 → 80-9 の順で並ぶこと
+④ 80-7 / 80-75 / 80-8 / 80-9 が run_step 経由（失敗時にPipelineをexitさせる経路）であること
+⑤ 80-7のproduction code path・local retention対象・summary contractを直接検証すること
+⑥ 設定が pipeline_s3_config.env に統合され、bucketを二重管理していないこと
 
 production contract regression（(33)-(38)）:
 ⑥ 80-7 のlocal retentionが未変更であること
@@ -37,6 +38,7 @@ SRC_ROOT = project_root
 
 RUNNER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline.sh"
 RUNNER_MASTER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline_master.sh"
+ASSISTANCE_RUNNER = SRC_ROOT / "00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh"
 CONFIG_ENV = SRC_ROOT / "00_pipeline/00_tool/pipeline_s3_config.env"
 RETENTION_SCRIPT = (
     SRC_ROOT / "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py"
@@ -65,9 +67,40 @@ class TestRunnerWiring(unittest.TestCase):
     def test_runners_are_identical(self):
         self.assertEqual(sha256(RUNNER), sha256(RUNNER_MASTER))
 
-    def test_new_steps_run_after_assistant_in_order(self):
+    def test_dictionary_suggestions_are_not_in_nightly_main_flow(self):
+        self.assertNotIn("run_suggest_and_cleanup.sh", self.text)
+
+    def test_manual_dictionary_suggestion_runner_is_preserved(self):
+        assistance_text = ASSISTANCE_RUNNER.read_text(encoding="utf-8")
+        manual_scripts = (
+            "03-8_extract_project_skill_category/10_assistance_tool/suggest_skill_dictionary.py",
+            "03-9_extract_project_phase_category/10_assistance_tool/suggest_phase_dictionary.py",
+            "03-10_extract_project_location/10_assistance_tool/suggest_location_dictionary.py",
+            "05-8_extract_resource_skill_category/10_assistance_tool/suggest_skill_dictionary.py",
+            "05-9_extract_resource_phase_category/10_assistance_tool/suggest_phase_dictionary.py",
+            "05-10_extract_resource_location/10_assistance_tool/suggest_location_dictionary.py",
+            "03-8_extract_project_skill_category/10_assistance_tool/cleanup_skill_candidates.py",
+            "03-9_extract_project_phase_category/10_assistance_tool/cleanup_phase_candidates.py",
+            "03-10_extract_project_location/10_assistance_tool/cleanup_location_candidates.py",
+            "05-8_extract_resource_skill_category/10_assistance_tool/cleanup_skill_candidates.py",
+            "05-9_extract_resource_phase_category/10_assistance_tool/cleanup_phase_candidates.py",
+            "05-10_extract_resource_location/10_assistance_tool/cleanup_location_candidates.py",
+        )
+        for script in manual_scripts:
+            self.assertIn(script, assistance_text)
+
+    def test_main_ai_steps_are_preserved(self):
+        self.assertIn(
+            "07-1_requirement_skill_ai_matching/00_tool/normalized/requirement_skill_ai_matching.py",
+            self.text,
+        )
+        self.assertIn(
+            "08-5_high_score_required_skill_recheck/00_tool/high_score_required_skill_recheck.py",
+            self.text,
+        )
+
+    def test_new_steps_run_in_order(self):
         markers = [
-            "run_suggest_and_cleanup.sh",
             "80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py",
             "80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py",
             "80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py",

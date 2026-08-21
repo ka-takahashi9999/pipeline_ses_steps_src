@@ -196,12 +196,6 @@ run_step "09-4_remove_category_mismatch_sales_candidates(RUN_DATE=$RUN_DATE)" "$
 
 run_step "09-5_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-5_generate_sales_reply_draft/00_tool/generate_sales_reply_draft.py" --target-date "$RUN_DATE"
 
-##アシスタントツール（shスクリプトのためrun_stepではなくbashで直接実行）
-publish_current_step "run_suggest_and_cleanup"
-log "=== START run_suggest_and_cleanup ==="
-bash "$ROOT/00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh" 2>&1 | tee -a "$LOG"
-log "=== DONE run_suggest_and_cleanup ==="
-
 # ──────────────────────────────────────────────────────────────────────
 # 09系のローカル/root ZIP保持整理 → CURRENTのbk1退避
 # → Portal同期対象prepare → Portal CURRENT publish。
