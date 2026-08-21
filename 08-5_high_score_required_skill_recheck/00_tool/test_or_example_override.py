@@ -2,6 +2,7 @@ import importlib.util
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).with_name("high_score_required_skill_recheck.py")
@@ -83,6 +84,61 @@ PRODUCTION_CASES = [
 
 
 class OrExampleOverrideTest(unittest.TestCase):
+    def test_llm_call_uses_08_5_telemetry_context_without_schema_change(self):
+        record = {
+            "project_info": {
+                "message_id": "project-1",
+                "required_skills": [
+                    {"skill": "Python開発経験", "match": True, "note": "Python経験あり"}
+                ],
+            },
+            "resource_info": {"message_id": "resource-1"},
+        }
+        skillsheet_map = {
+            "resource-1": {
+                "success": True,
+                "skillsheet": "Python開発経験あり",
+            }
+        }
+        llm_response = {
+            "required_skill_checks": [
+                {
+                    "skill": "Python開発経験",
+                    "original_match": True,
+                    "recheck_match": True,
+                    "confidence": "confirmed",
+                    "reason": "Python開発経験あり",
+                    "evidence": "Python開発経験あり",
+                }
+            ],
+            "category_match": "match",
+            "category_note": "案件: Python / 要員: Python",
+        }
+
+        with patch.object(target, "call_llm", return_value=llm_response) as call_llm_mock:
+            result, error = target._process_record(
+                record,
+                "100percent",
+                skillsheet_map,
+                {"project-1": "Python案件"},
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            set(result),
+            set(record) | {
+                "source_score_band",
+                "recheck_info",
+                "required_skill_checks",
+                "category_match",
+                "category_note",
+            },
+        )
+        self.assertEqual(
+            call_llm_mock.call_args.kwargs["telemetry_context"],
+            target.LLM_TELEMETRY_CONTEXT,
+        )
+
     def test_explicit_or_with_direct_evidence_can_override(self):
         cases = [
             check(

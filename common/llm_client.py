@@ -9,8 +9,11 @@ APIキーはAWS SSM Parameter Store (/openai/api_key) から取得する。
 """
 
 import json
+import os
 import time
 import threading
+import fcntl
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import boto3
@@ -29,6 +32,11 @@ _rate_limit_lock = threading.Lock()
 _last_call_time: float = 0.0
 _MIN_INTERVAL_SECONDS: float = 0.5  # 最小呼び出し間隔
 _HTTP_ERROR_BODY_MAX_CHARS: int = 1000
+
+# counter fileを利用できない場合だけ使うプロセス内fallback。
+# 通常経路はfile lock付きcounterにより、同一run/step内のcall_numberを採番する。
+_telemetry_counter_lock = threading.Lock()
+_telemetry_fallback_counters: Dict[str, int] = {}
 
 
 class LLMOutputTruncatedError(ValueError):
@@ -97,6 +105,206 @@ def _format_http_error_detail(response: Optional[requests.Response]) -> str:
     return " ".join(parts)
 
 
+def _metadata_text(value: Any) -> str:
+    """telemetry metadataを本文を含まない安全な文字列へ正規化する。"""
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _safe_filename_part(value: str) -> str:
+    normalized = "".join(
+        char if char.isascii() and (char.isalnum() or char in ("-", "_")) else "_"
+        for char in value
+    ).strip("_")
+    return normalized or "manual"
+
+
+def _build_telemetry_state(
+    telemetry_context: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """caller指定のstep/output先とrun環境変数だけから保存状態を作る。"""
+    if not isinstance(telemetry_context, dict):
+        return None
+
+    step = _metadata_text(telemetry_context.get("step")).strip()
+    output_dir = telemetry_context.get("output_dir")
+    if not step or not isinstance(output_dir, (str, os.PathLike)):
+        return None
+
+    run_id = _metadata_text(
+        telemetry_context.get("run_id", os.environ.get("RUN_ID", ""))
+    ).strip()
+    run_date = _metadata_text(
+        telemetry_context.get("run_date", os.environ.get("RUN_DATE", ""))
+    ).strip()
+    filename_run_id = _safe_filename_part(run_id)
+    usage_path = Path(output_dir) / f"llm_usage_{filename_run_id}.jsonl"
+    return {
+        "run_id": run_id,
+        "run_date": run_date,
+        "step": step,
+        "usage_path": usage_path,
+    }
+
+
+def _next_call_number(telemetry_state: Dict[str, Any]) -> int:
+    """同一usage fileのlogical call番号をfile lock付きで採番する。"""
+    usage_path = Path(telemetry_state["usage_path"])
+    counter_path = usage_path.with_suffix(".counter")
+    try:
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(counter_path, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as counter_file:
+            fcntl.flock(counter_file.fileno(), fcntl.LOCK_EX)
+            try:
+                current_text = counter_file.read().strip()
+                current = int(current_text) if current_text else 0
+                call_number = current + 1
+                counter_file.seek(0)
+                counter_file.truncate()
+                counter_file.write(str(call_number))
+                counter_file.flush()
+            finally:
+                fcntl.flock(counter_file.fileno(), fcntl.LOCK_UN)
+        return call_number
+    except Exception as error:
+        _logger.warn(
+            "LLM usage telemetry call_number採番失敗; "
+            f"プロセス内採番へfallbackします: {type(error).__name__}: {error}"
+        )
+
+    fallback_key = str(usage_path)
+    with _telemetry_counter_lock:
+        call_number = _telemetry_fallback_counters.get(fallback_key, 0) + 1
+        _telemetry_fallback_counters[fallback_key] = call_number
+        return call_number
+
+
+def _nonnegative_token(container: Dict[str, Any], key: str) -> tuple:
+    if key not in container:
+        return 0, False
+    value = container.get(key)
+    if isinstance(value, bool):
+        return 0, False
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0, False
+    if number < 0:
+        return 0, False
+    return number, True
+
+
+def _first_token_value(container: Dict[str, Any], keys: tuple) -> tuple:
+    for key in keys:
+        value, available = _nonnegative_token(container, key)
+        if available:
+            return value, True
+    return 0, False
+
+
+def _extract_usage(response_json: Any) -> Dict[str, Any]:
+    """Chat Completions top-level usageを既知shapeから防御的に抽出する。"""
+    empty = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "usage_available": False,
+    }
+    if not isinstance(response_json, dict):
+        return empty
+    usage = response_json.get("usage")
+    if not isinstance(usage, dict):
+        return empty
+
+    input_tokens, input_available = _first_token_value(
+        usage, ("prompt_tokens", "input_tokens")
+    )
+    output_tokens, output_available = _first_token_value(
+        usage, ("completion_tokens", "output_tokens")
+    )
+    total_tokens, total_available = _first_token_value(usage, ("total_tokens",))
+
+    cached_input_tokens, _ = _first_token_value(
+        usage, ("cached_input_tokens", "cached_prompt_tokens")
+    )
+    if cached_input_tokens == 0:
+        for details_key in ("prompt_tokens_details", "input_tokens_details"):
+            details = usage.get(details_key)
+            if not isinstance(details, dict):
+                continue
+            cached_input_tokens, cached_available = _first_token_value(
+                details, ("cached_tokens", "cached_input_tokens")
+            )
+            if cached_available:
+                break
+
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "usage_available": (
+            input_available or output_available or total_available
+        ),
+    }
+
+
+def _append_telemetry_record(path: Path, record: Dict[str, Any]) -> None:
+    """1 recordをprocess間file lock付きでJSONL appendする。"""
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as usage_file:
+        fcntl.flock(usage_file.fileno(), fcntl.LOCK_EX)
+        try:
+            usage_file.write(line)
+            usage_file.flush()
+        finally:
+            fcntl.flock(usage_file.fileno(), fcntl.LOCK_UN)
+
+
+def _record_telemetry_attempt(
+    telemetry_state: Optional[Dict[str, Any]],
+    model: str,
+    call_number: int,
+    attempt_number: int,
+    response_json: Any,
+    success: bool,
+    error_type: str,
+) -> None:
+    """usage保存をbest-effortで行い、例外をLLM処理へ伝播させない。"""
+    if telemetry_state is None:
+        return
+    try:
+        usage = _extract_usage(response_json)
+        record = {
+            "run_id": telemetry_state["run_id"],
+            "run_date": telemetry_state["run_date"],
+            "step": telemetry_state["step"],
+            "model": str(model),
+            "call_number": call_number,
+            "attempt_number": attempt_number,
+            "input_tokens": usage["input_tokens"],
+            "cached_input_tokens": usage["cached_input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "usage_available": usage["usage_available"],
+            "success": bool(success),
+            "error_type": "" if success else str(error_type or "unexpected_error"),
+        }
+        _append_telemetry_record(Path(telemetry_state["usage_path"]), record)
+    except Exception as error:
+        _logger.warn(
+            "LLM usage telemetry書き込み失敗; LLM処理は継続します: "
+            f"{type(error).__name__}: {error}"
+        )
+
+
 def call_llm(
     system_prompt: str,
     user_prompt: str,
@@ -106,6 +314,7 @@ def call_llm(
     max_tokens: int = 1024,
     max_retries: int = 3,
     retry_wait_seconds: float = 5.0,
+    telemetry_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     OpenAI APIを呼び出してJSONレスポンスを取得する。
@@ -120,6 +329,7 @@ def call_llm(
         max_tokens: 最大トークン数
         max_retries: リトライ回数
         retry_wait_seconds: リトライ間隔（秒）
+        telemetry_context: usage保存用のstep/output_dir/run metadata（省略可）
 
     Returns:
         パースされたJSONレスポンス（response_schemaのキー構造を保持）
@@ -130,6 +340,8 @@ def call_llm(
         ValueError: レスポンスJSONのパース失敗時
     """
     api_key = _get_api_key()
+    telemetry_state = _build_telemetry_state(telemetry_context)
+    call_number = _next_call_number(telemetry_state) if telemetry_state else 0
 
     # スキーマ情報をプロンプトに組み込む
     schema_str = json.dumps(response_schema, ensure_ascii=False, indent=2)
@@ -160,16 +372,21 @@ def call_llm(
     last_error_detail: Optional[str] = None
     for attempt in range(1, max_retries + 1):
         _enforce_rate_limit()
+        response_json: Any = None
+        response: Optional[requests.Response] = None
+        attempt_success = False
+        attempt_error_type = "unexpected_error"
         try:
             _logger.llm(f"API呼び出し試行 {attempt}/{max_retries} (model={model})")
-            resp = requests.post(
+            response = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=60,
             )
-            resp.raise_for_status()
-            choice = resp.json()["choices"][0]
+            response.raise_for_status()
+            response_json = response.json()
+            choice = response_json["choices"][0]
             content = choice["message"]["content"]
             finish_reason = choice.get("finish_reason")
             if finish_reason == "length":
@@ -183,12 +400,16 @@ def call_llm(
                 raise LLMOutputTruncatedError(error_message)
             parsed = json.loads(content)
             _validate_schema_keys(parsed, response_schema)
+            attempt_success = True
+            attempt_error_type = ""
             _logger.llm(f"API呼び出し成功 (attempt={attempt})")
             return parsed
-        except LLMOutputTruncatedError:
+        except LLMOutputTruncatedError as e:
             # 同じmax_tokensで再試行しても解消しないため即時に呼び出し元へ返す。
+            attempt_error_type = type(e).__name__
             raise
         except requests.exceptions.HTTPError as e:
+            attempt_error_type = type(e).__name__
             status = e.response.status_code if e.response is not None else None
             http_error_detail = _format_http_error_detail(e.response)
             _logger.warn(
@@ -200,13 +421,30 @@ def call_llm(
                 # リトライしても意味がないエラー
                 break
         except (json.JSONDecodeError, ValueError) as e:
+            attempt_error_type = type(e).__name__
             _logger.warn(f"JSONパースエラー (attempt={attempt}): {e}")
             last_error = e
             last_error_detail = str(e)
         except requests.exceptions.RequestException as e:
+            attempt_error_type = type(e).__name__
             _logger.warn(f"リクエストエラー (attempt={attempt}): {e}")
             last_error = e
             last_error_detail = str(e)
+        finally:
+            if response_json is None and response is not None:
+                try:
+                    response_json = response.json()
+                except Exception:
+                    response_json = None
+            _record_telemetry_attempt(
+                telemetry_state=telemetry_state,
+                model=model,
+                call_number=call_number,
+                attempt_number=attempt,
+                response_json=response_json,
+                success=attempt_success,
+                error_type=attempt_error_type,
+            )
 
         if attempt < max_retries:
             _logger.info(f"{retry_wait_seconds}秒後にリトライします...")

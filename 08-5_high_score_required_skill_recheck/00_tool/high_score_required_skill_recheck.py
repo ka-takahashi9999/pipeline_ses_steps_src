@@ -32,6 +32,10 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 RECHECK_LLM_MODEL = "gpt-4o"
 RECHECK_SKILLSHEET_MAX_CHARS = 10000
 RECHECK_PROJECT_BODY_MAX_CHARS = 3000
+LLM_TELEMETRY_CONTEXT = {
+    "step": STEP_NAME,
+    "output_dir": str(STEP_DIR / "99_execution_time"),
+}
 
 INPUT_SCORE_FILES: Tuple[Tuple[str, Path], ...] = (
     (
@@ -766,6 +770,7 @@ def _process_record(
             temperature=0.0,
             max_tokens=4096,
             max_retries=3,
+            telemetry_context=LLM_TELEMETRY_CONTEXT,
         )
     except ValueError as e:
         checks = _fallback_checks(required_skills, "LLM出力不正のため人間確認")

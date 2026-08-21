@@ -87,6 +87,10 @@ class ProcessPairTest(unittest.TestCase):
             {"project_info", "resource_info", "required_skills", "optional_skills", "evaluation_meta"},
         )
         call_llm_mock.assert_called_once()
+        self.assertEqual(
+            call_llm_mock.call_args.kwargs["telemetry_context"],
+            target.LLM_TELEMETRY_CONTEXT,
+        )
 
     def test_truncated_output_is_recorded_separately(self):
         project_skills_map = {

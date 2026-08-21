@@ -36,6 +36,10 @@ STEP_NAME = "07-1_requirement_skill_ai_matching"
 STEP_DIR = Path(__file__).resolve().parents[2]
 LLM_MODEL = "gpt-4o-mini"
 MAX_PROJECT_SKILLS_PER_PAIR = 40
+LLM_TELEMETRY_CONTEXT = {
+    "step": STEP_NAME,
+    "output_dir": str(STEP_DIR / "99_execution_time"),
+}
 
 # 表示用note（09-1のメール表示に使う判定根拠）の上限文字数
 NOTE_MAX_CHARS = 30
@@ -320,6 +324,7 @@ def process_pair(
             temperature=0.0,
             max_tokens=2048,
             max_retries=3,
+            telemetry_context=LLM_TELEMETRY_CONTEXT,
         )
     except LLMOutputTruncatedError as e:
         return None, _make_error(p_mid, r_mid, "llm_output_truncated", str(e)[:300])
