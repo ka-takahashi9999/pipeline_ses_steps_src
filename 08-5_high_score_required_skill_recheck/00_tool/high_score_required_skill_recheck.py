@@ -23,6 +23,7 @@ from common.file_utils import ensure_result_dirs, write_execution_time
 from common.json_utils import append_jsonl, read_jsonl, read_jsonl_as_list
 from common.llm_client import call_llm
 from common.logger import get_logger
+from common.skillsheet_ai_context import build_skillsheet_ai_context
 from common.skill_policy import AUTO_TRUE_RECHECK_REASON, is_auto_true_skill
 
 STEP_NAME = "08-5_high_score_required_skill_recheck"
@@ -43,7 +44,7 @@ INPUT_SCORE_FILES: Tuple[Tuple[str, Path], ...] = (
     ),
 )
 INPUT_SKILLSHEETS = (
-    project_root / "04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl"
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
 )
 INPUT_CLEANED_EMAILS = (
     project_root / "01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl"
@@ -733,12 +734,12 @@ def _process_record(
                 record,
                 source_score_band,
                 "missing_resource_skillsheet",
-                f"04-1にmessage_id={resource_mid}のデータなし",
+                f"04-2にmessage_id={resource_mid}のデータなし",
             ),
         )
 
-    raw_skillsheet = str(skillsheet_rec.get("skillsheet") or "").strip()
-    if not skillsheet_rec.get("success", False) or not raw_skillsheet:
+    normalized_skillsheet = str(skillsheet_rec.get("skillsheet") or "").strip()
+    if not skillsheet_rec.get("success", False) or not normalized_skillsheet:
         checks = _fallback_checks(required_skills, "スキルシート取得不可のため人間確認")
         return (
             _add_recheck_result(record, source_score_band, checks, 0),
@@ -750,7 +751,8 @@ def _process_record(
             ),
         )
 
-    skillsheet_text = _truncate_skillsheet(raw_skillsheet)
+    skillsheet_context = build_skillsheet_ai_context(normalized_skillsheet)
+    skillsheet_text = _truncate_skillsheet(skillsheet_context)
     skillsheet_chars_used = len(skillsheet_text)
     schema = _build_schema(required_skills)
     user_prompt = _build_user_prompt(required_skills, skillsheet_text, project_body_text)
@@ -922,7 +924,7 @@ def main() -> None:
 
     _init_output_files()
     skillsheet_map = _load_skillsheet_map()
-    logger.info(f"04-1スキルシート読み込み完了: {len(skillsheet_map)}件")
+    logger.info(f"04-2 normalizedスキルシート読み込み完了: {len(skillsheet_map)}件")
     cleaned_email_map = _load_cleaned_email_map()
     logger.info(f"01-4クリーニング済みメール読み込み完了: {len(cleaned_email_map)}件")
 

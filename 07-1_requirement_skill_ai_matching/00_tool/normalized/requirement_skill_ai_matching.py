@@ -25,6 +25,7 @@ from common.file_utils import ensure_result_dirs, write_execution_time
 from common.json_utils import append_jsonl, read_jsonl
 from common.llm_client import LLMOutputTruncatedError, call_llm
 from common.logger import get_logger
+from common.skillsheet_ai_context import build_skillsheet_ai_context
 from common.skill_policy import (
     AUTO_TRUE_NOTE,
     TECHNICAL_HINT_KEYWORDS,
@@ -293,7 +294,8 @@ def process_pair(
                                   "skillsheetが空")
 
     skillsheet_source = ss_rec.get("source", "unknown")
-    ss_truncated = _truncate_skillsheet(ss_text)
+    ss_context = build_skillsheet_ai_context(ss_text)
+    ss_truncated = _truncate_skillsheet(ss_context)
 
     # スキーマテンプレート（LLMへの出力形式ヒント）
     schema = {
