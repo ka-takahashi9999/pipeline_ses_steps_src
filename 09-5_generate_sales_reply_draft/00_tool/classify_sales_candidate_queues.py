@@ -17,6 +17,11 @@ sys.path.insert(0, str(project_root))
 
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.previous_candidate import (
+    PREVIOUS_CANDIDATE_DATE_FIELD,
+    PREVIOUS_CANDIDATE_FIELD,
+    load_and_mark_candidate_records,
+)
 
 STEP_NAME = "09-5_classify_sales_candidate_queues"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -312,6 +317,10 @@ def classify_candidate_pairs(
                 if is_proposal_ready
                 else _review_reasons(matching, sales, evidence)
             ),
+            PREVIOUS_CANDIDATE_FIELD: candidate.get(PREVIOUS_CANDIDATE_FIELD) is True,
+            PREVIOUS_CANDIDATE_DATE_FIELD: normalize_text(
+                candidate.get(PREVIOUS_CANDIDATE_DATE_FIELD)
+            ),
         }
         if is_proposal_ready:
             proposal_ready.append(output_record)
@@ -332,22 +341,30 @@ def resolve_paths(date_part: str) -> Tuple[Path, Path, Path, Path]:
     return candidate_path, draft_path, proposal_path, human_path
 
 
-def generate_candidate_queues(date_part: str) -> Dict[str, int]:
+def generate_candidate_queues(date_part: str) -> Dict[str, Any]:
     candidate_path, draft_path, proposal_path, human_path = resolve_paths(date_part)
     candidates = read_jsonl_as_list(str(candidate_path))
+    candidates, previous_date = load_and_mark_candidate_records(
+        candidates, INPUT_09_4_DIR, date_part
+    )
     drafts = read_jsonl_as_list(str(draft_path))
     rechecks = read_jsonl_as_list(str(RECHECK_ALL_PATH))
     errors = read_jsonl_as_list(str(RECHECK_ERROR_PATH)) if RECHECK_ERROR_PATH.exists() else []
     proposal_ready, human_review = classify_candidate_pairs(candidates, drafts, rechecks, errors)
     write_jsonl(str(proposal_path), proposal_ready)
     write_jsonl(str(human_path), human_review)
+    all_queues = proposal_ready + human_review
     return {
         "final_candidates": len(candidates),
-        "matching_strict": sum(record["matching_strict"] for record in proposal_ready + human_review),
-        "sales_ready": sum(record["sales_ready"] for record in proposal_ready + human_review),
-        "evidence_ready": sum(record["evidence_ready"] for record in proposal_ready + human_review),
+        "matching_strict": sum(record["matching_strict"] for record in all_queues),
+        "sales_ready": sum(record["sales_ready"] for record in all_queues),
+        "evidence_ready": sum(record["evidence_ready"] for record in all_queues),
         "proposal_ready": len(proposal_ready),
         "human_review": len(human_review),
+        "previous_candidate": sum(
+            record[PREVIOUS_CANDIDATE_FIELD] for record in all_queues
+        ),
+        "previous_candidate_date": previous_date,
     }
 
 
@@ -369,7 +386,9 @@ def main() -> None:
             f"sales_ready={summary['sales_ready']} "
             f"evidence_ready={summary['evidence_ready']} "
             f"proposal_ready={summary['proposal_ready']} "
-            f"human_review={summary['human_review']}"
+            f"human_review={summary['human_review']} "
+            f"previous_candidate={summary['previous_candidate']} "
+            f"comparison_date={summary['previous_candidate_date'] or 'none'}"
         )
     except Exception as error:
         logger.error(f"queue分類失敗: {error}")

@@ -17,6 +17,11 @@ sys.path.insert(0, str(tool_dir))
 
 from common.json_utils import read_jsonl_as_list
 from common.logger import get_logger
+from common.previous_candidate import (
+    PREVIOUS_CANDIDATE_DATE_FIELD,
+    PREVIOUS_CANDIDATE_FIELD,
+    load_and_mark_candidate_records,
+)
 from classify_sales_candidate_queues import (
     RECHECK_ALL_PATH,
     RECHECK_ERROR_PATH,
@@ -149,6 +154,9 @@ def main() -> None:
         canonical_bytes_before = draft_path.read_bytes()
         canonical_hash_before = hashlib.sha256(canonical_bytes_before).hexdigest()
         candidates = read_jsonl_as_list(str(candidate_path))
+        candidates, previous_candidate_date = load_and_mark_candidate_records(
+            candidates, INPUT_09_4_DIR, date_part
+        )
         drafts = read_jsonl_as_list(str(draft_path))
         drafts_before = copy.deepcopy(drafts)
         rechecks = read_jsonl_as_list(str(RECHECK_ALL_PATH))
@@ -168,6 +176,36 @@ def main() -> None:
         human_keys = unique_keys(human, "human_review", errors)
         expected_proposal_keys = {pair_key(record) for record in expected_proposal}
         expected_human_keys = {pair_key(record) for record in expected_human}
+        expected_queue_index = {
+            pair_key(record): record for record in expected_proposal + expected_human
+        }
+        actual_queues = proposal + human
+        previous_keys = {
+            pair_key(record)
+            for record in actual_queues
+            if record.get(PREVIOUS_CANDIDATE_FIELD) is True
+        }
+        expected_previous_keys = {
+            key
+            for key, record in expected_queue_index.items()
+            if record.get(PREVIOUS_CANDIDATE_FIELD) is True
+        }
+        invalid_previous_fields = sum(
+            not isinstance(record.get(PREVIOUS_CANDIDATE_FIELD), bool)
+            or record.get(PREVIOUS_CANDIDATE_DATE_FIELD) != previous_candidate_date
+            for record in actual_queues
+        )
+        cache_marker_keys = {
+            pair_key(record)
+            for record in candidates
+            if "_前回出力済" in str(record.get("pair_file_name") or "")
+        }
+        both_keys = previous_keys & cache_marker_keys
+        cache_only_keys = cache_marker_keys - previous_keys
+        previous_only_keys = previous_keys - cache_marker_keys
+        neither_keys = candidate_keys - (previous_keys | cache_marker_keys)
+        proposal_previous_count = len(previous_keys & proposal_keys)
+        human_previous_count = len(previous_keys & human_keys)
 
         lines.extend(
             [
@@ -178,6 +216,15 @@ def main() -> None:
                 f"evidence_ready count: {sum(bool(row.get('evidence_ready')) for row in proposal + human)}",
                 f"proposal_ready count: {len(proposal)}",
                 f"human_review count: {len(human)}",
+                f"previous candidate date: {previous_candidate_date or 'none'}",
+                f"previous candidate count: {len(previous_keys)}",
+                f"proposal previous candidate count: {proposal_previous_count}",
+                f"human previous candidate count: {human_previous_count}",
+                f"Success Cache marker count: {len(cache_marker_keys)}",
+                f"both count: {len(both_keys)}",
+                f"cache only count: {len(cache_only_keys)}",
+                f"previous only count: {len(previous_only_keys)}",
+                f"neither count: {len(neither_keys)}",
             ]
         )
         append_check(
@@ -201,6 +248,83 @@ def main() -> None:
             "queue分類がcanonical入力からの再計算結果と一致",
             "queue分類がcanonical入力からの再計算結果と不一致",
         )
+        append_check(
+            lines,
+            errors,
+            previous_keys == expected_previous_keys and invalid_previous_fields == 0,
+            "previous candidate structured fieldが直前final candidateとの4-field joinに一致",
+            "previous candidate structured fieldが4-field joinと不一致: "
+            f"key差分={len(previous_keys ^ expected_previous_keys)} field不正={invalid_previous_fields}",
+        )
+        append_check(
+            lines,
+            errors,
+            len(previous_keys) + len(candidate_keys - previous_keys) == len(candidate_keys),
+            "final candidate件数 = previous + not previous",
+            "previous candidate partitionの件数不整合",
+        )
+        append_check(
+            lines,
+            errors,
+            proposal_previous_count + len(proposal_keys - previous_keys) == len(proposal_keys),
+            "proposal_ready件数 = previous + not previous",
+            "proposal_ready previous partitionの件数不整合",
+        )
+        append_check(
+            lines,
+            errors,
+            human_previous_count + len(human_keys - previous_keys) == len(human_keys),
+            "human_review件数 = previous + not previous",
+            "human_review previous partitionの件数不整合",
+        )
+        append_check(
+            lines,
+            errors,
+            not previous_only_keys,
+            "previous candidateはすべて既存Success Cache markerにも存在",
+            f"previous only={len(previous_only_keys)}",
+        )
+        append_check(
+            lines,
+            errors,
+            all(key not in previous_keys for key in cache_only_keys),
+            "cache onlyにはprevious candidate badgeを付与しない",
+            "cache onlyにprevious candidate marker混入",
+        )
+        if date_part == "20260820":
+            expected_20260820 = {
+                "final": 618,
+                "proposal": 36,
+                "human": 582,
+                "previous": 146,
+                "proposal_previous": 9,
+                "human_previous": 137,
+                "cache_marker": 201,
+                "both": 146,
+                "cache_only": 55,
+                "previous_only": 0,
+                "neither": 417,
+            }
+            actual_20260820 = {
+                "final": len(candidate_keys),
+                "proposal": len(proposal_keys),
+                "human": len(human_keys),
+                "previous": len(previous_keys),
+                "proposal_previous": proposal_previous_count,
+                "human_previous": human_previous_count,
+                "cache_marker": len(cache_marker_keys),
+                "both": len(both_keys),
+                "cache_only": len(cache_only_keys),
+                "previous_only": len(previous_only_keys),
+                "neither": len(neither_keys),
+            }
+            append_check(
+                lines,
+                errors,
+                actual_20260820 == expected_20260820,
+                "20260820 expected count fixtureと一致",
+                f"20260820 expected count fixtureと不一致: {actual_20260820}",
+            )
 
         draft_groups = defaultdict(list)
         for draft in drafts:

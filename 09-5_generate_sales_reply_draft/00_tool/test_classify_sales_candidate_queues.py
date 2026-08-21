@@ -14,12 +14,19 @@ from classify_sales_candidate_queues import (
 )
 
 
-def candidate(project_id="project-1", resource_id="resource-1"):
+def candidate(
+    project_id="project-1",
+    resource_id="resource-1",
+    previous_candidate=False,
+    previous_candidate_date="",
+):
     return {
         "project_message_id": project_id,
         "resource_message_id": resource_id,
         "pair_file_name": f"{project_id}_{resource_id}.json",
         "score_band": "high",
+        "previous_candidate": previous_candidate,
+        "previous_candidate_date": previous_candidate_date,
     }
 
 
@@ -276,6 +283,23 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         before = copy.deepcopy((candidates, drafts, rechecks))
         self.classify(candidates=candidates, drafts=drafts, rechecks=rechecks)
         self.assertEqual(before, (candidates, drafts, rechecks))
+
+    def test_previous_candidate_fields_propagate_to_proposal_ready(self):
+        proposal, human = self.classify(
+            candidates=[candidate(previous_candidate=True, previous_candidate_date="20260819")]
+        )
+        self.assertEqual([], human)
+        self.assertTrue(proposal[0]["previous_candidate"])
+        self.assertEqual("20260819", proposal[0]["previous_candidate_date"])
+
+    def test_previous_candidate_fields_propagate_to_human_review(self):
+        proposal, human = self.classify(
+            candidates=[candidate(previous_candidate=True, previous_candidate_date="20260819")],
+            rechecks=[recheck(category_match="unclear")],
+        )
+        self.assertEqual([], proposal)
+        self.assertTrue(human[0]["previous_candidate"])
+        self.assertEqual("20260819", human[0]["previous_candidate_date"])
 
 
 if __name__ == "__main__":

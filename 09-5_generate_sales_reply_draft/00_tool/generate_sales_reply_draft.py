@@ -58,15 +58,6 @@ def first_non_empty(*values: Any) -> Optional[Any]:
     return None
 
 
-def is_previous_output_record(record: Dict[str, Any]) -> bool:
-    duplicate_value = record.get("duplicate_proposal_check")
-    if isinstance(duplicate_value, bool):
-        return duplicate_value
-    if isinstance(duplicate_value, str) and duplicate_value.strip().lower() in {"true", "1", "yes", "済"}:
-        return True
-    return PREVIOUS_OUTPUT_SUFFIX in normalize_text(record.get("pair_file_name"))
-
-
 def base_pair_file_stem(pair_file_name: Any) -> str:
     stem = Path(normalize_text(pair_file_name)).stem
     if stem.endswith(PREVIOUS_OUTPUT_SUFFIX):
@@ -76,8 +67,7 @@ def base_pair_file_stem(pair_file_name: Any) -> str:
 
 def build_preview_file_name(record: Dict[str, Any], mail_mode: str, is_note: bool = False) -> str:
     note_part = "_note" if is_note else ""
-    previous_part = PREVIOUS_OUTPUT_SUFFIX if is_previous_output_record(record) else ""
-    return f"{base_pair_file_stem(record.get('pair_file_name'))}_{mail_mode}{note_part}{previous_part}.txt"
+    return f"{base_pair_file_stem(record.get('pair_file_name'))}_{mail_mode}{note_part}.txt"
 
 
 def normalize_start_date_for_display(value: Any) -> Optional[str]:

@@ -18,12 +18,20 @@ sys.path.insert(0, str(project_root))
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import read_jsonl_as_list, read_jsonl_as_dict
 from common.logger import get_logger
+from common.previous_candidate import (
+    PREVIOUS_CANDIDATE_DATE_FIELD,
+    PREVIOUS_CANDIDATE_FIELD,
+    build_previous_identity_set,
+    pair_identity,
+    resolve_previous_candidate_path,
+)
 
 STEP_NAME = "09-1_mail_display_format"
 STEP_DIR = Path(__file__).resolve().parents[1]
 
 INPUT_DIR = project_root / "08-4_match_score_sort/01_result"
 INPUT_MAIL_MASTER = project_root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
+FINAL_CANDIDATE_DIR = project_root / "09-4_remove_category_mismatch_sales_candidates/01_result"
 
 # 入力ファイル定義: (ファイル名, 出力ラベル)
 INPUT_FILES = [
@@ -36,25 +44,12 @@ INPUT_FILES = [
     ("match_score_sort_0percent.jsonl",      "0percent"),
 ]
 
-PREVIOUS_OUTPUT_SUFFIX = "_前回出力済"
-
-
 def is_no_match_file(records: list) -> bool:
     return len(records) == 1 and records[0].get("status") == "no_match"
 
 
-def is_duplicate_proposal(pair: dict) -> bool:
-    value = pair.get("duplicate_proposal_check", False)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "済"}
-    return False
-
-
 def build_output_filename(label: str, seq: int, pair: dict) -> str:
-    suffix = PREVIOUS_OUTPUT_SUFFIX if is_duplicate_proposal(pair) else ""
-    return f"mail_display_format_{label}_pair_{seq:04d}{suffix}.txt"
+    return f"mail_display_format_{label}_pair_{seq:04d}.txt"
 
 
 def normalize_body(body: str) -> str:
@@ -78,9 +73,6 @@ def normalize_body(body: str) -> str:
 
 def format_pair(pair: dict, mail_master: dict) -> str:
     """1ペアのテキスト出力を生成する。"""
-    is_duplicate = is_duplicate_proposal(pair)
-    duplicate_flag = "済" if is_duplicate else "未"
-
     project_mid = pair.get("project_info", {}).get("message_id", "")
     resource_mid = pair.get("resource_info", {}).get("message_id", "")
     required_skills = pair.get("project_info", {}).get("required_skills", [])
@@ -91,9 +83,11 @@ def format_pair(pair: dict, mail_master: dict) -> str:
 
     lines = []
 
-    # 前回提案済フラグ
-    lines.append(f"■■■前回提案済フラグ：{duplicate_flag}")
-    lines.append("")
+    if pair.get(PREVIOUS_CANDIDATE_FIELD) is True:
+        previous_date = pair.get(PREVIOUS_CANDIDATE_DATE_FIELD, "")
+        badge = f"[前回も候補: {previous_date}]" if previous_date else "[前回も候補]"
+        lines.append(badge)
+        lines.append("")
 
     # 案件メール
     lines.append("■■■案件メール")
@@ -168,7 +162,23 @@ def main():
         mail_master = read_jsonl_as_dict(str(INPUT_MAIL_MASTER), key="message_id")
         logger.info(f"メールマスタ件数={len(mail_master)}")
 
+        previous_path, previous_date = resolve_previous_candidate_path(
+            FINAL_CANDIDATE_DIR, today
+        )
+        previous_records = (
+            read_jsonl_as_list(str(previous_path)) if previous_path is not None else []
+        )
+        previous_identities = build_previous_identity_set(previous_records)
+        if previous_path is None:
+            logger.info("直前final candidateなし: previous candidateは全件false")
+        else:
+            logger.info(
+                f"previous candidate comparison: date={previous_date} path={previous_path} "
+                f"records={len(previous_records)}"
+            )
+
         total_pairs = 0
+        previous_candidate_count = 0
 
         for in_filename, label in INPUT_FILES:
             in_path = INPUT_DIR / in_filename
@@ -182,8 +192,14 @@ def main():
                 continue
 
             for seq, pair in enumerate(records, 1):
-                text = format_pair(pair, mail_master)
-                out_filename = build_output_filename(label, seq, pair)
+                display_pair = dict(pair)
+                display_pair[PREVIOUS_CANDIDATE_FIELD] = (
+                    pair_identity(pair, mail_master) in previous_identities
+                )
+                display_pair[PREVIOUS_CANDIDATE_DATE_FIELD] = previous_date
+                previous_candidate_count += int(display_pair[PREVIOUS_CANDIDATE_FIELD])
+                text = format_pair(display_pair, mail_master)
+                out_filename = build_output_filename(label, seq, display_pair)
                 out_path = output_dir / out_filename
                 out_path.write_text(text, encoding="utf-8")
                 total_pairs += 1
@@ -191,6 +207,10 @@ def main():
             logger.info(f"{label}: {len(records)}件出力")
 
         logger.info(f"テキストファイル出力完了: {total_pairs}件 → {output_dir}")
+        logger.info(
+            f"previous candidate badge={previous_candidate_count}件 "
+            f"comparison_date={previous_date or 'none'}"
+        )
         logger.info("別日付の mail_display_format 出力は削除しません")
 
         elapsed = time.time() - start_time
