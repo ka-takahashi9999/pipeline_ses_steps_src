@@ -19,6 +19,7 @@ from common.file_utils import ensure_result_dirs, write_error_log, write_executi
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from classify_sales_candidate_queues import generate_candidate_queues
+from render_sales_index import generate_sales_index
 
 STEP_NAME = "09-5_generate_sales_reply_draft"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -823,6 +824,7 @@ def main() -> None:
 
         write_jsonl(str(output_path), output_records)
         queue_summary = generate_candidate_queues(date_part)
+        index_summary = generate_sales_index(date_part)
         elapsed = time.time() - start_time
         write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, len(output_records))
         logger.ok(f"ドラフトJSONL出力完了: {output_path} ({len(output_records)}件)")
@@ -831,6 +833,11 @@ def main() -> None:
             "pair queue出力完了: "
             f"proposal_ready={queue_summary['proposal_ready']} "
             f"human_review={queue_summary['human_review']}"
+        )
+        logger.ok(
+            "sales index出力完了: "
+            f"path={index_summary['index_path']} "
+            f"initial={index_summary['initial']} total={index_summary['total']}"
         )
 
     except Exception as error:
