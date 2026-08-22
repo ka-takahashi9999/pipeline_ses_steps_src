@@ -894,6 +894,8 @@ def _validate_responses(
     failed = 0
     response_parse_errors: List[str] = list(parse_errors or [])
     response_schema_errors: List[str] = []
+    schema_invalid_custom_ids: List[str] = []
+    schema_invalid_custom_id_set = set()
 
     for entry in sorted(manifest, key=lambda item: int(item["ordinal"])):
         custom_id = str(entry["custom_id"])
@@ -936,6 +938,9 @@ def _validate_responses(
                     completed += 1
                 else:
                     failed += 1
+                    if custom_id not in schema_invalid_custom_id_set:
+                        schema_invalid_custom_id_set.add(custom_id)
+                        schema_invalid_custom_ids.append(custom_id)
                     response_schema_errors.extend(
                         f"{custom_id}: {error}" for error in schema_errors
                     )
@@ -962,6 +967,9 @@ def _validate_responses(
         "parse_error_count": len(response_parse_errors),
         "schema_errors": response_schema_errors,
         "schema_error_count": len(response_schema_errors),
+        "schema_invalid_custom_ids": schema_invalid_custom_ids,
+        "schema_invalid_pair_count": len(schema_invalid_custom_ids),
+        "schema_violation_message_count": len(response_schema_errors),
         "integrity_ok": integrity_ok,
         "usage": usage_totals,
         "shadow_results": shadow_results,
@@ -1108,7 +1116,12 @@ def _report_text(report: Dict[str, Any]) -> str:
         f"missing: {report['missing']}",
         f"unknown: {report['unknown']}",
         f"parse error: {report['parse_error']}",
-        f"schema error: {report['schema_error']}",
+        f"schema invalid pairs: {report['schema_invalid_pairs']}",
+        f"schema violation messages: {report['schema_violation_messages']}",
+        "schema invalid custom ids: "
+        f"{json.dumps(report['schema_invalid_custom_ids'], ensure_ascii=False)}",
+        "schema error (legacy alias; validation message count): "
+        f"{report['schema_error']}",
         f"official created time: {latency['official_created_at']}",
         f"official terminal time: {latency['official_terminal_at']}",
         f"official batch elapsed: {latency['official_batch_elapsed_minutes']} min",
@@ -1173,7 +1186,11 @@ def report_run(
         "missing": validation["missing_count"],
         "unknown": validation["unknown_count"],
         "parse_error": validation["parse_error_count"],
-        "schema_error": validation["schema_error_count"],
+        "schema_invalid_pairs": validation["schema_invalid_pair_count"],
+        "schema_violation_messages": validation["schema_violation_message_count"],
+        "schema_invalid_custom_ids": validation["schema_invalid_custom_ids"],
+        "schema_error": validation["schema_violation_message_count"],
+        "schema_error_unit": "validation_messages (legacy alias)",
         "integrity_ok": validation["integrity_ok"],
         "duplicate_custom_ids": validation["duplicate_custom_ids"],
         "missing_custom_ids": validation["missing_custom_ids"],

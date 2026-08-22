@@ -77,6 +77,21 @@ class BatchApiCanaryTest(unittest.TestCase):
             "error": None,
         }
 
+    @classmethod
+    def _schema_invalid_response(cls, entry, include_extra_key=False):
+        response = cls._fixture_response(entry)
+        content = json.loads(
+            response["response"]["body"]["choices"][0]["message"]["content"]
+        )
+        content["category_match"] = "invalid"
+        content["category_note"] = ""
+        if include_extra_key:
+            content["unexpected"] = True
+        response["response"]["body"]["choices"][0]["message"]["content"] = (
+            json.dumps(content)
+        )
+        return response
+
     def test_prepare_50_300_678_and_manifest_counts(self):
         for sample_size in (50, 300, 678):
             with self.subTest(sample_size=sample_size):
@@ -158,6 +173,68 @@ class BatchApiCanaryTest(unittest.TestCase):
         )
         self.assertTrue(result["integrity_ok"])
         self.assertEqual(1, result["success_count"])
+
+    def test_one_invalid_pair_with_two_messages_is_counted_separately(self):
+        run_dir, _ = self._prepare("one-pair-two-messages", 50)
+        manifest_entry = self._manifest(run_dir)[0]
+        result = canary._validate_responses(
+            [manifest_entry],
+            [self._schema_invalid_response(manifest_entry)],
+            [],
+        )
+        self.assertEqual(1, result["schema_invalid_pair_count"])
+        self.assertEqual(2, result["schema_violation_message_count"])
+
+    def test_two_invalid_pairs_with_five_messages_are_counted_separately(self):
+        run_dir, _ = self._prepare("two-pairs-five-messages", 50)
+        manifest = self._manifest(run_dir)[:2]
+        responses = [
+            self._schema_invalid_response(manifest[0]),
+            self._schema_invalid_response(manifest[1], include_extra_key=True),
+        ]
+        result = canary._validate_responses(manifest, responses, [])
+        self.assertEqual(2, result["schema_invalid_pair_count"])
+        self.assertEqual(5, result["schema_violation_message_count"])
+
+    def test_multiple_messages_do_not_duplicate_invalid_custom_id(self):
+        run_dir, _ = self._prepare("invalid-id-dedup", 50)
+        manifest_entry = self._manifest(run_dir)[0]
+        result = canary._validate_responses(
+            [manifest_entry],
+            [self._schema_invalid_response(manifest_entry)],
+            [],
+        )
+        self.assertEqual(
+            [manifest_entry["custom_id"]], result["schema_invalid_custom_ids"]
+        )
+
+    def test_all_valid_has_zero_schema_pairs_and_messages(self):
+        run_dir, _ = self._prepare("all-schema-valid", 50)
+        manifest = self._manifest(run_dir)
+        responses = [self._fixture_response(entry) for entry in manifest]
+        result = canary._validate_responses(manifest, responses, [])
+        self.assertEqual(0, result["schema_invalid_pair_count"])
+        self.assertEqual(0, result["schema_violation_message_count"])
+        self.assertEqual([], result["schema_invalid_custom_ids"])
+
+    def test_existing_canary50_fixture_has_four_pairs_and_eight_messages(self):
+        fixture_dir = canary.CANARY_ROOT / "canary50-20260822-01"
+        if not fixture_dir.exists():
+            self.skipTest("existing canary50 fixture is not available")
+        manifest = list(canary.read_jsonl(str(fixture_dir / "manifest.jsonl")))
+        outputs, output_errors = canary._read_jsonl_strict(
+            fixture_dir / "output_raw.jsonl"
+        )
+        result = canary._validate_responses(manifest, outputs, [], output_errors)
+        expected_ids = [
+            "c-canary50-20260822-01-0013-27fe1e6c02c8",
+            "c-canary50-20260822-01-0018-1390e611707c",
+            "c-canary50-20260822-01-0019-a58c0a3dfc0f",
+            "c-canary50-20260822-01-0021-9c6f5aa4be63",
+        ]
+        self.assertEqual(4, result["schema_invalid_pair_count"])
+        self.assertEqual(8, result["schema_violation_message_count"])
+        self.assertEqual(expected_ids, result["schema_invalid_custom_ids"])
 
     def test_wrong_skill_is_rejected_by_production_validation(self):
         run_dir, _ = self._prepare("wrong-skill", 50)
@@ -400,6 +477,13 @@ class BatchApiCanaryTest(unittest.TestCase):
         report = canary.report_run("report", root=self.root)
         self.assertTrue(report["integrity_ok"])
         self.assertEqual(50, report["completed"])
+        self.assertEqual(0, report["schema_invalid_pairs"])
+        self.assertEqual(0, report["schema_violation_messages"])
+        self.assertEqual([], report["schema_invalid_custom_ids"])
+        self.assertEqual(report["schema_violation_messages"], report["schema_error"])
+        self.assertEqual(
+            "validation_messages (legacy alias)", report["schema_error_unit"]
+        )
         self.assertEqual(5000, report["usage"]["input_tokens"])
         self.assertEqual(1000, report["usage"]["cached_input_tokens"])
         self.assertEqual(1500, report["usage"]["output_tokens"])
@@ -409,6 +493,9 @@ class BatchApiCanaryTest(unittest.TestCase):
         self.assertEqual(list(range(1, 51)), [row["ordinal"] for row in report["shadow_results"]])
         self.assertTrue((run_dir / "report.json").exists())
         self.assertTrue((run_dir / "report.txt").exists())
+        report_text = (run_dir / "report.txt").read_text(encoding="utf-8")
+        self.assertIn("schema invalid pairs: 0", report_text)
+        self.assertIn("schema violation messages: 0", report_text)
 
     def test_status_history_uses_api_status_and_timestamps(self):
         state = {"status_history": [], "batch_timestamps": {}}
