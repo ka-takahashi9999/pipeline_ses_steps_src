@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -27,6 +28,7 @@ PRODUCTION_RESULT_DIR = STEP_DIR / "01_result"
 CURRENT_TOOL = Path(__file__).resolve()
 PRODUCTION_TOOL = CURRENT_TOOL.with_name("high_score_required_skill_recheck.py")
 MAX_SAMPLE_SIZE = 678
+SUBMIT_CLAIM_FILENAME = "submit.claim"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
 API_BASE_URL = "https://api.openai.com/v1"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
@@ -566,13 +568,7 @@ def _update_batch_state(state: Dict[str, Any], batch: Dict[str, Any]) -> None:
             state["batch_usage" if field == "usage" else field] = batch[field]
 
 
-def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Dict[str, Any]:
-    _require_network(allow_network)
-    run_dir = _run_dir(run_id, root=root)
-    candidates, _ = _load_candidates()
-    validation = _validate_prepared(run_dir, _source_hash_map(candidates))
-    state_path = run_dir / "batch_state.json"
-    state = _read_json(state_path)
+def _assert_submit_allowed(state: Dict[str, Any]) -> None:
     if state.get("batch_id"):
         raise ValueError("既存batch_idあり: 二重submitを拒否")
     submission_state = str(state.get("submission_state") or "")
@@ -582,6 +578,49 @@ def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Di
         )
     if state.get("input_file_id"):
         raise ValueError("既存input_file_idあり: 旧stateの曖昧な再submitを拒否")
+
+
+def _acquire_submit_claim(run_dir: Path, root: Path = CANARY_ROOT) -> Path:
+    claim_path = run_dir / SUBMIT_CLAIM_FILENAME
+    _assert_canary_path(claim_path, root=root)
+    try:
+        descriptor = os.open(
+            str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+    except FileExistsError as error:
+        raise ValueError(
+            "submit claim取得済み: 同一canary runの同時/再submitを拒否"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as claim_file:
+            claim_file.write(
+                json.dumps(
+                    {"claimed_at": _utc_now()},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            claim_file.flush()
+            os.fsync(claim_file.fileno())
+    except Exception:
+        # claimは意図的に残し、取得後のcrash/書込み失敗でも再submitを拒否する。
+        raise
+    return claim_path
+
+
+def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Dict[str, Any]:
+    _require_network(allow_network)
+    run_dir = _run_dir(run_id, root=root)
+    candidates, _ = _load_candidates()
+    validation = _validate_prepared(run_dir, _source_hash_map(candidates))
+    state_path = run_dir / "batch_state.json"
+    state = _read_json(state_path)
+    _assert_submit_allowed(state)
+
+    _acquire_submit_claim(run_dir, root=root)
+    state = _read_json(state_path)
+    _assert_submit_allowed(state)
 
     manifest_sha256 = str(validation["manifest_sha256"])
     stored_manifest_sha256 = str(state.get("manifest_sha256") or manifest_sha256)

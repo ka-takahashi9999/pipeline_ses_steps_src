@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
@@ -296,6 +297,79 @@ class BatchApiCanaryTest(unittest.TestCase):
         self.assertEqual("ambiguous-submit", batch_metadata[0]["canary_run_id"])
         self.assertEqual("1", batch_metadata[0]["canary_attempt"])
         self.assertEqual(state["manifest_sha256"], batch_metadata[0]["manifest_sha256"])
+
+    def test_concurrent_submit_allows_only_one_process_to_reach_network(self):
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        run_dir, _ = self._prepare("concurrent-submit", 50)
+        context = multiprocessing.get_context("fork")
+        start_barrier = context.Barrier(2)
+        result_queue = context.Queue()
+        files_upload_count = context.Value("i", 0)
+        batch_create_count = context.Value("i", 0)
+        original_acquire = canary._acquire_submit_claim
+
+        def synchronized_acquire(target_run_dir, root=canary.CANARY_ROOT):
+            start_barrier.wait(timeout=10)
+            return original_acquire(target_run_dir, root=root)
+
+        def fake_post(url, **kwargs):
+            if url.endswith("/files"):
+                with files_upload_count.get_lock():
+                    files_upload_count.value += 1
+                return FakeResponse({"id": "file-fixture"})
+            if url.endswith("/batches"):
+                with batch_create_count.get_lock():
+                    batch_create_count.value += 1
+                return FakeResponse(
+                    {"id": "batch-fixture", "status": "validating", "created_at": 1}
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+        def submit_worker():
+            try:
+                canary.submit_run("concurrent-submit", True, root=self.root)
+            except Exception as error:
+                result_queue.put(("failure", str(error)))
+            else:
+                result_queue.put(("success", ""))
+
+        with mock.patch.object(
+            canary, "_load_candidates", return_value=(self.candidates, self.excluded)
+        ), mock.patch.object(
+            canary, "_acquire_submit_claim", side_effect=synchronized_acquire
+        ), mock.patch.object(
+            canary,
+            "_authorization_headers",
+            return_value={"Authorization": "Bearer fixture"},
+        ), mock.patch.object(canary.requests, "post", side_effect=fake_post):
+            processes = [context.Process(target=submit_worker) for _ in range(2)]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=15)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(0, process.exitcode)
+
+        outcomes = [result_queue.get(timeout=5) for _ in range(2)]
+        self.assertEqual(1, sum(outcome[0] == "success" for outcome in outcomes))
+        self.assertEqual(1, sum(outcome[0] == "failure" for outcome in outcomes))
+        self.assertTrue(
+            any("submit claim取得済み" in outcome[1] for outcome in outcomes)
+        )
+        self.assertEqual(1, files_upload_count.value)
+        self.assertEqual(1, batch_create_count.value)
+        self.assertTrue((run_dir / canary.SUBMIT_CLAIM_FILENAME).exists())
 
     def test_pending_reconciliation_refuses_network_resubmit(self):
         run_dir, _ = self._prepare("pending-state", 50)
