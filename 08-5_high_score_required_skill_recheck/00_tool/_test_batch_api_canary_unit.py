@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("_test_batch_api_canary.py")
@@ -44,12 +45,12 @@ class BatchApiCanaryTest(unittest.TestCase):
     def _fixture_response(entry):
         checks = [
             {
-                "skill": "fixture skill",
+                "skill": skill,
                 "confidence": "human_review",
                 "reason": "fixture reason",
                 "evidence": "",
             }
-            for _ in range(entry["required_skill_count"])
+            for skill in entry["required_skill_texts"]
         ]
         content = {
             "required_skill_checks": checks,
@@ -148,6 +149,39 @@ class BatchApiCanaryTest(unittest.TestCase):
         self.assertEqual(50, result["success_count"])
         self.assertEqual(list(range(1, 51)), [item["ordinal"] for item in result["shadow_results"]])
 
+    def test_production_equivalent_response_is_accepted(self):
+        run_dir, _ = self._prepare("production-valid", 50)
+        manifest_entry = self._manifest(run_dir)[0]
+        result = canary._validate_responses(
+            [manifest_entry], [self._fixture_response(manifest_entry)], []
+        )
+        self.assertTrue(result["integrity_ok"])
+        self.assertEqual(1, result["success_count"])
+
+    def test_wrong_skill_is_rejected_by_production_validation(self):
+        run_dir, _ = self._prepare("wrong-skill", 50)
+        manifest_entry = self._manifest(run_dir)[0]
+        response = self._fixture_response(manifest_entry)
+        content = json.loads(response["response"]["body"]["choices"][0]["message"]["content"])
+        content["required_skill_checks"][0]["skill"] = "wrong skill"
+        response["response"]["body"]["choices"][0]["message"]["content"] = json.dumps(content)
+        result = canary._validate_responses([manifest_entry], [response], [])
+        self.assertFalse(result["integrity_ok"])
+        self.assertEqual(1, result["schema_error_count"])
+        self.assertIn("skill不一致", result["schema_errors"][0])
+
+    def test_empty_reason_is_rejected_by_production_validation(self):
+        run_dir, _ = self._prepare("empty-reason", 50)
+        manifest_entry = self._manifest(run_dir)[0]
+        response = self._fixture_response(manifest_entry)
+        content = json.loads(response["response"]["body"]["choices"][0]["message"]["content"])
+        content["required_skill_checks"][0]["reason"] = ""
+        response["response"]["body"]["choices"][0]["message"]["content"] = json.dumps(content)
+        result = canary._validate_responses([manifest_entry], [response], [])
+        self.assertFalse(result["integrity_ok"])
+        self.assertEqual(1, result["schema_error_count"])
+        self.assertIn("reasonが空", result["schema_errors"][0])
+
     def test_duplicate_custom_id_is_detected(self):
         run_dir, _ = self._prepare("duplicate", 50)
         manifest = self._manifest(run_dir)
@@ -205,6 +239,75 @@ class BatchApiCanaryTest(unittest.TestCase):
                 run_dir, canary._source_hash_map(self.candidates)
             )
 
+    def test_ambiguous_batch_create_timeout_blocks_resubmit(self):
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.body
+
+        run_dir, _ = self._prepare("ambiguous-submit", 50)
+        post_urls = []
+        observed_submission_states = []
+        batch_metadata = []
+        responses = [
+            FakeResponse({"id": "file-fixture"}),
+            canary.requests.Timeout("ambiguous Batch create timeout"),
+        ]
+
+        def fake_post(url, **kwargs):
+            post_urls.append(url)
+            observed_submission_states.append(
+                canary._read_json(run_dir / "batch_state.json")["submission_state"]
+            )
+            if url.endswith("/batches"):
+                batch_metadata.append(kwargs["json"]["metadata"])
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with mock.patch.object(
+            canary,
+            "_authorization_headers",
+            return_value={"Authorization": "Bearer fixture"},
+        ), mock.patch.object(canary.requests, "post", side_effect=fake_post):
+            with self.assertRaises(canary.requests.Timeout):
+                canary.submit_run("ambiguous-submit", True, root=self.root)
+            calls_after_first = list(post_urls)
+            with self.assertRaisesRegex(ValueError, "pending_reconciliation"):
+                canary.submit_run("ambiguous-submit", True, root=self.root)
+
+        state = canary._read_json(run_dir / "batch_state.json")
+        self.assertEqual("pending_reconciliation", state["submission_state"])
+        self.assertIsNone(state["batch_id"])
+        self.assertEqual(calls_after_first, post_urls)
+        self.assertEqual(1, sum(url.endswith("/files") for url in post_urls))
+        self.assertEqual(1, sum(url.endswith("/batches") for url in post_urls))
+        self.assertEqual(
+            ["submitting", "pending_reconciliation"], observed_submission_states
+        )
+        self.assertEqual("ambiguous-submit", batch_metadata[0]["canary_run_id"])
+        self.assertEqual("1", batch_metadata[0]["canary_attempt"])
+        self.assertEqual(state["manifest_sha256"], batch_metadata[0]["manifest_sha256"])
+
+    def test_pending_reconciliation_refuses_network_resubmit(self):
+        run_dir, _ = self._prepare("pending-state", 50)
+        state_path = run_dir / "batch_state.json"
+        state = canary._read_json(state_path)
+        state["submission_state"] = "pending_reconciliation"
+        canary._write_json(state_path, state, root=self.root)
+        with mock.patch.object(canary.requests, "post") as post:
+            with self.assertRaisesRegex(ValueError, "pending_reconciliation"):
+                canary.submit_run("pending-state", True, root=self.root)
+        post.assert_not_called()
+
     def test_fixture_report_usage_latency_and_shadow_output(self):
         run_dir, _ = self._prepare("report", 50)
         manifest = self._manifest(run_dir)
@@ -216,6 +319,7 @@ class BatchApiCanaryTest(unittest.TestCase):
         state["batch_submitted_at"] = "2026-08-22T00:00:00Z"
         state["last_status"] = "completed"
         state["request_counts"] = {"total": 50, "completed": 50, "failed": 0}
+        state["batch_timestamps"]["created_at"] = 1787360100
         state["batch_timestamps"]["in_progress_at"] = 1787360400
         state["batch_timestamps"]["completed_at"] = 1787364000
         canary._write_json(state_path, state, root=self.root)
@@ -226,6 +330,8 @@ class BatchApiCanaryTest(unittest.TestCase):
         self.assertEqual(1000, report["usage"]["cached_input_tokens"])
         self.assertEqual(1500, report["usage"]["output_tokens"])
         self.assertEqual(6500, report["usage"]["total_tokens"])
+        self.assertEqual(65.0, report["latency"]["official_batch_elapsed_minutes"])
+        self.assertEqual("completed_at", report["latency"]["official_terminal_field"])
         self.assertEqual(list(range(1, 51)), [row["ordinal"] for row in report["shadow_results"]])
         self.assertTrue((run_dir / "report.json").exists())
         self.assertTrue((run_dir / "report.txt").exists())
@@ -252,6 +358,23 @@ class BatchApiCanaryTest(unittest.TestCase):
         self.assertEqual("finalizing", state["status_history"][0]["status"])
         self.assertEqual(300, state["batch_timestamps"]["finalizing_at"])
         self.assertEqual(13, state["batch_usage"]["total_tokens"])
+
+    def test_official_created_at_to_terminal_latency_is_primary(self):
+        state = {
+            "last_status": "completed",
+            "submit_started_at": "2030-01-01T00:00:00Z",
+            "batch_create_started_at": "2030-01-01T00:01:00Z",
+            "batch_timestamps": {
+                "created_at": 100,
+                "completed_at": 400,
+                "failed_at": 1000,
+            },
+        }
+        latency = canary._latency_report(state)
+        self.assertEqual("completed_at", latency["official_terminal_field"])
+        self.assertEqual("1970-01-01T00:01:40Z", latency["official_created_at"])
+        self.assertEqual("1970-01-01T00:06:40Z", latency["official_terminal_at"])
+        self.assertEqual(5.0, latency["official_batch_elapsed_minutes"])
 
     def test_secret_patterns_are_rejected_and_artifacts_are_clean(self):
         run_dir, _ = self._prepare("secrets", 50)

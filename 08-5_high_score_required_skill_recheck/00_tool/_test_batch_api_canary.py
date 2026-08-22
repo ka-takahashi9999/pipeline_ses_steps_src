@@ -30,6 +30,12 @@ MAX_SAMPLE_SIZE = 678
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
 API_BASE_URL = "https://api.openai.com/v1"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
+TERMINAL_TIME_FIELDS = {
+    "completed": "completed_at",
+    "failed": "failed_at",
+    "expired": "expired_at",
+    "cancelled": "cancelled_at",
+}
 BATCH_TIME_FIELDS = (
     "created_at",
     "in_progress_at",
@@ -214,6 +220,9 @@ def _load_candidates() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
                     "project_message_id": project_id,
                     "resource_message_id": resource_id,
                     "required_skill_count": len(required_skills),
+                    "required_skill_texts": [
+                        PRODUCTION._skill_text(skill) for skill in required_skills
+                    ],
                     "request_size": len(_canonical_bytes(body)),
                     "source_record_sha256": source_hash,
                     "selection_hash": hashlib.sha256(
@@ -370,6 +379,18 @@ def _validate_prepared(
             raise ValueError(f"manifest mismatch: request body SHA-256不一致 {custom_id}")
         if request.get("method") != "POST" or request.get("url") != "/v1/chat/completions":
             raise ValueError(f"Batch request envelope不正: {custom_id}")
+        required_skill_texts = entry.get("required_skill_texts")
+        if not isinstance(required_skill_texts, list) or not all(
+            isinstance(skill, str) for skill in required_skill_texts
+        ):
+            raise ValueError(f"manifest mismatch: required skill一覧不正 {custom_id}")
+        if len(required_skill_texts) != int(entry.get("required_skill_count", -1)):
+            raise ValueError(f"manifest mismatch: required skill件数不一致 {custom_id}")
+        expected_schema = PRODUCTION._build_schema(
+            [{"skill": skill} for skill in required_skill_texts]
+        )
+        if _sha256(expected_schema) != entry.get("response_schema_sha256"):
+            raise ValueError(f"manifest mismatch: response schema SHA-256不一致 {custom_id}")
         if source_hashes is not None:
             source_key = (
                 int(entry.get("source_ordinal", -1)),
@@ -385,6 +406,13 @@ def _validate_prepared(
                     f"manifest mismatch: source record SHA-256不一致 {custom_id}"
                 )
     _ensure_no_secrets([run_dir / "input.jsonl", run_dir / "manifest.jsonl"])
+    manifest_sha256 = _sha256(manifest)
+    state_path = run_dir / "batch_state.json"
+    if state_path.exists():
+        state = _read_json(state_path)
+        stored_manifest_sha256 = state.get("manifest_sha256")
+        if stored_manifest_sha256 and stored_manifest_sha256 != manifest_sha256:
+            raise ValueError("manifest mismatch: batch state SHA-256不一致")
     return {
         "input_count": len(input_records),
         "manifest_count": len(manifest),
@@ -392,6 +420,7 @@ def _validate_prepared(
         "request_body_generated": all(isinstance(row.get("body"), dict) for row in input_records),
         "production_write": 0,
         "api_calls": 0,
+        "manifest_sha256": manifest_sha256,
     }
 
 
@@ -438,6 +467,7 @@ def prepare_run(
             "resource_message_id": item["resource_message_id"],
             "score_band": item["score_band"],
             "required_skill_count": item["required_skill_count"],
+            "required_skill_texts": item["required_skill_texts"],
             "request_size": item["request_size"],
             "request_sha256": _sha256(request),
             "request_body_sha256": _sha256(item["body"]),
@@ -465,6 +495,12 @@ def prepare_run(
         "prepared_at": prepared_at,
         "file_uploaded_at": None,
         "batch_submitted_at": None,
+        "submit_started_at": None,
+        "batch_create_started_at": None,
+        "batch_create_response_received_at": None,
+        "submission_state": "prepared",
+        "submission_attempt": 0,
+        "manifest_sha256": _sha256(manifest),
         "input_file_id": None,
         "batch_id": None,
         "last_status": None,
@@ -539,6 +575,31 @@ def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Di
     state = _read_json(state_path)
     if state.get("batch_id"):
         raise ValueError("既存batch_idあり: 二重submitを拒否")
+    submission_state = str(state.get("submission_state") or "")
+    if submission_state in {"submitting", "pending_reconciliation", "submitted"}:
+        raise ValueError(
+            f"submission_state={submission_state}: 安全確認前の再submitを拒否"
+        )
+    if state.get("input_file_id"):
+        raise ValueError("既存input_file_idあり: 旧stateの曖昧な再submitを拒否")
+
+    manifest_sha256 = str(validation["manifest_sha256"])
+    stored_manifest_sha256 = str(state.get("manifest_sha256") or manifest_sha256)
+    if stored_manifest_sha256 != manifest_sha256:
+        raise ValueError("manifest mismatch: submit対象SHA-256不一致")
+    try:
+        submission_attempt = int(state.get("submission_attempt", 0)) + 1
+    except (TypeError, ValueError):
+        raise ValueError("submission_attemptが整数ではありません")
+    state.update(
+        {
+            "submission_state": "submitting",
+            "submission_attempt": submission_attempt,
+            "manifest_sha256": manifest_sha256,
+            "submit_started_at": _utc_now(),
+        }
+    )
+    _write_json(state_path, state, root=root)
 
     headers = _authorization_headers()
     with open(run_dir / "input.jsonl", "rb") as input_file:
@@ -557,6 +618,9 @@ def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Di
     state["file_uploaded_at"] = _utc_now()
     _write_json(state_path, state, root=root)
 
+    state["submission_state"] = "pending_reconciliation"
+    state["batch_create_started_at"] = _utc_now()
+    _write_json(state_path, state, root=root)
     response = requests.post(
         API_BASE_URL + "/batches",
         headers={**headers, "Content-Type": "application/json"},
@@ -564,7 +628,12 @@ def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Di
             "input_file_id": input_file_id,
             "endpoint": "/v1/chat/completions",
             "completion_window": "24h",
-            "metadata": {"canary_run_id": run_id, "step": PRODUCTION.STEP_NAME},
+            "metadata": {
+                "canary_run_id": run_id,
+                "step": PRODUCTION.STEP_NAME,
+                "canary_attempt": str(submission_attempt),
+                "manifest_sha256": manifest_sha256,
+            },
         },
         timeout=120,
     )
@@ -572,8 +641,11 @@ def submit_run(run_id: str, allow_network: bool, root: Path = CANARY_ROOT) -> Di
     batch_id = str(batch.get("id") or "")
     if not batch_id:
         raise RuntimeError("OpenAI batch create responseにidがありません")
+    response_received_at = _utc_now()
     state["batch_id"] = batch_id
-    state["batch_submitted_at"] = _utc_now()
+    state["batch_submitted_at"] = response_received_at
+    state["batch_create_response_received_at"] = response_received_at
+    state["submission_state"] = "submitted"
     _update_batch_state(state, batch)
     _write_json(state_path, state, root=root)
     return {"batch_id": batch_id, "status": state.get("last_status"), **validation}
@@ -732,6 +804,20 @@ def _validate_response_schema(
             continue
         if check.get("confidence") not in PRODUCTION.VALID_CONFIDENCES:
             errors.append(f"required_skill_checks[{index}] confidence不正")
+    required_skill_texts = manifest_entry.get("required_skill_texts")
+    if not isinstance(required_skill_texts, list) or not all(
+        isinstance(skill, str) for skill in required_skill_texts
+    ):
+        errors.append("manifest required_skill_texts不正")
+    else:
+        production_required_skills = [
+            {"skill": skill} for skill in required_skill_texts
+        ]
+        _, production_error = PRODUCTION._validate_required_skill_checks(
+            production_required_skills, checks
+        )
+        if production_error:
+            errors.append(f"production validation不一致: {production_error}")
     if parsed.get("category_match") not in PRODUCTION.VALID_CATEGORY_MATCHES:
         errors.append("category_match不正")
     if not isinstance(parsed.get("category_note"), str) or not parsed.get("category_note"):
@@ -859,14 +945,14 @@ def _latency_report(state: Dict[str, Any]) -> Dict[str, Any]:
     timestamps = state.get("batch_timestamps")
     if not isinstance(timestamps, dict):
         timestamps = {}
-    submitted = _parse_iso(state.get("batch_submitted_at"))
-    terminal_epoch = next(
-        (
-            timestamps.get(field)
-            for field in ("completed_at", "failed_at", "expired_at", "cancelled_at")
-            if timestamps.get(field) is not None
-        ),
-        None,
+    last_status = str(state.get("last_status") or "")
+    terminal_field = TERMINAL_TIME_FIELDS.get(last_status)
+    created_epoch = timestamps.get("created_at")
+    terminal_epoch = timestamps.get(terminal_field) if terminal_field else None
+    created = (
+        datetime.fromtimestamp(created_epoch, tz=timezone.utc)
+        if isinstance(created_epoch, (int, float))
+        else None
     )
     terminal = (
         datetime.fromtimestamp(terminal_epoch, tz=timezone.utc)
@@ -879,6 +965,8 @@ def _latency_report(state: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(in_progress_epoch, (int, float))
         else None
     )
+    local_submit_started = _parse_iso(state.get("submit_started_at"))
+    local_batch_create_started = _parse_iso(state.get("batch_create_started_at"))
 
     def elapsed_minutes(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
         if start is None or end is None:
@@ -889,12 +977,26 @@ def _latency_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "local_prepared_at": state.get("prepared_at"),
         "file_uploaded_at": state.get("file_uploaded_at"),
         "batch_submitted_at": state.get("batch_submitted_at"),
+        "local_submit_started_at": state.get("submit_started_at"),
+        "local_batch_create_started_at": state.get("batch_create_started_at"),
+        "local_batch_create_response_received_at": state.get(
+            "batch_create_response_received_at"
+        ),
         "batch_timestamps_epoch": {field: timestamps.get(field) for field in BATCH_TIME_FIELDS},
         "batch_timestamps_iso": {field: _epoch_iso(timestamps.get(field)) for field in BATCH_TIME_FIELDS},
-        "terminal_at": _epoch_iso(terminal_epoch),
-        "submit_to_terminal_minutes": elapsed_minutes(submitted, terminal),
-        "submit_to_in_progress_minutes": elapsed_minutes(submitted, in_progress),
-        "in_progress_to_terminal_minutes": elapsed_minutes(in_progress, terminal),
+        "official_created_at": _epoch_iso(created_epoch),
+        "official_terminal_field": terminal_field,
+        "official_terminal_at": _epoch_iso(terminal_epoch),
+        "official_batch_elapsed_minutes": elapsed_minutes(created, terminal),
+        "local_submit_start_to_terminal_minutes": elapsed_minutes(
+            local_submit_started, terminal
+        ),
+        "local_batch_create_start_to_terminal_minutes": elapsed_minutes(
+            local_batch_create_started, terminal
+        ),
+        "official_in_progress_to_terminal_minutes": elapsed_minutes(
+            in_progress, terminal
+        ),
     }
 
 
@@ -968,9 +1070,12 @@ def _report_text(report: Dict[str, Any]) -> str:
         f"unknown: {report['unknown']}",
         f"parse error: {report['parse_error']}",
         f"schema error: {report['schema_error']}",
-        f"submit time: {latency['batch_submitted_at']}",
-        f"terminal time: {latency['terminal_at']}",
-        f"elapsed: {latency['submit_to_terminal_minutes']} min",
+        f"official created time: {latency['official_created_at']}",
+        f"official terminal time: {latency['official_terminal_at']}",
+        f"official batch elapsed: {latency['official_batch_elapsed_minutes']} min",
+        f"local submit start: {latency['local_submit_started_at']}",
+        "local submit start to terminal: "
+        f"{latency['local_submit_start_to_terminal_minutes']} min",
         f"input tokens: {usage['input_tokens']}",
         f"cached input tokens: {usage['cached_input_tokens']}",
         f"output tokens: {usage['output_tokens']}",
