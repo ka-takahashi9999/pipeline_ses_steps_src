@@ -93,7 +93,7 @@ SYSTEM_PROMPT = """あなたはIT人材評価の専門家です。
   チームワーク / 責任感 / 自立 / 自走 / 一人称 を主題とするスキル、および
   「スキルシートから直接判定不能な人物像・スタンス系」スキル
 - これらに該当し、かつスキル文言に技術語（言語名／製品名／設計・開発・構築・運用 等の工程語）を含まない場合は、
-  confidence=confirmed, recheck_match=true, reason="営業確認前提で固定" とする
+  confidence=confirmed, reason="営業確認前提で固定" とする
 - スキル文言に技術語を含む場合（例:「Javaを一人称で対応できる方」）は通常評価（技術要件本体で判定）
 
 【重要方針】
@@ -140,7 +140,6 @@ SYSTEM_PROMPT = """あなたはIT人材評価の専門家です。
 - confidence は confirmed / human_review / not_confirmed のみ
 - reason は短く、根拠または確認ポイントを書く。空文字/null禁止
 - evidence はスキルシートから短い根拠断片を抜き出す。根拠がない場合は空文字
-- recheck_match は confirmed と human_review なら true、not_confirmed なら false
 - category_match は match / mismatch / unclear のみ
 - category_note は短く技術領域を記載する。空文字/null禁止
 """
@@ -213,8 +212,6 @@ def _build_schema(required_skills: List[Dict[str, Any]]) -> Dict[str, Any]:
         "required_skill_checks": [
             {
                 "skill": _skill_text(skill),
-                "original_match": skill.get("match") is True,
-                "recheck_match": True,
                 "confidence": "human_review",
                 "reason": "",
                 "evidence": "",

@@ -84,7 +84,7 @@ PRODUCTION_CASES = [
 
 
 class OrExampleOverrideTest(unittest.TestCase):
-    def test_llm_call_uses_08_5_telemetry_context_without_schema_change(self):
+    def test_llm_response_omits_restored_fields_but_final_schema_keeps_them(self):
         record = {
             "project_info": {
                 "message_id": "project-1",
@@ -104,8 +104,6 @@ class OrExampleOverrideTest(unittest.TestCase):
             "required_skill_checks": [
                 {
                     "skill": "Python開発経験",
-                    "original_match": True,
-                    "recheck_match": True,
                     "confidence": "confirmed",
                     "reason": "Python開発経験あり",
                     "evidence": "Python開発経験あり",
@@ -138,6 +136,72 @@ class OrExampleOverrideTest(unittest.TestCase):
             call_llm_mock.call_args.kwargs["telemetry_context"],
             target.LLM_TELEMETRY_CONTEXT,
         )
+        response_check_schema = call_llm_mock.call_args.kwargs["response_schema"][
+            "required_skill_checks"
+        ][0]
+        self.assertEqual(
+            set(response_check_schema),
+            {"skill", "confidence", "reason", "evidence"},
+        )
+        self.assertEqual(
+            result["required_skill_checks"][0],
+            {
+                "skill": "Python開発経験",
+                "original_match": True,
+                "recheck_match": True,
+                "confidence": "confirmed",
+                "reason": "Python開発経験あり",
+                "evidence": "Python開発経験あり",
+            },
+        )
+
+    def test_restores_match_fields_from_input_and_confidence_contract(self):
+        required_skills = [
+            {"skill": "Python開発経験", "match": True},
+            {"skill": "Java開発経験", "match": False},
+            {"skill": "COBOL開発経験", "match": True},
+        ]
+        llm_checks = [
+            {
+                "skill": "Python開発経験",
+                "confidence": "confirmed",
+                "reason": "Python経験あり",
+                "evidence": "Python 5年",
+            },
+            {
+                "skill": "Java開発経験",
+                "confidence": "human_review",
+                "reason": "Java経験年数の確認が必要",
+                "evidence": "Java経験あり",
+            },
+            {
+                "skill": "COBOL開発経験",
+                "confidence": "not_confirmed",
+                "reason": "COBOL経験の根拠なし",
+                "evidence": "",
+            },
+        ]
+
+        checks, error = target._validate_required_skill_checks(
+            required_skills, llm_checks
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            [item["original_match"] for item in checks], [True, False, True]
+        )
+        self.assertEqual(
+            [item["recheck_match"] for item in checks], [True, True, False]
+        )
+        expected_final_keys = {
+            "skill",
+            "original_match",
+            "recheck_match",
+            "confidence",
+            "reason",
+            "evidence",
+        }
+        self.assertTrue(all(set(item) == expected_final_keys for item in checks))
 
     def test_explicit_or_with_direct_evidence_can_override(self):
         cases = [
