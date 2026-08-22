@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common.file_utils import ensure_result_dirs, write_execution_time
 from common.json_utils import append_jsonl, read_jsonl, read_jsonl_as_list
@@ -25,6 +26,7 @@ from common.llm_client import call_llm
 from common.logger import get_logger
 from common.skillsheet_ai_context import build_skillsheet_ai_context
 from common.skill_policy import AUTO_TRUE_RECHECK_REASON, is_auto_true_skill
+import high_score_required_skill_recheck_core as SHARED_CORE
 
 STEP_NAME = "08-5_high_score_required_skill_recheck"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -274,52 +276,9 @@ def _validate_required_skill_checks(
     required_skills: List[Dict[str, Any]],
     checks: Any,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    if not isinstance(checks, list):
-        return None, "required_skill_checksがlistでない"
-    if len(checks) != len(required_skills):
-        return (
-            None,
-            f"required_skill_checks件数不一致: 入力={len(required_skills)} 出力={len(checks)}",
-        )
-
-    normalized: List[Dict[str, Any]] = []
-    for i, (orig, check) in enumerate(zip(required_skills, checks)):
-        if not isinstance(check, dict):
-            return None, f"required_skill_checks[{i}]がdictでない"
-
-        expected_skill = _skill_text(orig)
-        if check.get("skill") != expected_skill:
-            return (
-                None,
-                f"required_skill_checks[{i}]のskill不一致: "
-                f"入力={expected_skill!r} 出力={check.get('skill')!r}",
-            )
-
-        confidence = check.get("confidence")
-        if confidence not in VALID_CONFIDENCES:
-            return None, f"required_skill_checks[{i}]のconfidence不正: {confidence!r}"
-
-        reason = check.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            return None, f"required_skill_checks[{i}]のreasonが空またはnull"
-
-        evidence = check.get("evidence")
-        if evidence is None:
-            evidence = ""
-        if not isinstance(evidence, str):
-            evidence = str(evidence)
-
-        normalized.append(
-            {
-                "skill": expected_skill,
-                "original_match": orig.get("match") is True,
-                "recheck_match": confidence != "not_confirmed",
-                "confidence": confidence,
-                "reason": reason.strip(),
-                "evidence": evidence.strip(),
-            }
-        )
-    return normalized, None
+    return SHARED_CORE.normalize_required_skill_checks(
+        required_skills, checks, VALID_CONFIDENCES, _skill_text
+    )
 
 
 def _apply_auto_true_override(checks: List[Dict[str, Any]]) -> int:
@@ -634,12 +593,9 @@ def _replay_postprocessing_record(
 
 
 def _decide_recheck_status(checks: List[Dict[str, Any]]) -> str:
-    confidences = [check.get("confidence") for check in checks]
-    if any(conf == "not_confirmed" for conf in confidences):
-        return STATUS_NOT_CONFIRMED
-    if any(conf == "human_review" for conf in confidences):
-        return STATUS_HUMAN_REVIEW
-    return STATUS_CONFIRMED
+    return SHARED_CORE.decide_recheck_status(
+        checks, STATUS_CONFIRMED, STATUS_HUMAN_REVIEW, STATUS_NOT_CONFIRMED
+    )
 
 
 def _add_recheck_result(
@@ -651,33 +607,23 @@ def _add_recheck_result(
     category_note: str = "",
     apply_auto_true_override: bool = False,
 ) -> Dict[str, Any]:
-    result = deepcopy(record)
     # 07-1 と同じポリシーで、コミュ系・一人称系など営業確認前提の非技術スキルは
     # LLM正常応答かつschema検証済みの経路に限り confidence=confirmed 固定へ上書きする。
     if apply_auto_true_override:
         _apply_auto_true_override(checks)
         _apply_or_example_override(checks, category_match)
-    status = _decide_recheck_status(checks)
-    result["source_score_band"] = source_score_band
-    result["recheck_info"] = {
-        "recheck_status": status,
-        "model": RECHECK_LLM_MODEL,
-        "skillsheet_chars_used": skillsheet_chars_used,
-        "required_skill_count": len(checks),
-        "confirmed_count": sum(
-            1 for check in checks if check.get("confidence") == "confirmed"
-        ),
-        "human_review_count": sum(
-            1 for check in checks if check.get("confidence") == "human_review"
-        ),
-        "not_confirmed_count": sum(
-            1 for check in checks if check.get("confidence") == "not_confirmed"
-        ),
-    }
-    result["required_skill_checks"] = checks
-    result["category_match"] = category_match
-    result["category_note"] = category_note or ""
-    return result
+    return SHARED_CORE.build_result_record(
+        record,
+        source_score_band,
+        checks,
+        skillsheet_chars_used,
+        category_match,
+        category_note,
+        RECHECK_LLM_MODEL,
+        STATUS_CONFIRMED,
+        STATUS_HUMAN_REVIEW,
+        STATUS_NOT_CONFIRMED,
+    )
 
 
 def _make_error(
@@ -703,13 +649,9 @@ def _extract_category_fields(
     llm_response: Dict[str, Any],
 ) -> Tuple[str, str]:
     """LLMレスポンスからcategory_match/category_noteを取得・正規化する。"""
-    cat_match = str(llm_response.get("category_match", "unclear")).strip().lower()
-    if cat_match not in VALID_CATEGORY_MATCHES:
-        cat_match = "unclear"
-    cat_note = str(llm_response.get("category_note") or "").strip()
-    if not cat_note:
-        cat_note = "判定不明"
-    return cat_match, cat_note
+    return SHARED_CORE.normalize_category_fields(
+        llm_response, VALID_CATEGORY_MATCHES
+    )
 
 
 def _process_record(
