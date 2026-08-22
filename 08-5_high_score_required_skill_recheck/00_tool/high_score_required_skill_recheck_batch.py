@@ -602,10 +602,13 @@ def resume_run(
     runtime_root: Path = RUNTIME_ROOT,
 ) -> Dict[str, Any]:
     run_dir = _run_dir(run_id, runtime_root)
+    validation = validate_prepared(run_dir)
     store = FileStateStore(run_dir)
     state, etag = store.load()
     if state.get("state") == STATE_COMMITTED:
-        marker = validate_commit_marker()
+        marker = validate_commit_marker(
+            run_id, str(validation["manifest_sha256"])
+        )
         return {
             "run_id": run_id,
             "batch_id": state.get("batch_id"),
@@ -730,30 +733,91 @@ def reconcile_pending(
         raise ValueError("max_checksは1-10に限定します")
     run_dir = _run_dir(run_id, runtime_root)
     store = FileStateStore(run_dir)
-    state, etag = store.load()
-    if state.get("batch_id"):
+    pending_state, pending_etag = store.load()
+    if pending_state.get("batch_id"):
         return resume_run(run_id, client, runtime_root)
-    if state.get("state") != STATE_PENDING_RECONCILIATION:
+    if pending_state.get("state") != STATE_PENDING_RECONCILIATION:
         raise SubmissionBlocked("PENDING_RECONCILIATION stateではありません")
+    pending_identity = tuple(
+        pending_state.get(field)
+        for field in (
+            "run_id",
+            "submission_nonce",
+            "manifest_sha256",
+            "input_file_id",
+        )
+    )
 
     matches_by_id: Dict[str, Dict[str, Any]] = {}
     checks_completed = 0
     for _ in range(max_checks):
-        for match in _reconciliation_matches(client.list_batches(), state):
+        for match in _reconciliation_matches(client.list_batches(), pending_state):
             matches_by_id[str(match["id"])] = match
         checks_completed += 1
         if len(matches_by_id) >= 1:
             break
 
-    state, etag = store.load()
-    state["reconciliation_checks"] = int(state.get("reconciliation_checks", 0)) + checks_completed
+    # list結果を得た時点のpending ETagからだけ遷移する。競合時は現stateを
+    # 再確認し、別workerが採用したbatch_id/stateを古い結果で上書きしない。
+    state = pending_state
+    etag = pending_etag
+    for _ in range(3):
+        if state.get("batch_id"):
+            return resume_run(run_id, client, runtime_root)
+        if state.get("state") != STATE_PENDING_RECONCILIATION:
+            return {
+                "run_id": run_id,
+                "match_count": len(matches_by_id),
+                "batch_id": state.get("batch_id"),
+                "state": state.get("state"),
+                "state_etag": etag,
+                "reconciliation_skipped": True,
+            }
+        current_identity = tuple(
+            state.get(field)
+            for field in (
+                "run_id",
+                "submission_nonce",
+                "manifest_sha256",
+                "input_file_id",
+            )
+        )
+        if current_identity != pending_identity:
+            return {
+                "run_id": run_id,
+                "match_count": len(matches_by_id),
+                "batch_id": state.get("batch_id"),
+                "state": state.get("state"),
+                "state_etag": etag,
+                "reconciliation_skipped": True,
+            }
+        next_state = dict(state)
+        next_state["reconciliation_checks"] = int(
+            next_state.get("reconciliation_checks", 0)
+        ) + checks_completed
+        if len(matches_by_id) == 1:
+            adopted = next(iter(matches_by_id.values()))
+            next_state["batch_id"] = str(adopted["id"])
+            next_state["state"] = STATE_SUBMITTED
+            next_state["reconciled_at"] = utc_now()
+            _update_observed_batch(next_state, adopted)
+        else:
+            next_state["state"] = STATE_SAFE_STOPPED
+            next_state["safe_stop_reason"] = (
+                "reconciliation_no_match_after_bounded_checks"
+                if not matches_by_id
+                else "reconciliation_duplicate_batches"
+            )
+        try:
+            next_etag = store.cas(etag, next_state)
+            state = next_state
+            break
+        except CASConflict:
+            state, etag = store.load()
+    else:
+        raise CASConflict("reconciliation pending transitionのCAS retry上限超過")
+
     if len(matches_by_id) == 1:
-        adopted = next(iter(matches_by_id.values()))
-        state["batch_id"] = str(adopted["id"])
-        state["state"] = STATE_SUBMITTED
-        state["reconciled_at"] = utc_now()
-        _update_observed_batch(state, adopted)
-        next_etag = store.cas(etag, state)
         return {
             "run_id": run_id,
             "match_count": 1,
@@ -761,12 +825,6 @@ def reconcile_pending(
             "state": state["state"],
             "state_etag": next_etag,
         }
-    state["state"] = STATE_SAFE_STOPPED
-    if len(matches_by_id) == 0:
-        state["safe_stop_reason"] = "reconciliation_no_match_after_bounded_checks"
-    else:
-        state["safe_stop_reason"] = "reconciliation_duplicate_batches"
-    store.cas(etag, state)
     if not matches_by_id:
         raise ReconciliationFailed(
             f"bounded reconciliation {checks_completed}回で一致0件: 安全停止"
@@ -812,9 +870,12 @@ def _parse_success_response(
     if not isinstance(body, dict):
         return None, "response.body欠落"
     try:
-        content = body["choices"][0]["message"]["content"]
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None, "choices[0].message.content欠落"
+    if choice.get("finish_reason") == "length":
+        return None, "Batch output truncated: finish_reason=length"
     if not isinstance(content, str):
         return None, "response contentが文字列でない"
     try:
@@ -964,10 +1025,19 @@ def collect_records(
             else:
                 parsed, parse_error = _parse_success_response(response_record)
                 if parsed is None:
+                    truncated = "finish_reason=length" in parse_error
                     result, error_record = _fallback_result(
                         entry,
-                        "Batch response parse errorのため人間確認",
-                        "batch_response_parse_error",
+                        (
+                            "Batch出力truncationのため人間確認"
+                            if truncated
+                            else "Batch response parse errorのため人間確認"
+                        ),
+                        (
+                            "batch_output_truncated"
+                            if truncated
+                            else "batch_response_parse_error"
+                        ),
                         parse_error,
                     )
                     schema_error = parse_error
@@ -1112,12 +1182,20 @@ def _restore_bytes(path: Path, previous: Optional[bytes]) -> None:
 
 
 def validate_commit_marker(
+    expected_run_id: str,
+    expected_manifest_sha256: str,
     marker_path: Path = COMMIT_MARKER,
     artifact_paths: Dict[str, Path] = ARTIFACT_PATHS,
 ) -> Dict[str, Any]:
+    if not expected_run_id or not expected_manifest_sha256:
+        raise PublishError("commit marker検証にはexpected run_id/manifest_sha256が必須です")
     marker = _read_json_object(marker_path)
     if marker.get("engine_version") != ENGINE_VERSION:
         raise PublishError("production commit marker engine_version不一致")
+    if marker.get("run_id") != expected_run_id:
+        raise PublishError("production commit marker run_id不一致")
+    if marker.get("manifest_sha256") != expected_manifest_sha256:
+        raise PublishError("production commit marker manifest_sha256不一致")
     artifacts = marker.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != set(artifact_paths):
         raise PublishError("production commit marker artifact集合不一致")
@@ -1189,7 +1267,7 @@ def transactional_publish(
         }
         _atomic_write_json(marker_target, marker)
         marker_written = True
-        validate_commit_marker(marker_target, targets)
+        validate_commit_marker(run_id, manifest_sha256, marker_target, targets)
         return marker
     except Exception as error:
         rollback_errors: List[str] = []
@@ -1231,6 +1309,32 @@ def _verify_completed_counts(state: Dict[str, Any], batch: Dict[str, Any]) -> No
         )
 
 
+def _verify_result_file_contract(
+    batch: Dict[str, Any],
+    output_file_id: str,
+    error_file_id: str,
+    output_payload: bytes,
+    error_payload: bytes,
+) -> None:
+    counts = batch.get("request_counts")
+    if not isinstance(counts, dict):
+        raise CollectorIntegrityError("Batch request_countsがありません")
+    completed = int(counts.get("completed", 0))
+    failed = int(counts.get("failed", 0))
+    if completed > 0 and not output_file_id:
+        raise CollectorIntegrityError("completed>0ですがoutput_file_idがありません")
+    if failed > 0 and not error_file_id:
+        raise CollectorIntegrityError("failed>0ですがerror_file_idがありません")
+    output_count = len(_read_jsonl_bytes_strict(output_payload, "output"))
+    error_count = len(_read_jsonl_bytes_strict(error_payload, "error"))
+    if output_count != completed or error_count != failed:
+        raise CollectorIntegrityError(
+            "Batch request_counts/result file件数不一致: "
+            f"completed={completed} output={output_count} "
+            f"failed={failed} error={error_count}"
+        )
+
+
 def collect_run(
     run_id: str,
     client: Any,
@@ -1242,7 +1346,9 @@ def collect_run(
     store = FileStateStore(run_dir)
     state, etag = store.load()
     if state.get("state") == STATE_COMMITTED:
-        marker = validate_commit_marker()
+        marker = validate_commit_marker(
+            run_id, str(validation["manifest_sha256"])
+        )
         return {
             "run_id": run_id,
             "state": STATE_COMMITTED,
@@ -1266,12 +1372,20 @@ def collect_run(
     _update_observed_batch(state, batch)
     etag = store.cas(etag, state)
 
-    output_file_id = str(batch.get("output_file_id") or state.get("output_file_id") or "")
-    error_file_id = str(batch.get("error_file_id") or state.get("error_file_id") or "")
+    output_file_id = str(batch.get("output_file_id") or "")
+    error_file_id = str(batch.get("error_file_id") or "")
+    counts = batch.get("request_counts")
+    if not isinstance(counts, dict):
+        raise CollectorIntegrityError("Batch request_countsがありません")
+    if int(counts.get("completed", 0)) > 0 and not output_file_id:
+        raise CollectorIntegrityError("completed>0ですがoutput_file_idがありません")
+    if int(counts.get("failed", 0)) > 0 and not error_file_id:
+        raise CollectorIntegrityError("failed>0ですがerror_file_idがありません")
     output_payload = client.download_file(output_file_id) if output_file_id else b""
     error_payload = client.download_file(error_file_id) if error_file_id else b""
-    if not output_payload and not error_payload and int(state.get("request_count", 0)):
-        raise CollectorIntegrityError("output/error fileが共にありません")
+    _verify_result_file_contract(
+        batch, output_file_id, error_file_id, output_payload, error_payload
+    )
     manifest = list(read_jsonl(str(run_dir / "manifest.jsonl")))
     collected = collect_records(manifest, output_payload, error_payload)
 

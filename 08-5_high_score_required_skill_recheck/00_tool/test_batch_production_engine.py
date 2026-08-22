@@ -51,6 +51,7 @@ class FakeClient:
             "input_file_id": "file-input-1",
         }
         self.list_values = []
+        self.list_callback = None
         self.downloads = {}
 
     def upload_input(self, _path):
@@ -69,6 +70,10 @@ class FakeClient:
 
     def list_batches(self):
         self.list_calls += 1
+        if self.list_callback is not None:
+            callback = self.list_callback
+            self.list_callback = None
+            callback()
         return list(self.list_values)
 
     def download_file(self, file_id):
@@ -107,7 +112,9 @@ def manifest_entry(index=1, skill="Python開発経験"):
     return item
 
 
-def success_row(entry, confidence="confirmed", evidence="Python経験3年"):
+def success_row(
+    entry, confidence="confirmed", evidence="Python経験3年", finish_reason="stop"
+):
     parsed = {
         "required_skill_checks": [
             {
@@ -124,7 +131,12 @@ def success_row(entry, confidence="confirmed", evidence="Python経験3年"):
         "custom_id": entry["custom_id"],
         "response": {
             "status_code": 200,
-            "body": {"choices": [{"message": {"content": json.dumps(parsed)}}]},
+            "body": {
+                "choices": [{
+                    "message": {"content": json.dumps(parsed)},
+                    "finish_reason": finish_reason,
+                }]
+            },
         },
     }
 
@@ -350,6 +362,33 @@ class StateAndSubmissionTest(unittest.TestCase):
                 stopped, _ = batch.FileStateStore(run_dir).load()
                 self.assertEqual(batch.STATE_SAFE_STOPPED, stopped["state"])
 
+    def test_stale_zero_match_cannot_overwrite_concurrent_adoption(self):
+        run_dir, stale_client, state, metadata = self._pending()
+
+        def worker_a_adopts():
+            worker_a = FakeClient()
+            worker_a.list_values = [{
+                "id": "batch-adopted",
+                "status": "validating",
+                "input_file_id": state["input_file_id"],
+                "metadata": metadata,
+            }]
+            batch.reconcile_pending("run1", worker_a, self.root, max_checks=1)
+            stale_client.retrieve_value = {
+                "id": "batch-adopted",
+                "status": "validating",
+                "input_file_id": state["input_file_id"],
+            }
+
+        stale_client.list_callback = worker_a_adopts
+        report = batch.reconcile_pending(
+            "run1", stale_client, self.root, max_checks=1
+        )
+        final_state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual("batch-adopted", report["batch_id"])
+        self.assertEqual("batch-adopted", final_state["batch_id"])
+        self.assertNotEqual(batch.STATE_SAFE_STOPPED, final_state["state"])
+
 
 class CollectorIntegrityTest(unittest.TestCase):
     def entries(self, count=2):
@@ -398,6 +437,29 @@ class CollectorIntegrityTest(unittest.TestCase):
         self.assertEqual("human_review", pair["after"]["status"])
         self.assertEqual("unclear", pair["after"]["category_match"])
 
+    def test_finish_reason_length_falls_back_even_with_valid_confirmed_json(self):
+        entry = self.entries(1)[0]
+        result = batch.collect_records(
+            [entry], jsonl_bytes([success_row(entry, finish_reason="length")]), b""
+        )
+        pair = result["audit_pairs"][0]
+        self.assertFalse(pair["schema_valid"])
+        self.assertEqual("human_review", pair["after"]["status"])
+        self.assertFalse(
+            pair["schema_valid"]
+            and pair["after"]["status"] == "confirmed"
+            and pair["after"]["category_match"] == "match"
+        )
+        self.assertEqual("batch_output_truncated", result["errors"][0]["error_type"])
+
+    def test_finish_reason_stop_remains_confirmed(self):
+        entry = self.entries(1)[0]
+        result = batch.collect_records(
+            [entry], jsonl_bytes([success_row(entry, finish_reason="stop")]), b""
+        )
+        self.assertTrue(result["audit_pairs"][0]["schema_valid"])
+        self.assertEqual("confirmed", result["audit_pairs"][0]["after"]["status"])
+
     def test_same_custom_id_across_output_and_error_is_duplicate(self):
         entry = self.entries(1)[0]
         with self.assertRaises(batch.CollectorIntegrityError):
@@ -415,20 +477,23 @@ class CollectorRetryAndPublishTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _completed_run(self):
+    def _completed_run(self, count=1):
         run_dir = self.root / "runtime"
-        batch.prepare_run("run1", run_dir, [context()])
+        batch.prepare_run(
+            "run1", run_dir, [context(index) for index in range(1, count + 1)]
+        )
         actual = run_dir / "run1"
         manifest = list(batch.read_jsonl(str(actual / "manifest.jsonl")))
-        entry = manifest[0]
         set_state(actual, batch_id="batch-1", state=batch.STATE_SUBMITTED)
         client = FakeClient()
         client.retrieve_value = {
             "id": "batch-1", "status": "completed",
-            "request_counts": {"total": 1, "completed": 1, "failed": 0},
+            "request_counts": {"total": count, "completed": count, "failed": 0},
             "output_file_id": "output-1", "error_file_id": None,
         }
-        client.downloads["output-1"] = jsonl_bytes([success_row(entry)])
+        client.downloads["output-1"] = jsonl_bytes(
+            [success_row(entry) for entry in manifest]
+        )
         return run_dir, actual, client
 
     def test_collector_retry_is_idempotent_before_publish(self):
@@ -446,6 +511,55 @@ class CollectorRetryAndPublishTest(unittest.TestCase):
             batch.collect_run("run1", client, runtime, publish=True)
         after = sorted(path.name for path in actual.iterdir())
         self.assertEqual(before, after)
+        self.assertFalse((actual / "stage").exists())
+
+    def test_request_counts_two_completed_but_output_one_error_one_fails(self):
+        runtime, actual, client = self._completed_run(count=2)
+        manifest = list(batch.read_jsonl(str(actual / "manifest.jsonl")))
+        client.retrieve_value.update({
+            "request_counts": {"total": 2, "completed": 2, "failed": 0},
+            "output_file_id": "output-1",
+            "error_file_id": "error-1",
+        })
+        client.downloads["output-1"] = jsonl_bytes([success_row(manifest[0])])
+        client.downloads["error-1"] = jsonl_bytes([
+            {"custom_id": manifest[1]["custom_id"], "error": {"code": "bad"}}
+        ])
+        with self.assertRaises(batch.CollectorIntegrityError):
+            batch.collect_run("run1", client, runtime, publish=True)
+        self.assertFalse((actual / "stage").exists())
+
+    def test_request_counts_one_completed_one_failed_matches_files(self):
+        runtime, actual, client = self._completed_run(count=2)
+        manifest = list(batch.read_jsonl(str(actual / "manifest.jsonl")))
+        client.retrieve_value.update({
+            "request_counts": {"total": 2, "completed": 1, "failed": 1},
+            "output_file_id": "output-1",
+            "error_file_id": "error-1",
+        })
+        client.downloads["output-1"] = jsonl_bytes([success_row(manifest[0])])
+        client.downloads["error-1"] = jsonl_bytes([
+            {"custom_id": manifest[1]["custom_id"], "error": {"code": "bad"}}
+        ])
+        report = batch.collect_run("run1", client, runtime, publish=False)
+        self.assertEqual(2, report["record_count"])
+        self.assertEqual(1, report["production_error_count"])
+
+    def test_completed_positive_requires_output_file_id(self):
+        runtime, actual, client = self._completed_run()
+        client.retrieve_value["output_file_id"] = None
+        with self.assertRaises(batch.CollectorIntegrityError):
+            batch.collect_run("run1", client, runtime, publish=True)
+        self.assertFalse((actual / "stage").exists())
+
+    def test_failed_positive_requires_error_file_id(self):
+        runtime, actual, client = self._completed_run(count=2)
+        client.retrieve_value.update({
+            "request_counts": {"total": 2, "completed": 1, "failed": 1},
+            "error_file_id": None,
+        })
+        with self.assertRaises(batch.CollectorIntegrityError):
+            batch.collect_run("run1", client, runtime, publish=True)
         self.assertFalse((actual / "stage").exists())
 
     def _stage_and_targets(self):
@@ -490,10 +604,29 @@ class CollectorRetryAndPublishTest(unittest.TestCase):
             stage, "run1", "m" * 64, "e" * 64, targets, marker
         )
         self.assertEqual(set(targets), set(result["artifacts"]))
-        self.assertEqual(result, batch.validate_commit_marker(marker, targets))
+        self.assertEqual(
+            result,
+            batch.validate_commit_marker("run1", "m" * 64, marker, targets),
+        )
         targets["all"].write_bytes(b"tampered\n")
         with self.assertRaises(batch.PublishError):
-            batch.validate_commit_marker(marker, targets)
+            batch.validate_commit_marker("run1", "m" * 64, marker, targets)
+
+    def test_commit_marker_rejects_stale_run_id(self):
+        stage, targets, marker = self._stage_and_targets()
+        batch.transactional_publish(
+            stage, "old-run", "m" * 64, "e" * 64, targets, marker
+        )
+        with self.assertRaises(batch.PublishError):
+            batch.validate_commit_marker("current-run", "m" * 64, marker, targets)
+
+    def test_commit_marker_rejects_manifest_hash_mismatch(self):
+        stage, targets, marker = self._stage_and_targets()
+        batch.transactional_publish(
+            stage, "run1", "m" * 64, "e" * 64, targets, marker
+        )
+        with self.assertRaises(batch.PublishError):
+            batch.validate_commit_marker("run1", "x" * 64, marker, targets)
 
 
 class Saved678ProductionRegressionTest(unittest.TestCase):
