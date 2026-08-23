@@ -1,8 +1,7 @@
-"""Focused offline tests for the 07-1 candidate-retention guard."""
+"""07-1 test専用minimal retention guardのfocused tests。"""
 
 import copy
 import importlib.util
-import sys
 import unittest
 from pathlib import Path
 
@@ -25,177 +24,156 @@ def skill(name="Pythonコーディング経験", match=False, note="Python経験
     return {"skill": name, "match": match, "note": note}
 
 
-def record(required_skills, project="project-1", resource="resource-1"):
+def record(required_skills, optional_skills=None, project="project-1", resource="resource-1"):
     return {
         "project_info": {"message_id": project},
         "resource_info": {"message_id": resource},
         "required_skills": required_skills,
-        "optional_skills": [],
+        "optional_skills": optional_skills or [],
     }
 
 
 class GuardConditionTest(unittest.TestCase):
-    def test_no_required_years_and_direct_one_month_practical_evidence_is_rescued(self):
-        value = skill()
-        evidence = "社内業務でPython/Seleniumによるスクレイピングを実装"
-        guarded, audit = target.apply_guard_to_record(record([value]), evidence)
-        self.assertTrue(guarded["required_skills"][0]["match"])
-        self.assertEqual(len(audit), 1)
+    def test_no_year_requirement_and_direct_python_work_is_retained(self):
+        rows = [record([skill()])]
+        before = copy.deepcopy(rows)
+        audits, retained = target.collect_retention_candidates(
+            rows, {"resource-1": "社内業務でPythonスクレイピングを実装"}
+        )
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(rows, before)
 
-    def test_explicit_three_year_requirement_is_not_rescued(self):
+    def test_explicit_three_year_requirement_is_not_retained(self):
         value = skill(name="Python 3年以上", note="Python経験は1ヶ月のみ")
-        guarded, audit = target.apply_guard_to_record(
-            record([value]), "実務でPythonを使い機能を実装"
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "実務でPython機能を実装")
         )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
 
-    def test_other_explicit_minimum_year_forms_are_not_rescued(self):
-        for name in ("Python 3年超", "Python 最低2年", "Python 経験3年~5年"):
-            with self.subTest(name=name):
-                value = skill(name=name, note="Python経験は1ヶ月のみ")
-                guarded, audit = target.apply_guard_to_record(
-                    record([value]), "実務でPythonを使い機能を実装"
-                )
-                self.assertFalse(guarded["required_skills"][0]["match"])
-                self.assertEqual(audit, [])
+    def test_missing_python_evidence_is_not_retained(self):
+        self.assertIsNone(target.evaluate_required_skill(skill(), "担当業務の記載なし"))
 
-    def test_self_study_only_is_not_rescued(self):
-        guarded, audit = target.apply_guard_to_record(
-            record([skill()]), "Pythonを自己学習し資格を取得"
+    def test_other_technology_evidence_is_not_retained(self):
+        self.assertIsNone(
+            target.evaluate_required_skill(skill(), "業務でJava機能を実装")
         )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
 
-    def test_other_technology_only_is_not_rescued(self):
-        guarded, audit = target.apply_guard_to_record(
-            record([skill()]), "Java/Seleniumによる業務システムを実装"
+    def test_compound_partial_match_is_not_retained(self):
+        value = skill(name="C# + SQLの実務経験", note="C#経験は1ヶ月のみ")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務システムをC#で実装")
         )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
 
-    def test_existing_true_is_not_changed(self):
-        original = skill(match=True, note="Python実務経験あり")
-        guarded, audit = target.apply_guard_to_record(
-            record([original]), "業務でPythonを使用して実装"
+    def test_rhel_windows_partial_match_is_not_duration_reason_or_retained(self):
+        value = skill(name="OS:RHEL、Windows", note="Windows経験のみの記載")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務システムをWindowsで開発")
         )
-        self.assertEqual(guarded["required_skills"][0], original)
-        self.assertEqual(audit, [])
 
-    def test_indeterminate_evidence_is_not_rescued(self):
-        guarded, audit = target.apply_guard_to_record(
-            record([skill()]), "Python | 1ヶ月"
-        )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
-
-    def test_non_duration_failure_is_not_rescued(self):
-        value = skill(note="Python経験1ヶ月のみ、設計経験の記載なし")
-        guarded, audit = target.apply_guard_to_record(
-            record([value]), "Pythonで業務ツールを実装"
-        )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
-
-    def test_guard_is_not_python_specific(self):
+    def test_multiple_middleware_partial_match_is_not_retained(self):
         value = skill(
-            name="Node.jsを用いたバックエンド開発経験",
-            note="Node.js経験は1カ月のみ",
+            name="Apache、Tomcatの構築経験", note="Apache経験は6ヶ月のみ"
         )
-        guarded, audit = target.apply_guard_to_record(
-            record([value]), "ユーザー情報システムをNode.jsで改修対応"
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でApache環境を構築")
         )
-        self.assertTrue(guarded["required_skills"][0]["match"])
-        self.assertEqual(len(audit), 1)
 
-    def test_required_work_type_must_have_direct_evidence(self):
+    def test_concurrent_true_is_out_of_scope(self):
+        value = skill(match=True, note="Python実務経験あり")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でPython機能を実装")
+        )
+
+    def test_linux_build_concurrent_true_is_unchanged(self):
+        value = skill(
+            name="Linux環境の構築経験", match=True, note="Linux構築経験あり"
+        )
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でLinux環境を構築")
+        )
+
+    def test_optional_skill_is_not_examined(self):
+        rows = [record([], optional_skills=[skill()])]
+        audits, retained = target.collect_retention_candidates(
+            rows, {"resource-1": "業務でPython機能を実装"}
+        )
+        self.assertEqual(audits, [])
+        self.assertEqual(retained, [])
+
+    def test_guard_never_promotes_false_to_true(self):
+        rows = [record([skill()])]
+        before = copy.deepcopy(rows)
+        target.collect_retention_candidates(
+            rows, {"resource-1": "業務でPython機能を実装"}
+        )
+        self.assertEqual(target.count_false_to_true(before, rows), 0)
+        self.assertFalse(rows[0]["required_skills"][0]["match"])
+
+    def test_guard_does_not_write_production_files(self):
+        before = target.snapshot_production_files()
+        target.collect_retention_candidates(
+            [record([skill()])], {"resource-1": "業務でPython機能を実装"}
+        )
+        self.assertEqual(target.snapshot_production_files(), before)
+
+    def test_non_duration_false_reason_is_not_retained(self):
+        value = skill(note="Python実装経験の記載なし")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でPython機能を実装")
+        )
+
+    def test_duration_reason_without_numeric_value_is_retained(self):
+        value = skill(note="Pythonの経験年数不足")
+        self.assertIsNotNone(
+            target.evaluate_required_skill(value, "業務でPython機能を実装")
+        )
+
+    def test_self_study_is_not_direct_practical_evidence(self):
+        self.assertIsNone(
+            target.evaluate_required_skill(skill(), "Pythonを独学し資格を取得")
+        )
+
+    def test_required_action_needs_direct_support(self):
         value = skill(
             name="AWSクラウド環境のシステム設計経験",
             note="AWS経験は3ヶ月のみ",
         )
-        guarded, audit = target.apply_guard_to_record(
-            record([value]), "AWSへアプリをデプロイした経験あり"
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "AWSへ業務アプリをデプロイ")
         )
-        self.assertFalse(guarded["required_skills"][0]["match"])
-        self.assertEqual(audit, [])
+
+    def test_alternative_technology_can_use_same_noted_technology(self):
+        value = skill(
+            name="Nest.jsまたはNode.jsを用いたバックエンド開発経験",
+            note="Node.js経験は1カ月のみ",
+        )
+        self.assertIsNotNone(
+            target.evaluate_required_skill(value, "業務システムをNode.jsで改修対応")
+        )
 
 
-class ReplayIntegrityTest(unittest.TestCase):
-    def test_guard_quality_classification_separates_direct_alignment_and_grey(self):
-        audits = [
-            {
-                "project_message_id": "project-1",
-                "resource_message_id": "resource-1",
-                "skill_index": 0,
-                "matched_token": "python",
-                "evidence": "Pythonで実装",
-            },
-            {
-                "project_message_id": "project-2",
-                "resource_message_id": "resource-2",
-                "skill_index": 0,
-                "matched_token": "node.js",
-                "evidence": "Node.jsで改修",
-            },
-        ]
-        direct = [
-            record([skill(match=True)], "project-1", "resource-1"),
-            record([skill(match=False)], "project-2", "resource-2"),
-        ]
-        result = target.classify_guard_audits(audits, direct)
-        self.assertEqual(result["CLEARLY_ACCEPTABLE_VARIANCE"], 1)
-        self.assertEqual(result["GREY"], 1)
-        self.assertEqual(result["CLEAR_QUALITY_PROBLEM"], 0)
-
-    def test_retention_path_recovers_known_gate_loss_without_proposal_ready(self):
-        key_args = {"project": "project-loss", "resource": "resource-loss"}
-        before = record(
-            [
-                skill(),
-                {"skill": "設計経験", "match": False, "note": "記載なし"},
-                {"skill": "顧客折衝", "match": False, "note": "記載なし"},
-                {"skill": "資料作成", "match": False, "note": "記載なし"},
-                {"skill": "AI知見", "match": False, "note": "記載なし"},
-                {"skill": "推進力", "match": True, "note": "固定true"},
-            ],
-            **key_args
-        )
-        direct = copy.deepcopy(before)
-        for index in (0, 2, 3, 4, 5):
-            direct["required_skills"][index]["match"] = True
-        after, audits = target.apply_guard(
-            [before], {"resource-loss": "業務でPythonスクレイピングを実装"}
-        )
-        membership = {("project-loss", "resource-loss"): "human_review"}
-        simulation = target.simulate_downstream(
-            [before], after, [direct], audits, membership
-        )
-        self.assertEqual(simulation["candidate_loss_before"], 1)
-        self.assertEqual(simulation["candidate_loss_after"], 0)
-        self.assertEqual(simulation["recovered_saved_status"], {"human_review": 1})
-        self.assertEqual(simulation["proposal_ready_false_positive_after"], 0)
-
-    def test_duplicate_and_order_are_preserved_and_production_is_unchanged(self):
+class DownstreamRetentionTest(unittest.TestCase):
+    def test_below_gate_pair_is_added_without_result_change(self):
         rows = [
-            record([skill()], "project-1", "resource-1"),
-            record([skill()], "project-1", "resource-2"),
+            record(
+                [
+                    skill(),
+                    skill("AI知見", False, "記載なし"),
+                    skill("顧客折衝", False, "記載なし"),
+                    skill("資料作成", False, "記載なし"),
+                    skill("構築", False, "記載なし"),
+                    skill("推進", True, "固定true"),
+                ]
+            )
         ]
-        before_snapshot = target.snapshot_production_files()
-        guarded, audits = target.apply_guard(
-            rows,
-            {
-                "resource-1": "Pythonで業務処理を実装",
-                "resource-2": "Pythonを自己学習",
-            },
+        before = copy.deepcopy(rows)
+        _, retained = target.collect_retention_candidates(
+            rows, {"resource-1": "社内業務でPythonスクレイピングを実装"}
         )
-        after_snapshot = target.snapshot_production_files()
-        self.assertEqual(
-            [target.pair_key(row) for row in guarded],
-            [target.pair_key(row) for row in rows],
-        )
-        self.assertEqual(len(set(target.pair_key(row) for row in guarded)), 2)
-        self.assertEqual(len(audits), 1)
-        self.assertEqual(before_snapshot, after_snapshot)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0]["retention_destination"], "08-5_recheck_only")
+        self.assertFalse(retained[0]["proposal_ready_direct"])
+        self.assertEqual(rows, before)
 
 
 if __name__ == "__main__":
