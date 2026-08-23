@@ -2,7 +2,7 @@
 
 Production 07-1 is imported as the source of truth for request construction and
 response validation.  This file never writes production outputs.  Network use
-requires both an explicit sample size and --allow-network; at most 300 logical
+requires both an explicit sample size and --allow-network; at most 500 logical
 requests can be made in one run.
 """
 
@@ -31,8 +31,9 @@ STEP_DIR = TOOL_DIR.parent
 PROJECT_ROOT = STEP_DIR.parent
 PRODUCTION_PATH = TOOL_DIR / "normalized/requirement_skill_ai_matching.py"
 TEST_OUTPUT_ROOT = STEP_DIR / "_test_07_1_speedup"
-MAX_LIVE_SAMPLE_SIZE = 300
-MAX_CONCURRENCY_HARD_LIMIT = 8
+MAX_LIVE_SAMPLE_SIZE = 500
+MAX_CONCURRENCY_HARD_LIMIT = 4
+PRESERVED_SAMPLE_PREFIX_SIZE = 300
 DEFAULT_SAMPLE_SEED = "07-1-speedup-v1"
 DEFAULT_INITIAL_CONCURRENCY = 2
 DEFAULT_MAX_CONCURRENCY = 4
@@ -186,6 +187,7 @@ def deterministic_sample(
     next_project_index = initial_project_count
     positions = {pid: 0 for pid in selected_projects}
     selected: List[Dict[str, Any]] = []
+    preserved_prefix_max_ordinal: Optional[int] = None
 
     while len(selected) < sample_size:
         progressed = False
@@ -198,6 +200,13 @@ def deterministic_sample(
                     pair, project_skills_map, skillsheet_map
                 )
                 if call_kwargs is None:
+                    continue
+                if (
+                    sample_size > PRESERVED_SAMPLE_PREFIX_SIZE
+                    and len(selected) >= PRESERVED_SAMPLE_PREFIX_SIZE
+                    and preserved_prefix_max_ordinal is not None
+                    and original_ordinal <= preserved_prefix_max_ordinal
+                ):
                     continue
                 resource_mid = str(
                     pair.get("resource_info", {}).get("message_id", "")
@@ -215,6 +224,10 @@ def deterministic_sample(
                         "pair": pair,
                     }
                 )
+                if len(selected) == PRESERVED_SAMPLE_PREFIX_SIZE:
+                    preserved_prefix_max_ordinal = max(
+                        row["original_ordinal"] for row in selected
+                    )
                 progressed = True
                 break
             if len(selected) >= sample_size:

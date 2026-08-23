@@ -1,6 +1,7 @@
 """Focused/offline tests for _test_07_1_speedup.py.  No network calls."""
 
 import importlib.util
+import hashlib
 import json
 import sys
 import tempfile
@@ -215,17 +216,30 @@ class SamplingAndCollectionTest(unittest.TestCase):
         self.assertGreaterEqual(len(counts), 2)
         self.assertTrue(all(count >= 2 for count in counts.values()))
 
-    def test_sampling_expands_projects_for_40_100_and_300(self):
-        pairs, projects, skillsheets = fixture_inputs(20, 20)
+    def test_sampling_expands_projects_for_40_100_300_and_500(self):
+        seed = "scale-seed"
+        pairs, projects, skillsheets = fixture_inputs(30, 20)
+        pairs.sort(
+            key=lambda pair: (
+                hashlib.sha256(
+                    "{}\0{}".format(
+                        seed, pair["project_info"]["message_id"]
+                    ).encode("utf-8")
+                ).hexdigest(),
+                pair["resource_info"]["message_id"],
+            )
+        )
         production_before = target.snapshot_production_outputs()
+        samples = {}
 
-        for sample_size in (40, 100, 300):
+        for sample_size in (40, 100, 300, 500):
             first = target.deterministic_sample(
-                pairs, projects, skillsheets, sample_size, "scale-seed"
+                pairs, projects, skillsheets, sample_size, seed
             )
             second = target.deterministic_sample(
-                pairs, projects, skillsheets, sample_size, "scale-seed"
+                pairs, projects, skillsheets, sample_size, seed
             )
+            samples[sample_size] = first
             first_identities = [row["request_identity"] for row in first]
             second_identities = [row["request_identity"] for row in second]
             self.assertEqual(len(first), sample_size)
@@ -257,13 +271,18 @@ class SamplingAndCollectionTest(unittest.TestCase):
             else:
                 self.assertGreater(len(rows_by_project), 4)
 
+        self.assertEqual(
+            [row["request_identity"] for row in samples[500][:300]],
+            [row["request_identity"] for row in samples[300]],
+        )
+
         with self.assertRaises(ValueError):
             target.deterministic_sample(
                 pairs,
                 projects,
                 skillsheets,
                 target.MAX_LIVE_SAMPLE_SIZE + 1,
-                "scale-seed",
+                seed,
             )
         self.assertEqual(production_before, target.snapshot_production_outputs())
 
@@ -385,6 +404,7 @@ class RetryAndAdaptiveTest(unittest.TestCase):
         self.assertEqual(controller.current, 2)
 
     def test_429_decreases_and_upper_bound_is_enforced(self):
+        self.assertEqual(target.MAX_CONCURRENCY_HARD_LIMIT, 4)
         controller = target.AdaptiveConcurrency(2, 3)
         good = {
             "status": "success",
@@ -539,7 +559,7 @@ class CostAndCliGuardTest(unittest.TestCase):
         self.assertEqual(usage["cache_rate"], 0.4)
 
     def test_network_flag_and_sample_hard_limit(self):
-        self.assertEqual(target.MAX_LIVE_SAMPLE_SIZE, 300)
+        self.assertEqual(target.MAX_LIVE_SAMPLE_SIZE, 500)
         with self.assertRaises(SystemExit):
             target.main(["--sample-size", "30"])
         with self.assertRaises(SystemExit):
