@@ -121,6 +121,32 @@ class GuardConditionTest(unittest.TestCase):
 
 
 class ReplayIntegrityTest(unittest.TestCase):
+    def test_guard_quality_classification_separates_direct_alignment_and_grey(self):
+        audits = [
+            {
+                "project_message_id": "project-1",
+                "resource_message_id": "resource-1",
+                "skill_index": 0,
+                "matched_token": "python",
+                "evidence": "Pythonで実装",
+            },
+            {
+                "project_message_id": "project-2",
+                "resource_message_id": "resource-2",
+                "skill_index": 0,
+                "matched_token": "node.js",
+                "evidence": "Node.jsで改修",
+            },
+        ]
+        direct = [
+            record([skill(match=True)], "project-1", "resource-1"),
+            record([skill(match=False)], "project-2", "resource-2"),
+        ]
+        result = target.classify_guard_audits(audits, direct)
+        self.assertEqual(result["CLEARLY_ACCEPTABLE_VARIANCE"], 1)
+        self.assertEqual(result["GREY"], 1)
+        self.assertEqual(result["CLEAR_QUALITY_PROBLEM"], 0)
+
     def test_retention_path_recovers_known_gate_loss_without_proposal_ready(self):
         key_args = {"project": "project-loss", "resource": "resource-loss"}
         before = record(

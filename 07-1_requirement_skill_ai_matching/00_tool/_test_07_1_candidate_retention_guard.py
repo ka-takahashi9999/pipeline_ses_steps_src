@@ -340,6 +340,42 @@ def compare_with_direct(
     }
 
 
+def classify_guard_audits(
+    audit_rows: Sequence[Dict[str, Any]], direct_rows: Sequence[Dict[str, Any]]
+) -> Dict[str, int]:
+    direct_map = {pair_key(row): row for row in direct_rows}
+    counts = {
+        "CLEARLY_ACCEPTABLE_VARIANCE": 0,
+        "GREY": 0,
+        "CLEAR_QUALITY_PROBLEM": 0,
+    }
+    for audit in audit_rows:
+        key = (
+            str(audit.get("project_message_id", "")),
+            str(audit.get("resource_message_id", "")),
+        )
+        baseline = direct_map.get(key)
+        index = audit.get("skill_index")
+        if (
+            baseline is None
+            or not isinstance(index, int)
+            or index < 0
+            or index >= len(baseline.get("required_skills") or [])
+            or not audit.get("matched_token")
+            or not audit.get("evidence")
+        ):
+            counts["CLEAR_QUALITY_PROBLEM"] += 1
+            continue
+        direct_skill = baseline["required_skills"][index]
+        if direct_skill.get("match") is True:
+            counts["CLEARLY_ACCEPTABLE_VARIANCE"] += 1
+        else:
+            # Direct disagreement is not promoted to a positive downstream
+            # decision.  It remains a human-review GREY case.
+            counts["GREY"] += 1
+    return counts
+
+
 def _load_recheck_membership() -> Dict[PairKey, str]:
     membership: Dict[PairKey, str] = {}
     for path, status in (
@@ -446,10 +482,10 @@ def build_report(
         (row["project_message_id"], row["resource_message_id"])
         for row in audit_rows
     }
-    unsafe_applications = sum(
-        not row.get("matched_token") or not row.get("evidence") for row in audit_rows
-    )
-    new_clear_false_positive = 0 if unsafe_applications == 0 else unsafe_applications
+    guard_quality_classification = classify_guard_audits(audit_rows, direct_rows)
+    new_clear_false_positive = guard_quality_classification[
+        "CLEAR_QUALITY_PROBLEM"
+    ]
     recovered_loss = (
         downstream["candidate_loss_before"] - downstream["candidate_loss_after"]
     )
@@ -475,6 +511,7 @@ def build_report(
         "guard_applied_skills": len(audit_rows),
         "false_to_true": len(audit_rows),
         "new_clear_false_positive": new_clear_false_positive,
+        "guard_quality_classification": guard_quality_classification,
         "independent_clear_errors_before": INDEPENDENT_CLEAR_ERRORS_BEFORE,
         "independent_clear_errors_after": clear_errors_after,
         "known_clear_false_negative_before": downstream["candidate_loss_before"],
