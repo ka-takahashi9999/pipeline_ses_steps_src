@@ -487,6 +487,7 @@ class CostAndCliGuardTest(unittest.TestCase):
         self.assertEqual(usage["cache_rate"], 0.4)
 
     def test_network_flag_and_sample_hard_limit(self):
+        self.assertEqual(target.MAX_LIVE_SAMPLE_SIZE, 100)
         with self.assertRaises(SystemExit):
             target.main(["--sample-size", "30"])
         with self.assertRaises(SystemExit):
