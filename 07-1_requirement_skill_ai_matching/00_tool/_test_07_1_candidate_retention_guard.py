@@ -64,17 +64,6 @@ DURATION_VALUE_RE = re.compile(
     r"(?:[0-9０-９]+(?:\.[0-9０-９]+)?|[一二三四五六七八九十百]+)\s*"
     r"(?:(?:ヶ|か|カ|ケ|ヵ)?月|年(?:間)?)"
 )
-DURATION_JUDGMENT_RE = re.compile(
-    r"(?:のみ|だけ|しか|未満|で不足)"
-)
-DURATION_SHORTAGE_RE = re.compile(
-    r"(?:経験(?:期間|年数)?(?:が|は)?短(?:い|期)|短期経験|"
-    r"期間不足|経験期間不足|年数不足|経験年数不足)"
-)
-NON_DURATION_FAILURE_RE = re.compile(
-    r"(?:記載なし|経験なし|未経験|知見なし|対応不可|別技術|資格のみ|"
-    r"設計経験なし|構築経験なし|実装経験なし)"
-)
 PRACTICAL_MARKER_RE = re.compile(
     r"(?:実務|業務|案件|開発|実装|構築|製造|改修|運用|保守|担当|対応|"
     r"作成|設計|テスト|導入|スクレイピング|デプロイ)"
@@ -83,6 +72,12 @@ NON_PRACTICAL_ONLY_RE = re.compile(
     r"(?:自己学習|独学|学習中?|研修|資格|勉強|個人開発)"
 )
 ALTERNATIVE_CUE_RE = re.compile(r"(?:または|もしくは|或いは|\bor\b)", re.I)
+CONJUNCTION_CUE_RE = re.compile(
+    r"(?:および|及び|かつ|且つ|ならびに|並びに|\band\b|"
+    r"(?<=[A-Za-z0-9+#.])\s*と(?!して|した|する|の|も)|"
+    r"と\s*(?=[A-Za-z0-9]))",
+    re.I,
+)
 TOKEN_STOP_WORDS = {"and", "or", "etc", "web", "api", "os", "ai", "it"}
 ACTION_EVIDENCE_RULES = (
     (re.compile(r"設計"), re.compile(r"(?:設計|アーキテクチャ)")),
@@ -159,18 +154,39 @@ def _contains_token(text: str, token: str) -> bool:
     )
 
 
+def _safe_retention_tokens(required_skill: str) -> List[str]:
+    """単一技術または全技術がORで接続されたskillだけtokenを返す。"""
+    tokens = _technology_tokens(required_skill)
+    if not tokens or CONJUNCTION_CUE_RE.search(required_skill):
+        return []
+    alternative_count = len(ALTERNATIVE_CUE_RE.findall(required_skill))
+    if len(tokens) == 1:
+        return tokens if alternative_count == 0 else []
+    if alternative_count != len(tokens) - 1:
+        return []
+    return tokens
+
+
 def _duration_only_false_note(note: str, tokens: Sequence[str]) -> List[str]:
     lowered = note.lower().strip()
-    if not lowered or NON_DURATION_FAILURE_RE.search(lowered):
+    if not lowered or not tokens:
         return []
     mentioned = [token for token in tokens if _contains_token(lowered, token)]
-    if not mentioned:
+    if not mentioned and len(tokens) != 1:
         return []
-    if DURATION_VALUE_RE.search(lowered) and DURATION_JUDGMENT_RE.search(lowered):
-        return mentioned
-    if DURATION_SHORTAGE_RE.search(lowered):
-        return mentioned
-    return []
+    technology = r"(?:{})".format("|".join(re.escape(token) for token in tokens))
+    subject = r"(?:(?:{})\s*(?:の)?\s*)?".format(technology)
+    experience = r"(?:(?:実務|業務)?経験(?:期間|年数)?|期間|年数)"
+    duration_only_re = re.compile(
+        r"^{}{}\s*(?:が|は)?\s*(?:{}\s*(?:のみ|だけ|しか(?:ない)?|未満|で不足)|"
+        r"(?:短い|短期|不足(?:している)?))\s*[。．.]?$".format(
+            subject, experience, DURATION_VALUE_RE.pattern
+        ),
+        re.I,
+    )
+    if not duration_only_re.fullmatch(lowered):
+        return []
+    return mentioned or list(tokens)
 
 
 def _required_actions_supported(required_skill: str, evidence_line: str) -> bool:
@@ -208,10 +224,8 @@ def evaluate_required_skill(
     note = str(required_skill.get("note", "")).strip()
     if not skill_name or REQUIRED_DURATION_RE.search(skill_name):
         return None
-    tokens = _technology_tokens(skill_name)
+    tokens = _safe_retention_tokens(skill_name)
     if not tokens:
-        return None
-    if len(tokens) > 1 and not ALTERNATIVE_CUE_RE.search(skill_name):
         return None
     note_tokens = _duration_only_false_note(note, tokens)
     if not note_tokens:
@@ -408,6 +422,18 @@ def analyze_replay(
         )
         for audit in audits
     )
+    mixed_or_and_retained = sum(
+        bool(ALTERNATIVE_CUE_RE.search(audit["required_skill"]))
+        and bool(CONJUNCTION_CUE_RE.search(audit["required_skill"]))
+        for audit in audits
+    )
+    non_duration_reason_retained = sum(
+        not _duration_only_false_note(
+            audit["concurrent_false_reason"],
+            _safe_retention_tokens(audit["required_skill"]),
+        )
+        for audit in audits
+    )
     retained_rate = len(retained) / len(concurrent_rows) if concurrent_rows else 0.0
     production_write = int(production_before != production_after)
     input_write = int(input_file_before != input_file_after)
@@ -421,6 +447,8 @@ def analyze_replay(
             0 < len(retained) <= MAX_RETAINED_PAIR_COUNT,
             retained_rate <= MAX_RETAINED_PAIR_RATE,
             condition_violations == 0,
+            mixed_or_and_retained == 0,
+            non_duration_reason_retained == 0,
             row_changes == 0,
             false_to_true == 0,
             input_write == 0,
@@ -453,6 +481,8 @@ def analyze_replay(
         "known_false_positives_reviewed": KNOWN_CONCURRENT_FALSE_POSITIVES,
         "known_false_positives_affected": known_fp_affected,
         "condition_violations": condition_violations,
+        "mixed_or_and_retained": mixed_or_and_retained,
+        "non_duration_reason_retained": non_duration_reason_retained,
         "production_write": production_write,
         "new_api_calls": 0,
         "source_hashes_before": production_before,

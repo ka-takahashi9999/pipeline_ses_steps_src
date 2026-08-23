@@ -64,6 +64,21 @@ class GuardConditionTest(unittest.TestCase):
             target.evaluate_required_skill(value, "業務システムをC#で実装")
         )
 
+    def test_mixed_or_and_partial_match_is_not_retained(self):
+        value = skill(
+            name="PythonまたはJavaとSQLの開発経験",
+            note="Python経験は1ヶ月のみ",
+        )
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "Pythonのみ業務で開発")
+        )
+
+    def test_and_partial_match_is_not_retained(self):
+        value = skill(name="PythonとSQLの開発経験", note="Python経験は1ヶ月のみ")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "Pythonのみ業務で開発")
+        )
+
     def test_rhel_windows_partial_match_is_not_duration_reason_or_retained(self):
         value = skill(name="OS:RHEL、Windows", note="Windows経験のみの記載")
         self.assertIsNone(
@@ -122,6 +137,18 @@ class GuardConditionTest(unittest.TestCase):
             target.evaluate_required_skill(value, "業務でPython機能を実装")
         )
 
+    def test_duration_and_unclear_practical_reason_is_not_retained(self):
+        value = skill(note="Python経験は1ヶ月のみで、業務経験も不明確")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でPython機能を実装")
+        )
+
+    def test_duration_and_missing_design_reason_is_not_retained(self):
+        value = skill(note="経験1ヶ月、設計経験も確認できない")
+        self.assertIsNone(
+            target.evaluate_required_skill(value, "業務でPython機能を実装")
+        )
+
     def test_duration_reason_without_numeric_value_is_retained(self):
         value = skill(note="Pythonの経験年数不足")
         self.assertIsNotNone(
@@ -146,6 +173,23 @@ class GuardConditionTest(unittest.TestCase):
         value = skill(
             name="Nest.jsまたはNode.jsを用いたバックエンド開発経験",
             note="Node.js経験は1カ月のみ",
+        )
+        self.assertIsNotNone(
+            target.evaluate_required_skill(value, "業務システムをNode.jsで改修対応")
+        )
+
+    def test_single_python_duration_only_reason_is_retained(self):
+        value = skill(note="Python経験は1ヶ月のみ")
+        self.assertIsNotNone(
+            target.evaluate_required_skill(
+                value, "社内業務でPythonスクレイピングを実装"
+            )
+        )
+
+    def test_pure_or_duration_only_reason_is_retained(self):
+        value = skill(
+            name="Nest.jsまたはNode.jsを用いたバックエンド開発経験",
+            note="Node.js経験期間が短い",
         )
         self.assertIsNotNone(
             target.evaluate_required_skill(value, "業務システムをNode.jsで改修対応")

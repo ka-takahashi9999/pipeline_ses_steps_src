@@ -103,6 +103,8 @@ def confirm_run(run_dir: Path) -> Dict[str, Any]:
         "proposal_ready_false_positive_after",
         "known_false_positives_affected",
         "condition_violations",
+        "mixed_or_and_retained",
+        "non_duration_reason_retained",
         "production_write",
         "new_api_calls",
     )
