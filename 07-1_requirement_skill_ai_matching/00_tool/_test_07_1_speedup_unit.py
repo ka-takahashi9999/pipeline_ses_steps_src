@@ -215,11 +215,11 @@ class SamplingAndCollectionTest(unittest.TestCase):
         self.assertGreaterEqual(len(counts), 2)
         self.assertTrue(all(count >= 2 for count in counts.values()))
 
-    def test_sampling_expands_projects_for_40_69_and_100(self):
-        pairs, projects, skillsheets = fixture_inputs(8, 20)
+    def test_sampling_expands_projects_for_40_100_and_300(self):
+        pairs, projects, skillsheets = fixture_inputs(20, 20)
         production_before = target.snapshot_production_outputs()
 
-        for sample_size in (40, 69, 100):
+        for sample_size in (40, 100, 300):
             first = target.deterministic_sample(
                 pairs, projects, skillsheets, sample_size, "scale-seed"
             )
@@ -252,7 +252,7 @@ class SamplingAndCollectionTest(unittest.TestCase):
                     min(row["original_ordinal"] for row in rows),
                 )
 
-            if sample_size in (40, 69):
+            if sample_size == 40:
                 self.assertEqual(len(rows_by_project), 4)
             else:
                 self.assertGreater(len(rows_by_project), 4)
@@ -539,7 +539,7 @@ class CostAndCliGuardTest(unittest.TestCase):
         self.assertEqual(usage["cache_rate"], 0.4)
 
     def test_network_flag_and_sample_hard_limit(self):
-        self.assertEqual(target.MAX_LIVE_SAMPLE_SIZE, 100)
+        self.assertEqual(target.MAX_LIVE_SAMPLE_SIZE, 300)
         with self.assertRaises(SystemExit):
             target.main(["--sample-size", "30"])
         with self.assertRaises(SystemExit):

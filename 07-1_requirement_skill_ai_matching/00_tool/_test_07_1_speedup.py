@@ -2,7 +2,7 @@
 
 Production 07-1 is imported as the source of truth for request construction and
 response validation.  This file never writes production outputs.  Network use
-requires both an explicit sample size and --allow-network; at most 100 logical
+requires both an explicit sample size and --allow-network; at most 300 logical
 requests can be made in one run.
 """
 
@@ -31,7 +31,7 @@ STEP_DIR = TOOL_DIR.parent
 PROJECT_ROOT = STEP_DIR.parent
 PRODUCTION_PATH = TOOL_DIR / "normalized/requirement_skill_ai_matching.py"
 TEST_OUTPUT_ROOT = STEP_DIR / "_test_07_1_speedup"
-MAX_LIVE_SAMPLE_SIZE = 100
+MAX_LIVE_SAMPLE_SIZE = 300
 MAX_CONCURRENCY_HARD_LIMIT = 8
 DEFAULT_SAMPLE_SEED = "07-1-speedup-v1"
 DEFAULT_INITIAL_CONCURRENCY = 2
