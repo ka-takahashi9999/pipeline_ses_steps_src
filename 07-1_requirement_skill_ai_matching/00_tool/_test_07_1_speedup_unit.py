@@ -215,6 +215,58 @@ class SamplingAndCollectionTest(unittest.TestCase):
         self.assertGreaterEqual(len(counts), 2)
         self.assertTrue(all(count >= 2 for count in counts.values()))
 
+    def test_sampling_expands_projects_for_40_69_and_100(self):
+        pairs, projects, skillsheets = fixture_inputs(8, 20)
+        production_before = target.snapshot_production_outputs()
+
+        for sample_size in (40, 69, 100):
+            first = target.deterministic_sample(
+                pairs, projects, skillsheets, sample_size, "scale-seed"
+            )
+            second = target.deterministic_sample(
+                pairs, projects, skillsheets, sample_size, "scale-seed"
+            )
+            first_identities = [row["request_identity"] for row in first]
+            second_identities = [row["request_identity"] for row in second]
+            self.assertEqual(len(first), sample_size)
+            self.assertEqual(first_identities, second_identities)
+            self.assertEqual(len(first_identities), len(set(first_identities)))
+            self.assertEqual(
+                [row["original_ordinal"] for row in first],
+                sorted(row["original_ordinal"] for row in first),
+            )
+
+            rows_by_project = {}
+            for row in first:
+                project_mid = row["project_message_id"]
+                rows_by_project.setdefault(project_mid, []).append(row)
+                self.assertEqual(
+                    project_mid,
+                    row["pair"]["project_info"]["message_id"],
+                )
+            for rows in rows_by_project.values():
+                warm_rows = [row for row in rows if row["is_project_warm_one"]]
+                self.assertEqual(len(warm_rows), 1)
+                self.assertEqual(
+                    warm_rows[0]["original_ordinal"],
+                    min(row["original_ordinal"] for row in rows),
+                )
+
+            if sample_size in (40, 69):
+                self.assertEqual(len(rows_by_project), 4)
+            else:
+                self.assertGreater(len(rows_by_project), 4)
+
+        with self.assertRaises(ValueError):
+            target.deterministic_sample(
+                pairs,
+                projects,
+                skillsheets,
+                target.MAX_LIVE_SAMPLE_SIZE + 1,
+                "scale-seed",
+            )
+        self.assertEqual(production_before, target.snapshot_production_outputs())
+
     def test_collector_restores_ordinal_after_shuffled_completion(self):
         sample = target.deterministic_sample(
             self.pairs, self.projects, self.skillsheets, 6
@@ -362,9 +414,9 @@ class RetryAndAdaptiveTest(unittest.TestCase):
 
 class SchedulerTest(unittest.TestCase):
     def setUp(self):
-        self.pairs, self.projects, self.skillsheets = fixture_inputs(2, 4)
+        self.pairs, self.projects, self.skillsheets = fixture_inputs(6, 2)
         self.sample = target.deterministic_sample(
-            self.pairs, self.projects, self.skillsheets, 8
+            self.pairs, self.projects, self.skillsheets, 12
         )
         self.temp = tempfile.TemporaryDirectory(prefix="test_07_1_speedup_")
         self.checkpoint = Path(self.temp.name) / "checkpoint.jsonl"

@@ -181,8 +181,9 @@ def deterministic_sample(
     if not ranked_projects:
         raise ValueError("同一project内に複数pairを持つsample候補がありません")
 
-    desired_projects = min(4, max(1, sample_size // 2), len(ranked_projects))
-    selected_projects = ranked_projects[:desired_projects]
+    initial_project_count = min(4, max(1, sample_size // 2), len(ranked_projects))
+    selected_projects = ranked_projects[:initial_project_count]
+    next_project_index = initial_project_count
     positions = {pid: 0 for pid in selected_projects}
     selected: List[Dict[str, Any]] = []
 
@@ -219,6 +220,12 @@ def deterministic_sample(
             if len(selected) >= sample_size:
                 break
         if not progressed:
+            if next_project_index < len(ranked_projects):
+                next_project = ranked_projects[next_project_index]
+                next_project_index += 1
+                selected_projects.append(next_project)
+                positions[next_project] = 0
+                continue
             break
 
     if len(selected) != sample_size:
