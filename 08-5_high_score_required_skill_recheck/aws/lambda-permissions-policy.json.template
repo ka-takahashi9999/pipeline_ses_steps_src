@@ -1,0 +1,44 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOpenAIKeyOnly",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:ap-northeast-1:166714029268:parameter/openai/api_key"
+    },
+    {
+      "Sid": "ReadWriteBatchStateOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::technoverse/pipeline_ses_steps/batch-state/08-5/*"
+    },
+    {
+      "Sid": "ReadWriteTerminalPipelineStatusOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::technoverse/pipeline_ses_steps/pipeline-status/*"
+    },
+    {
+      "Sid": "CreateLambdaLogGroup",
+      "Effect": "Allow",
+      "Action": "logs:CreateLogGroup",
+      "Resource": "arn:aws:logs:ap-northeast-1:166714029268:*"
+    },
+    {
+      "Sid": "WriteLambdaLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:ap-northeast-1:166714029268:log-group:/aws/lambda/auto-match-08-5-batch-status:*"
+    }
+  ]
+}

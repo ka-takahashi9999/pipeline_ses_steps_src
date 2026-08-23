@@ -4,7 +4,12 @@ set -Eeuo pipefail
 ROOT="/home/ec2-user/pipeline_ses_steps"
 SCRIPT_DIR="$ROOT/00_pipeline/00_tool"
 CONFIG_FILE="${PIPELINE_S3_CONFIG_FILE:-$SCRIPT_DIR/pipeline_s3_config.env}"
-PIPELINE_SCRIPT="${PIPELINE_SCRIPT:-$SCRIPT_DIR/run_full_pipeline.sh}"
+PIPELINE_PHASE="${PIPELINE_PHASE:-A}"
+if [[ "$PIPELINE_PHASE" == "B" ]]; then
+  PIPELINE_SCRIPT="${PIPELINE_SCRIPT:-$SCRIPT_DIR/run_full_pipeline_phase_b.sh}"
+else
+  PIPELINE_SCRIPT="${PIPELINE_SCRIPT:-$SCRIPT_DIR/run_full_pipeline.sh}"
+fi
 STATUS_WRITER="${PIPELINE_STATUS_WRITER:-$ROOT/99-9_publish_pipeline_status/00_tool/publish_pipeline_status.py}"
 PYTHON_BIN="${PIPELINE_PYTHON_BIN:-/usr/bin/python3}"
 AWS_BIN="${PIPELINE_AWS_BIN:-/usr/bin/aws}"
@@ -20,6 +25,11 @@ source "$CONFIG_FILE"
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_DATE:?RUN_DATE is required}"
 
+if [[ "$PIPELINE_PHASE" != "A" && "$PIPELINE_PHASE" != "B" ]]; then
+  echo "PIPELINE_PHASE must be A or B: $PIPELINE_PHASE" >&2
+  exit 2
+fi
+
 if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
   echo "RUN_ID contains unsupported characters: $RUN_ID" >&2
   exit 2
@@ -33,13 +43,33 @@ if [[ ! -x "$PYTHON_BIN" || ! -r "$STATUS_WRITER" ]]; then
   exit 2
 fi
 
-STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 STATE_DIR="$ROOT/00_pipeline/01_result/managed/$RUN_DATE/$RUN_ID"
 LOCAL_LOG="$STATE_DIR/pipeline.log"
 LOCAL_STATUS_FILE="$STATE_DIR/status.json"
 CURRENT_STEP_FILE="$STATE_DIR/current_step"
+SUSPEND_CONTRACT_FILE="$STATE_DIR/suspend_contract"
+SUSPEND_EXIT_CODE=85
 LOCK_FILE="${PIPELINE_LOCK_FILE:-$ROOT/00_pipeline/01_result/run_full_pipeline.lock}"
 LOG_S3_URI="s3://$PIPELINE_S3_BUCKET/$PIPELINE_S3_BASE_PREFIX/$PIPELINE_LOG_PREFIX/$RUN_DATE/$RUN_ID/pipeline.log"
+
+STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+if [[ "$PIPELINE_PHASE" == "B" && -s "$LOCAL_STATUS_FILE" ]]; then
+  preserved_started_at="$($PYTHON_BIN -c '
+import json, sys
+path, run_id, run_date = sys.argv[1:]
+doc = json.load(open(path, encoding="utf-8"))
+if doc.get("run_id") != run_id or doc.get("run_date") != run_date:
+    raise SystemExit(1)
+value = doc.get("started_at")
+if not isinstance(value, str) or not value:
+    raise SystemExit(1)
+print(value)
+' "$LOCAL_STATUS_FILE" "$RUN_ID" "$RUN_DATE")" || {
+    echo "Phase B could not preserve Phase A started_at" >&2
+    exit 2
+  }
+  STARTED_AT="$preserved_started_at"
+fi
 
 LOCK_STATE="NOT_ACQUIRED"
 LOCK_FD_OPEN=0
@@ -161,8 +191,33 @@ finalize() {
   if [[ "$LOCK_STATE" == "BLOCKED_BY_OTHER" ]]; then
     current_step="ALREADY_RUNNING"
   fi
+  if [[ "$original_exit_code" -eq "$SUSPEND_EXIT_CODE" ]]; then
+    if [[ "$current_step" != "08-5_BATCH_WAIT" ]] || \
+       [[ ! -s "$SUSPEND_CONTRACT_FILE" ]] || \
+       [[ "$(head -n 1 "$SUSPEND_CONTRACT_FILE")" != "SUSPENDED:BATCH_WAIT:08-5_BATCH_WAIT" ]]; then
+      final_exit_code=1
+      error_message="invalid pipeline suspension contract"
+      FAILURE_MESSAGE="$error_message"
+      managed_log "$error_message"
+    else
+      managed_log "pipeline suspended for 08-5 Batch wait"
+      if upload_log && publish_status "RUNNING" "$current_step"; then
+        if [[ "$LOCK_STATE" == "ACQUIRED" && "$LOCK_FD_OPEN" -eq 1 ]]; then
+          : > "$LOCK_FILE"
+          "$FLOCK_BIN" -u 9
+          LOCK_STATE="RELEASED"
+        fi
+        exit 0
+      fi
+      final_exit_code=1
+      error_message="failed to persist RUNNING Batch-wait suspension"
+      FAILURE_MESSAGE="$error_message"
+      managed_log "$error_message"
+    fi
+  fi
+
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  if [[ "$original_exit_code" -eq 0 ]]; then
+  if [[ "$final_exit_code" -eq 0 ]]; then
     final_status="SUCCEEDED"
     error_message=""
     managed_log "pipeline completed successfully"
@@ -263,8 +318,14 @@ LOCK_STATE="ACQUIRED"
 LOCAL_IO_ENABLED=1
 : > "$LOCK_FILE"
 printf '%s\n' "$RUN_ID" >&9
-: > "$LOCAL_LOG"
-printf '%s\n' "INITIALIZING" > "$CURRENT_STEP_FILE"
+if [[ "$PIPELINE_PHASE" == "B" ]]; then
+  touch "$LOCAL_LOG"
+  printf '%s\n' "INITIALIZING_PHASE_B" > "$CURRENT_STEP_FILE"
+else
+  : > "$LOCAL_LOG"
+  printf '%s\n' "INITIALIZING" > "$CURRENT_STEP_FILE"
+fi
+: > "$SUSPEND_CONTRACT_FILE"
 
 export RUN_ID RUN_DATE
 export PIPELINE_STARTED_AT="$STARTED_AT"
@@ -272,13 +333,20 @@ export PIPELINE_LOG="$LOCAL_LOG"
 export PIPELINE_LOG_S3_URI="$LOG_S3_URI"
 export PIPELINE_LOCAL_STATUS_FILE="$LOCAL_STATUS_FILE"
 export PIPELINE_CURRENT_STEP_FILE="$CURRENT_STEP_FILE"
+export PIPELINE_SUSPEND_CONTRACT_FILE="$SUSPEND_CONTRACT_FILE"
+export PIPELINE_SUSPEND_EXIT_CODE="$SUSPEND_EXIT_CODE"
 export PIPELINE_STATUS_WRITER="$STATUS_WRITER"
 export PIPELINE_S3_BUCKET PIPELINE_S3_BASE_PREFIX PIPELINE_STATUS_PREFIX
 export PIPELINE_LOG_PREFIX PIPELINE_AWS_REGION
+export ENABLE_08_5_BATCH_ORCHESTRATION
 export AWS_DEFAULT_REGION="$PIPELINE_AWS_REGION"
 
-managed_log "managed pipeline start (RUN_DATE=$RUN_DATE, RUN_ID=$RUN_ID)"
-publish_status "RUNNING" "INITIALIZING"
+managed_log "managed pipeline start (phase=$PIPELINE_PHASE, RUN_DATE=$RUN_DATE, RUN_ID=$RUN_ID)"
+if [[ "$PIPELINE_PHASE" == "B" ]]; then
+  publish_status "RUNNING" "INITIALIZING_PHASE_B"
+else
+  publish_status "RUNNING" "INITIALIZING"
+fi
 
 set +e
 /usr/bin/bash "$PIPELINE_SCRIPT"

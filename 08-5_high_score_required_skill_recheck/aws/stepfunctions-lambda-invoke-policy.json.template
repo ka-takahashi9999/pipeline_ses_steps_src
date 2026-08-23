@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Invoke085BatchStatusOnly",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:ap-northeast-1:166714029268:function:auto-match-08-5-batch-status"
+    }
+  ]
+}

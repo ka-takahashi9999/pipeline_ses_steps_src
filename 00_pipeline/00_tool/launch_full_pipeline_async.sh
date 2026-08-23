@@ -17,6 +17,12 @@ source "$CONFIG_FILE"
 
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_DATE:?RUN_DATE is required}"
+: "${PIPELINE_PHASE:=A}"
+
+if [[ "$PIPELINE_PHASE" != "A" && "$PIPELINE_PHASE" != "B" ]]; then
+  echo "PIPELINE_PHASE must be A or B: $PIPELINE_PHASE" >&2
+  exit 2
+fi
 
 if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
   echo "RUN_ID contains unsupported characters: $RUN_ID" >&2
@@ -35,7 +41,8 @@ if [[ ! -r "$MANAGED_WRAPPER" ]]; then
   exit 2
 fi
 
-UNIT_NAME="pipeline-ses-${RUN_DATE}-${RUN_ID}.service"
+phase_suffix="$(printf '%s' "$PIPELINE_PHASE" | tr '[:upper:]' '[:lower:]')"
+UNIT_NAME="pipeline-ses-${RUN_DATE}-${RUN_ID}-phase-${phase_suffix}.service"
 
 # A repeated SSM launcher call for the same execution is treated as already accepted.
 if "$SYSTEMCTL_BIN" is-active --quiet "$UNIT_NAME"; then
@@ -53,12 +60,14 @@ systemd_args=(
   --working-directory="$ROOT"
   --setenv="RUN_ID=$RUN_ID"
   --setenv="RUN_DATE=$RUN_DATE"
+  --setenv="PIPELINE_PHASE=$PIPELINE_PHASE"
   --setenv="PIPELINE_S3_CONFIG_FILE=$CONFIG_FILE"
   --setenv="PIPELINE_S3_BUCKET=$PIPELINE_S3_BUCKET"
   --setenv="PIPELINE_S3_BASE_PREFIX=$PIPELINE_S3_BASE_PREFIX"
   --setenv="PIPELINE_STATUS_PREFIX=$PIPELINE_STATUS_PREFIX"
   --setenv="PIPELINE_LOG_PREFIX=$PIPELINE_LOG_PREFIX"
   --setenv="PIPELINE_AWS_REGION=$PIPELINE_AWS_REGION"
+  --setenv="ENABLE_08_5_BATCH_ORCHESTRATION=$ENABLE_08_5_BATCH_ORCHESTRATION"
 )
 
 if [[ -n "$PIPELINE_SYSTEMD_USER" ]]; then
@@ -80,4 +89,4 @@ if [[ "$systemd_exit_code" -ne 0 ]]; then
   exit "$systemd_exit_code"
 fi
 
-echo "managed pipeline accepted: unit=$UNIT_NAME run_id=$RUN_ID run_date=$RUN_DATE"
+echo "managed pipeline accepted: unit=$UNIT_NAME phase=$PIPELINE_PHASE run_id=$RUN_ID run_date=$RUN_DATE"

@@ -47,6 +47,16 @@ run_step() {
   log "=== DONE $step (elapsed=${elapsed}s) ==="
 }
 
+suspend_for_batch_wait() {
+  local contract_file="${PIPELINE_SUSPEND_CONTRACT_FILE:?suspend contract file is required}"
+  local exit_code="${PIPELINE_SUSPEND_EXIT_CODE:-85}"
+  publish_current_step "08-5_BATCH_WAIT"
+  printf '%s\n' "SUSPENDED:BATCH_WAIT:08-5_BATCH_WAIT" > "${contract_file}.tmp.$$"
+  mv "${contract_file}.tmp.$$" "$contract_file"
+  log "=== SUSPENDED 08-5_BATCH_WAIT (exit=$exit_code) ==="
+  exit "$exit_code"
+}
+
 log "########## pipeline start ##########"
 log "RUN_DATE=$RUN_DATE"
 
@@ -180,7 +190,21 @@ run_step "08-3_match_score_partition" "$ROOT/08-3_match_score_partition/00_tool/
 
 run_step "08-4_match_score_sort" "$ROOT/08-4_match_score_sort/00_tool/match_score_sort.py"
 
-run_step "08-5_high_score_required_skill_recheck" "$ROOT/08-5_high_score_required_skill_recheck/00_tool/high_score_required_skill_recheck.py"
+if [[ "${ENABLE_08_5_BATCH_ORCHESTRATION:-0}" == "1" ]]; then
+  run_step \
+    "08-5_batch_prepare_submit" \
+    "$ROOT/08-5_high_score_required_skill_recheck/00_tool/batch_aws_orchestration.py" \
+    phase-a --pipeline-run-id "$RUN_ID" --run-date "$RUN_DATE"
+
+  # Phase Aはterminal successではない。managed wrapperの明示contractでRUNNINGを維持し、
+  # Step FunctionsがEC2を停止してBatch status waitへ移る。
+  suspend_for_batch_wait
+elif [[ "${ENABLE_08_5_BATCH_ORCHESTRATION:-0}" == "0" ]]; then
+  run_step "08-5_high_score_required_skill_recheck" "$ROOT/08-5_high_score_required_skill_recheck/00_tool/high_score_required_skill_recheck.py"
+else
+  log "ENABLE_08_5_BATCH_ORCHESTRATION must be 0 or 1"
+  exit 2
+fi
 
 run_step "09-1_mail_display_format(RUN_DATE=$RUN_DATE)" "$ROOT/09-1_mail_display_format/00_tool/mail_display_format.py" --target-date "$RUN_DATE"
 
