@@ -90,9 +90,19 @@ def success_checkpoint(item, concurrency=1):
         "result": {
             "project_info": {"message_id": item["project_message_id"]},
             "resource_info": {"message_id": item["resource_message_id"]},
-            "required_skills": [],
+            "required_skills": [
+                {
+                    "skill": "Python開発経験",
+                    "match": True,
+                    "note": "実務経験あり",
+                }
+            ],
             "optional_skills": [],
-            "evaluation_meta": {},
+            "evaluation_meta": {
+                "skillsheet_source": "offline",
+                "llm_model": "gpt-4o-mini",
+                "soft_skill_auto_true_count": 0,
+            },
         },
         "error": None,
         "concurrency_at_submit": concurrency,
@@ -229,6 +239,14 @@ class FlagAndRequestContractTest(unittest.TestCase):
             item = {
                 **saved,
                 "api_request": True,
+                "skill_contract_sha256": target._skill_contract_hash(
+                    checkpoint_by_identity[saved["request_identity"]]["result"][
+                        "required_skills"
+                    ],
+                    checkpoint_by_identity[saved["request_identity"]]["result"][
+                        "optional_skills"
+                    ],
+                ),
             }
             manifest.append(item)
             checkpoint = checkpoint_by_identity[saved["request_identity"]]
@@ -385,6 +403,21 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed=1"):
             target.collect_concurrent_checkpoints(manifest, [invalid_error])
 
+        changed_skill = success_checkpoint(self.items[0])
+        changed_skill["result"]["required_skills"][0]["skill"] = "CHANGED_SKILL"
+        with self.assertRaisesRegex(ValueError, "malformed=1"):
+            target.collect_concurrent_checkpoints(manifest, [changed_skill])
+
+        long_note = success_checkpoint(self.items[0])
+        long_note["result"]["required_skills"][0]["note"] = "x" * 31
+        with self.assertRaisesRegex(ValueError, "malformed=1"):
+            target.collect_concurrent_checkpoints(manifest, [long_note])
+
+        invalid_meta = success_checkpoint(self.items[0])
+        invalid_meta["result"]["evaluation_meta"] = {}
+        with self.assertRaisesRegex(ValueError, "malformed=1"):
+            target.collect_concurrent_checkpoints(manifest, [invalid_meta])
+
     def test_worker_enables_bounded_retry_backoff(self):
         captured = {}
 
@@ -433,6 +466,11 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
 
 
 class RetentionProductionRegressionTest(unittest.TestCase):
+    def test_limited_run_does_not_mix_all_cache_hits_into_sidecar(self):
+        with patch.object(target, "load_current_cache_hit_results") as load_hits:
+            self.assertEqual(target.cache_hit_results_for_run(10), [])
+        load_hits.assert_not_called()
+
     def test_cache_hit_is_read_only_and_remains_retention_reachable(self):
         with tempfile.TemporaryDirectory(prefix="07_1_cache_hit_guard_") as temporary:
             root = Path(temporary)

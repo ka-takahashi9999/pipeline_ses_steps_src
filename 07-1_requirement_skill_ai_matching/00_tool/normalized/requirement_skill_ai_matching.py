@@ -447,6 +447,21 @@ def _request_body_hash(call_kwargs: Dict[str, Any]) -> str:
     return _json_hash(payload)
 
 
+def _skill_contract_hash(required: Any, optional: Any) -> str:
+    return _json_hash(
+        {
+            "required_skills": [
+                item.get("skill") if isinstance(item, dict) else None
+                for item in (required if isinstance(required, list) else [])
+            ],
+            "optional_skills": [
+                item.get("skill") if isinstance(item, dict) else None
+                for item in (optional if isinstance(optional, list) else [])
+            ],
+        }
+    )
+
+
 def _capture_response(response_schema: Dict[str, Any]) -> Dict[str, Any]:
     response = copy.deepcopy(response_schema)
     for field in ("required_skills", "optional_skills"):
@@ -497,6 +512,11 @@ def build_concurrent_items(
             if call_kwargs is not None
             else _json_hash({"no_api_request": preflight_error})
         )
+        response_schema = (
+            call_kwargs.get("response_schema", {})
+            if call_kwargs is not None
+            else {}
+        )
         items.append(
             {
                 "ordinal": ordinal,
@@ -506,6 +526,14 @@ def build_concurrent_items(
                     ordinal, project_mid, resource_mid
                 ),
                 "request_body_sha256": request_hash,
+                "skill_contract_sha256": (
+                    _skill_contract_hash(
+                        response_schema.get("required_skills"),
+                        response_schema.get("optional_skills"),
+                    )
+                    if call_kwargs is not None
+                    else ""
+                ),
                 "api_request": call_kwargs is not None,
                 "is_project_warm_one": False,
                 "pair": pair,
@@ -535,6 +563,7 @@ def concurrent_manifest_record(item: Dict[str, Any]) -> Dict[str, Any]:
         "resource_message_id": item["resource_message_id"],
         "request_identity": item["request_identity"],
         "request_body_sha256": item["request_body_sha256"],
+        "skill_contract_sha256": item["skill_contract_sha256"],
         "api_request": item["api_request"],
         "is_project_warm_one": item["is_project_warm_one"],
     }
@@ -589,6 +618,11 @@ def load_current_cache_hit_results() -> List[Dict[str, Any]]:
             }
         )
     return restored
+
+
+def cache_hit_results_for_run(limit: Optional[int]) -> List[Dict[str, Any]]:
+    """limited runでは未処理のCache HITをsidecarへ混入させない。"""
+    return [] if limit is not None else load_current_cache_hit_results()
 
 
 class AdaptiveConcurrency:
@@ -716,16 +750,20 @@ def _valid_completed_skill_list(value: Any) -> bool:
         return False
     return all(
         isinstance(item, dict)
+        and set(item) == {"skill", "match", "note"}
         and isinstance(item.get("skill"), str)
         and bool(item.get("skill"))
         and isinstance(item.get("match"), bool)
         and isinstance(item.get("note"), str)
         and bool(item.get("note"))
+        and len(item.get("note")) <= NOTE_MAX_CHARS
         for item in value
     )
 
 
-def _valid_checkpoint_payload(row: Dict[str, Any]) -> bool:
+def _valid_checkpoint_payload(
+    row: Dict[str, Any], expected: Dict[str, Any]
+) -> bool:
     status = row.get("status")
     result = row.get("result")
     error = row.get("error")
@@ -743,10 +781,30 @@ def _valid_checkpoint_payload(row: Dict[str, Any]) -> bool:
             or resource_info.get("message_id") != resource_mid
         ):
             return False
+        required = result.get("required_skills")
+        optional = result.get("optional_skills")
+        if not (
+            _valid_completed_skill_list(required)
+            and _valid_completed_skill_list(optional)
+            and _skill_contract_hash(required, optional)
+            == expected.get("skill_contract_sha256")
+        ):
+            return False
+        evaluation_meta = result.get("evaluation_meta")
+        if not isinstance(evaluation_meta, dict) or set(evaluation_meta) != {
+            "skillsheet_source",
+            "llm_model",
+            "soft_skill_auto_true_count",
+        }:
+            return False
+        soft_count = evaluation_meta.get("soft_skill_auto_true_count")
         return (
-            _valid_completed_skill_list(result.get("required_skills"))
-            and _valid_completed_skill_list(result.get("optional_skills"))
-            and isinstance(result.get("evaluation_meta"), dict)
+            isinstance(evaluation_meta.get("skillsheet_source"), str)
+            and bool(evaluation_meta.get("skillsheet_source"))
+            and evaluation_meta.get("llm_model") == LLM_MODEL
+            and isinstance(soft_count, int)
+            and not isinstance(soft_count, bool)
+            and 0 <= soft_count <= len(required) + len(optional)
         )
     if status == "error":
         if result is not None or not isinstance(error, dict):
@@ -798,10 +856,12 @@ def collect_concurrent_checkpoints(
             == expected_row.get("resource_message_id")
             and row.get("request_body_sha256")
             == expected_row.get("request_body_sha256")
+            and row.get("skill_contract_sha256")
+            == expected_row.get("skill_contract_sha256")
             and row.get("api_request") is expected_row.get("api_request")
             and row.get("completion_state") == "completed"
             and row.get("status") in ("success", "error")
-            and _valid_checkpoint_payload(row)
+            and _valid_checkpoint_payload(row, expected_row)
         )
         if not valid:
             malformed.append("line={}:{}".format(index, identity))
@@ -1007,7 +1067,7 @@ def _run_concurrent(
         list(read_jsonl(str(checkpoint_path))) if checkpoint_path.exists() else []
     )
     # API fan-out前にCache HIT側のretention入力も検証する。
-    cache_hit_results = load_current_cache_hit_results()
+    cache_hit_results = cache_hit_results_for_run(args.limit)
     started = time.time()
     checkpoints, controller, stopped = run_concurrent_scheduler(
         items,
