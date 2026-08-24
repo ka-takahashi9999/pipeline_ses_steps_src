@@ -16,8 +16,9 @@ class FakeResponse:
     status_code = 200
     text = ""
 
-    def __init__(self, payload):
+    def __init__(self, payload, headers=None):
         self.payload = payload
+        self.headers = headers or {}
 
     def raise_for_status(self):
         return None
@@ -140,6 +141,47 @@ class CallLlmTest(unittest.TestCase):
         self.assertEqual(result, {"result": "ok"})
         self.assertEqual(call_count, 1)
         self.assertEqual(len(records), 1)
+
+    def test_response_observer_receives_rate_headers_without_changing_result(self):
+        response = FakeResponse(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"result":"ok"}'},
+                    }
+                ]
+            },
+            headers={
+                "X-RateLimit-Remaining-Requests": "999",
+                "X-RateLimit-Remaining-Tokens": "999999",
+                "X-Unrelated": "ignored",
+            },
+        )
+        observed = []
+        with patch.object(llm_client, "_get_api_key", return_value="test-key"), patch.object(
+            llm_client, "_enforce_rate_limit"
+        ), patch.object(llm_client.requests, "post", return_value=response):
+            result = llm_client.call_llm(
+                system_prompt="system",
+                user_prompt="user",
+                response_schema={"result": ""},
+                max_tokens=10,
+                telemetry_context=None,
+                response_observer=observed.append,
+            )
+
+        self.assertEqual(result, {"result": "ok"})
+        self.assertEqual(len(observed), 1)
+        self.assertTrue(observed[0]["success"])
+        self.assertEqual(observed[0]["status_code"], 200)
+        self.assertEqual(
+            observed[0]["rate_limit_headers"],
+            {
+                "x-ratelimit-remaining-requests": "999",
+                "x-ratelimit-remaining-tokens": "999999",
+            },
+        )
 
     def test_usage_available_success_is_recorded_with_required_schema(self):
         response = FakeResponse(

@@ -300,20 +300,19 @@ def load_production_contexts() -> List[Dict[str, Any]]:
     cleaned_email_map = DIRECT._load_cleaned_email_map()
     contexts: List[Dict[str, Any]] = []
     source_ordinal = 0
-    for score_band, input_path in DIRECT.INPUT_SCORE_FILES:
-        for record in read_jsonl(str(input_path)):
-            if DIRECT._is_no_match_record(record):
-                continue
-            source_ordinal += 1
-            contexts.append(
-                _build_request_context(
-                    record,
-                    score_band,
-                    source_ordinal,
-                    skillsheet_map,
-                    cleaned_email_map,
-                )
+    for score_band, record in DIRECT.iter_input_records():
+        if DIRECT._is_no_match_record(record):
+            continue
+        source_ordinal += 1
+        contexts.append(
+            _build_request_context(
+                record,
+                score_band,
+                source_ordinal,
+                skillsheet_map,
+                cleaned_email_map,
             )
+        )
     return contexts
 
 

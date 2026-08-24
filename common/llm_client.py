@@ -14,7 +14,7 @@ import time
 import threading
 import fcntl
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import boto3
 import requests
@@ -32,6 +32,7 @@ _rate_limit_lock = threading.Lock()
 _last_call_time: float = 0.0
 _MIN_INTERVAL_SECONDS: float = 0.5  # 最小呼び出し間隔
 _HTTP_ERROR_BODY_MAX_CHARS: int = 1000
+CHAT_COMPLETIONS_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
 # counter fileを利用できない場合だけ使うプロセス内fallback。
 # 通常経路はfile lock付きcounterにより、同一run/step内のcall_numberを採番する。
@@ -103,6 +104,54 @@ def _format_http_error_detail(response: Optional[requests.Response]) -> str:
             parts.append(f"{key}={_truncate_http_error_text(value)}")
     parts.append(f"response_body={response_text}")
     return " ".join(parts)
+
+
+def build_chat_completion_payload(
+    system_prompt: str,
+    user_prompt: str,
+    response_schema: Dict[str, Any],
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0,
+    max_tokens: int = 1024,
+) -> Dict[str, Any]:
+    """call_llmが送信するChat Completions bodyを副作用なしで構築する。"""
+    schema_str = json.dumps(response_schema, ensure_ascii=False, indent=2)
+    full_system_prompt = (
+        f"{system_prompt}\n\n"
+        "必ず以下のJSONスキーマに従ってJSONのみを返すこと。"
+        "キー名は変更禁止。値のみ更新可。\n"
+        f"```json\n{schema_str}\n```"
+    )
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": full_system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _response_rate_headers(response: Optional[requests.Response]) -> Dict[str, str]:
+    if response is None:
+        return {}
+    wanted = {
+        "retry-after",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+        "x-request-id",
+    }
+    return {
+        str(key).lower(): str(value)
+        for key, value in response.headers.items()
+        if str(key).lower() in wanted
+    }
 
 
 def _metadata_text(value: Any) -> str:
@@ -315,6 +364,7 @@ def call_llm(
     max_retries: int = 3,
     retry_wait_seconds: float = 5.0,
     telemetry_context: Optional[Dict[str, Any]] = None,
+    response_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     OpenAI APIを呼び出してJSONレスポンスを取得する。
@@ -330,6 +380,7 @@ def call_llm(
         max_retries: リトライ回数
         retry_wait_seconds: リトライ間隔（秒）
         telemetry_context: usage保存用のstep/output_dir/run metadata（省略可）
+        response_observer: 各attemptのstatus/latency/rate-limit header通知先（省略可）
 
     Returns:
         パースされたJSONレスポンス（response_schemaのキー構造を保持）
@@ -343,35 +394,24 @@ def call_llm(
     telemetry_state = _build_telemetry_state(telemetry_context)
     call_number = _next_call_number(telemetry_state) if telemetry_state else 0
 
-    # スキーマ情報をプロンプトに組み込む
-    schema_str = json.dumps(response_schema, ensure_ascii=False, indent=2)
-    full_system_prompt = (
-        f"{system_prompt}\n\n"
-        f"必ず以下のJSONスキーマに従ってJSONのみを返すこと。キー名は変更禁止。値のみ更新可。\n"
-        f"```json\n{schema_str}\n```"
-    )
-
-    messages = [
-        {"role": "system", "content": full_system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
+    payload = build_chat_completion_payload(
+        system_prompt,
+        user_prompt,
+        response_schema,
+        model,
+        temperature,
+        max_tokens,
+    )
 
     last_error: Optional[Exception] = None
     last_error_detail: Optional[str] = None
     for attempt in range(1, max_retries + 1):
         _enforce_rate_limit()
+        attempt_started = time.monotonic()
         response_json: Any = None
         response: Optional[requests.Response] = None
         attempt_success = False
@@ -379,7 +419,7 @@ def call_llm(
         try:
             _logger.llm(f"API呼び出し試行 {attempt}/{max_retries} (model={model})")
             response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                CHAT_COMPLETIONS_ENDPOINT,
                 headers=headers,
                 json=payload,
                 timeout=60,
@@ -445,6 +485,25 @@ def call_llm(
                 success=attempt_success,
                 error_type=attempt_error_type,
             )
+            if response_observer is not None:
+                try:
+                    response_observer(
+                        {
+                            "attempt": attempt,
+                            "status_code": (
+                                response.status_code if response is not None else None
+                            ),
+                            "latency_seconds": time.monotonic() - attempt_started,
+                            "success": attempt_success,
+                            "error_type": attempt_error_type,
+                            "rate_limit_headers": _response_rate_headers(response),
+                        }
+                    )
+                except Exception as observer_error:
+                    _logger.warn(
+                        "response observer失敗; LLM処理は継続します: "
+                        f"{type(observer_error).__name__}: {observer_error}"
+                    )
 
         if attempt < max_retries:
             _logger.info(f"{retry_wait_seconds}秒後にリトライします...")

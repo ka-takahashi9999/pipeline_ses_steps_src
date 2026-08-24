@@ -7,6 +7,7 @@
 """
 
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -48,6 +49,14 @@ INPUT_SCORE_FILES: Tuple[Tuple[str, Path], ...] = (
         "80to99percent",
         project_root / "08-4_match_score_sort/01_result/match_score_sort_80to99percent.jsonl",
     ),
+)
+RETENTION_SIDECAR = (
+    project_root
+    / "07-1_requirement_skill_ai_matching/01_result/"
+    "requirement_skill_retention_candidates.jsonl"
+)
+CONCURRENT_CONFIG = (
+    project_root / "07-1_requirement_skill_ai_matching/00_tool/config.py"
 )
 INPUT_SKILLSHEETS = (
     project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
@@ -147,6 +156,55 @@ SYSTEM_PROMPT = """あなたはIT人材評価の専門家です。
 """
 
 VALID_CATEGORY_MATCHES = {"match", "mismatch", "unclear"}
+
+
+def _concurrent_input_enabled() -> bool:
+    spec = importlib.util.spec_from_file_location(
+        "config_07_1_for_08_5_input_wiring", str(CONCURRENT_CONFIG)
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("07-1 concurrent configをloadできません")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, "ENABLE_07_1_CONCURRENT", False) is True
+
+
+def configured_input_score_files() -> Tuple[Tuple[str, Path], ...]:
+    if not _concurrent_input_enabled():
+        return INPUT_SCORE_FILES
+    return INPUT_SCORE_FILES + (("retention_guard", RETENTION_SIDECAR),)
+
+
+def _input_pair_key(record: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    project_mid = str(record.get("project_info", {}).get("message_id", ""))
+    resource_mid = str(record.get("resource_info", {}).get("message_id", ""))
+    if not project_mid or not resource_mid:
+        return None
+    return project_mid, resource_mid
+
+
+def iter_input_records():
+    """通常入力を優先し、sidecarを最後にpair identityで重複排除する。"""
+    if not _concurrent_input_enabled():
+        for score_band, input_path in INPUT_SCORE_FILES:
+            for record in read_jsonl(str(input_path)):
+                yield score_band, record
+        return
+
+    seen = set()
+    for score_band, input_path in INPUT_SCORE_FILES + (
+        ("retention_guard", RETENTION_SIDECAR),
+    ):
+        for record in read_jsonl(str(input_path)):
+            if _is_no_match_record(record):
+                yield score_band, record
+                continue
+            key = _input_pair_key(record)
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            yield score_band, record
 
 
 def _is_no_match_record(record: Dict[str, Any]) -> bool:
@@ -855,7 +913,7 @@ def main() -> None:
             sys.exit(1)
         return
 
-    for _, path in INPUT_SCORE_FILES:
+    for _, path in configured_input_score_files():
         if not path.exists():
             logger.error(f"入力ファイルが見つかりません: {path}")
             sys.exit(1)
@@ -877,43 +935,42 @@ def main() -> None:
     skipped_no_match_count = 0
     start_time = time.time()
 
-    for source_score_band, input_path in INPUT_SCORE_FILES:
-        for record in read_jsonl(str(input_path)):
-            if _is_no_match_record(record):
-                skipped_no_match_count += 1
-                continue
-            if args.limit is not None and processed_count >= args.limit:
-                break
+    for source_score_band, record in iter_input_records():
+        if _is_no_match_record(record):
+            skipped_no_match_count += 1
+            continue
+        if args.limit is not None and processed_count >= args.limit:
+            break
 
-            try:
-                result_record, error_record = _process_record(
-                    record, source_score_band, skillsheet_map, cleaned_email_map
-                )
-            except Exception as e:
-                result_record = _add_recheck_result(
-                    record,
-                    source_score_band,
-                    _fallback_checks(
-                        _required_skills_from_record(record),
-                        "予期しないエラーのため人間確認",
-                    ),
-                    0,
-                )
-                error_record = _make_error(
-                    record, source_score_band, "unexpected_error", str(e)
-                )
+        try:
+            result_record, error_record = _process_record(
+                record, source_score_band, skillsheet_map, cleaned_email_map
+            )
+        except Exception as e:
+            result_record = _add_recheck_result(
+                record,
+                source_score_band,
+                _fallback_checks(
+                    _required_skills_from_record(record),
+                    "予期しないエラーのため人間確認",
+                ),
+                0,
+            )
+            error_record = _make_error(
+                record, source_score_band, "unexpected_error", str(e)
+            )
 
-            _write_result(result_record)
-            processed_count += 1
+        _write_result(result_record)
+        processed_count += 1
 
-            if error_record:
-                append_jsonl(str(OUTPUT_ERROR), error_record)
-                error_count += 1
+        if error_record:
+            append_jsonl(str(OUTPUT_ERROR), error_record)
+            error_count += 1
 
-            if processed_count % 10 == 0:
-                logger.info(
-                    f"処理中: processed={processed_count} errors={error_count}"
-                )
+        if processed_count % 10 == 0:
+            logger.info(
+                f"処理中: processed={processed_count} errors={error_count}"
+            )
 
         if args.limit is not None and processed_count >= args.limit:
             break
