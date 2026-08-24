@@ -16,11 +16,16 @@ class FakeResponse:
     status_code = 200
     text = ""
 
-    def __init__(self, payload, headers=None):
+    def __init__(self, payload, headers=None, status_code=200):
         self.payload = payload
         self.headers = headers or {}
+        self.status_code = status_code
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            raise llm_client.requests.exceptions.HTTPError(
+                "HTTP {}".format(self.status_code), response=self
+            )
         return None
 
     def json(self):
@@ -182,6 +187,72 @@ class CallLlmTest(unittest.TestCase):
                 "x-ratelimit-remaining-tokens": "999999",
             },
         )
+
+    def test_bounded_retry_backoff_caps_retry_after(self):
+        responses = [
+            FakeResponse(
+                {"error": {"message": "rate limit"}},
+                headers={"Retry-After": "100"},
+                status_code=429,
+            ),
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"result":"ok"}'},
+                        }
+                    ]
+                }
+            ),
+        ]
+        with patch.object(llm_client, "_get_api_key", return_value="test-key"), patch.object(
+            llm_client, "_enforce_rate_limit"
+        ), patch.object(
+            llm_client.requests, "post", side_effect=responses
+        ), patch.object(llm_client.time, "sleep") as sleep_mock:
+            result = llm_client.call_llm(
+                system_prompt="system",
+                user_prompt="user",
+                response_schema={"result": ""},
+                max_tokens=10,
+                telemetry_context=None,
+                use_bounded_retry_backoff=True,
+            )
+        self.assertEqual(result, {"result": "ok"})
+        sleep_mock.assert_called_once_with(30.0)
+
+    def test_bounded_retry_backoff_uses_exponential_fallback(self):
+        responses = [
+            FakeResponse(
+                {"error": {"message": "rate limit"}}, status_code=429
+            ),
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"result":"ok"}'},
+                        }
+                    ]
+                }
+            ),
+        ]
+        with patch.object(llm_client, "_get_api_key", return_value="test-key"), patch.object(
+            llm_client, "_enforce_rate_limit"
+        ), patch.object(
+            llm_client.requests, "post", side_effect=responses
+        ), patch.object(llm_client.time, "sleep") as sleep_mock:
+            result = llm_client.call_llm(
+                system_prompt="system",
+                user_prompt="user",
+                response_schema={"result": ""},
+                max_tokens=10,
+                telemetry_context=None,
+                use_bounded_retry_backoff=True,
+            )
+        self.assertEqual(result, {"result": "ok"})
+        sleep_mock.assert_called_once_with(1.0)
 
     def test_usage_available_success_is_recorded_with_required_schema(self):
         response = FakeResponse(

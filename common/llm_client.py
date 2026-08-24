@@ -154,6 +154,17 @@ def _response_rate_headers(response: Optional[requests.Response]) -> Dict[str, s
     }
 
 
+def _bounded_retry_wait_seconds(
+    response: Optional[requests.Response], attempt: int
+) -> float:
+    headers = _response_rate_headers(response)
+    value = headers.get("retry-after", "").strip()
+    try:
+        return min(30.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return min(8.0, float(2 ** (attempt - 1)))
+
+
 def _metadata_text(value: Any) -> str:
     """telemetry metadataを本文を含まない安全な文字列へ正規化する。"""
     if value is None:
@@ -365,6 +376,7 @@ def call_llm(
     retry_wait_seconds: float = 5.0,
     telemetry_context: Optional[Dict[str, Any]] = None,
     response_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
+    use_bounded_retry_backoff: bool = False,
 ) -> Dict[str, Any]:
     """
     OpenAI APIを呼び出してJSONレスポンスを取得する。
@@ -381,6 +393,7 @@ def call_llm(
         retry_wait_seconds: リトライ間隔（秒）
         telemetry_context: usage保存用のstep/output_dir/run metadata（省略可）
         response_observer: 各attemptのstatus/latency/rate-limit header通知先（省略可）
+        use_bounded_retry_backoff: Retry-After/指数backoffを上限付きで使うか
 
     Returns:
         パースされたJSONレスポンス（response_schemaのキー構造を保持）
@@ -506,8 +519,13 @@ def call_llm(
                     )
 
         if attempt < max_retries:
-            _logger.info(f"{retry_wait_seconds}秒後にリトライします...")
-            time.sleep(retry_wait_seconds)
+            wait_seconds = (
+                _bounded_retry_wait_seconds(response, attempt)
+                if use_bounded_retry_backoff
+                else retry_wait_seconds
+            )
+            _logger.info(f"{wait_seconds}秒後にリトライします...")
+            time.sleep(wait_seconds)
 
     if isinstance(last_error, (json.JSONDecodeError, ValueError)):
         raise ValueError(

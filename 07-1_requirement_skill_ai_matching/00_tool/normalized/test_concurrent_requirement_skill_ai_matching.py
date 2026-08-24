@@ -371,6 +371,47 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing=1"):
             target.collect_concurrent_checkpoints(manifest, shuffled[:-1])
 
+    def test_collector_rejects_invalid_result_and_error_payloads(self):
+        manifest = [target.concurrent_manifest_record(self.items[0])]
+        invalid_success = success_checkpoint(self.items[0])
+        invalid_success["result"] = None
+        with self.assertRaisesRegex(ValueError, "malformed=1"):
+            target.collect_concurrent_checkpoints(manifest, [invalid_success])
+
+        invalid_error = success_checkpoint(self.items[0])
+        invalid_error["status"] = "error"
+        invalid_error["result"] = None
+        invalid_error["error"] = {"unexpected": True}
+        with self.assertRaisesRegex(ValueError, "malformed=1"):
+            target.collect_concurrent_checkpoints(manifest, [invalid_error])
+
+    def test_worker_enables_bounded_retry_backoff(self):
+        captured = {}
+
+        def fake_call(**kwargs):
+            captured.update(kwargs)
+            kwargs["response_observer"](
+                {
+                    "attempt": 1,
+                    "status_code": 200,
+                    "success": True,
+                    "error_type": "",
+                    "rate_limit_headers": {},
+                }
+            )
+            return success_response(kwargs)
+
+        with patch.object(target, "call_llm", side_effect=fake_call):
+            checkpoint = target._concurrent_worker(
+                self.items[0],
+                self.projects,
+                self.skillsheets,
+                Logger(),
+                1,
+            )
+        self.assertEqual(checkpoint["status"], "success")
+        self.assertTrue(captured["use_bounded_retry_backoff"])
+
     def test_scheduler_never_writes_canonical_output(self):
         result_path = Path(self.temporary.name) / "canonical.jsonl"
         result_path.write_text("sentinel\n", encoding="utf-8")
@@ -392,6 +433,89 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
 
 
 class RetentionProductionRegressionTest(unittest.TestCase):
+    def test_cache_hit_is_read_only_and_remains_retention_reachable(self):
+        with tempfile.TemporaryDirectory(prefix="07_1_cache_hit_guard_") as temporary:
+            root = Path(temporary)
+            duplicates = root / "duplicates.jsonl"
+            diff_file = root / "diff.jsonl"
+            cache_file = root / "success_cache.jsonl"
+            target.write_jsonl(
+                str(duplicates),
+                [
+                    {
+                        "project_info": {"message_id": "current-project"},
+                        "resource_info": {"message_id": "current-resource"},
+                    }
+                ],
+            )
+            target.write_jsonl(
+                str(diff_file),
+                [
+                    {
+                        "project_info": {
+                            "message_id": "current-project",
+                            "from": "project@example.com",
+                            "subject": "project-subject",
+                        },
+                        "resource_info": {
+                            "message_id": "current-resource",
+                            "from": "resource@example.com",
+                            "subject": "resource-subject",
+                        },
+                    }
+                ],
+            )
+            target.write_jsonl(
+                str(cache_file),
+                [
+                    {
+                        "cache_version": 1,
+                        "comparison_key": {
+                            "project_from": "project@example.com",
+                            "project_subject": "project-subject",
+                            "resource_from": "resource@example.com",
+                            "resource_subject": "resource-subject",
+                        },
+                        "source_message_ids": {
+                            "project_message_id": "old-project",
+                            "resource_message_id": "old-resource",
+                        },
+                        "required_skills": [
+                            {
+                                "skill": "Pythonコーディング経験",
+                                "match": False,
+                                "note": "Python経験は1ヶ月のみ",
+                            }
+                        ],
+                        "optional_skills": [],
+                        "evaluation_meta": {"llm_model": "gpt-4o-mini"},
+                    }
+                ],
+            )
+            cache_before = cache_file.read_bytes()
+            with patch.object(target, "INPUT_DUPLICATE_PAIRS", duplicates), patch.object(
+                target, "INPUT_DIFF_FILE", diff_file
+            ), patch.object(target, "SUCCESS_CACHE_FILE", cache_file):
+                restored = target.load_current_cache_hit_results()
+
+            self.assertEqual(cache_file.read_bytes(), cache_before)
+            self.assertEqual(len(restored), 1)
+            self.assertTrue(restored[0]["duplicate_proposal_check"])
+            self.assertEqual(
+                restored[0]["project_info"]["message_id"], "current-project"
+            )
+            retained, stats = retention_guard.build_retention_sidecar(
+                restored,
+                {
+                    "current-resource": {
+                        "skillsheet": "Python業務でスクレイピングを実装"
+                    }
+                },
+            )
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(stats["guard_false_to_true"], 0)
+            self.assertTrue(retained[0]["duplicate_proposal_check"])
+
     def test_guard_fixtures_fail_closed_and_positive_whitelist(self):
         mixed = {
             "skill": "PythonまたはJavaとSQLの開発経験",

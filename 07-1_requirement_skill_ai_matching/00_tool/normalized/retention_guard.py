@@ -202,7 +202,9 @@ def build_retention_sidecar(
                     "optional_skills": row.get("optional_skills") or [],
                 },
                 "resource_info": {"message_id": resource_mid},
-                "duplicate_proposal_check": False,
+                "duplicate_proposal_check": bool(
+                    row.get("duplicate_proposal_check", False)
+                ),
                 "match_info": {
                     "required_skills_match_rate": rate,
                     "optional_skills_match_rate": optional_rate,

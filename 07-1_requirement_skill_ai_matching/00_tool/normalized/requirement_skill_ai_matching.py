@@ -40,6 +40,11 @@ from common.llm_client import (
     call_llm,
 )
 from common.logger import get_logger
+from common.success_cache import (
+    SUCCESS_CACHE_PATH,
+    comparison_key_from_diff_record,
+    load_success_cache,
+)
 from common.skillsheet_ai_context import build_skillsheet_ai_context
 from common.skill_policy import (
     AUTO_TRUE_NOTE,
@@ -72,6 +77,16 @@ INPUT_PROJECT_SKILLS = (
 INPUT_SKILLSHEETS = (
     project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
 )
+INPUT_DUPLICATE_PAIRS = (
+    project_root
+    / "06-80_duplicate_proposal_check/01_result/"
+    "99_duplicate_duplicate_proposal_check.jsonl"
+)
+INPUT_DIFF_FILE = (
+    project_root
+    / "06-80_duplicate_proposal_check/01_result/duplicate_proposal_check_diff_file.jsonl"
+)
+SUCCESS_CACHE_FILE = SUCCESS_CACHE_PATH
 
 OUTPUT_RESULT = STEP_DIR / "01_result/requirement_skill_ai_matching.jsonl"
 OUTPUT_ERROR = STEP_DIR / "01_result/99_error_requirement_skill_ai_matching.jsonl"
@@ -525,6 +540,57 @@ def concurrent_manifest_record(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def load_current_cache_hit_results() -> List[Dict[str, Any]]:
+    """今回runのCache HITをSuccess Cacheからread-onlyで復元する。"""
+    for path, label in (
+        (INPUT_DUPLICATE_PAIRS, "06-80 Cache HIT pair"),
+        (INPUT_DIFF_FILE, "06-80 diff file"),
+    ):
+        if not path.exists():
+            raise RuntimeError("{}が見つかりません: {}".format(label, path))
+
+    hit_keys = {
+        (
+            str(row.get("project_info", {}).get("message_id", "")),
+            str(row.get("resource_info", {}).get("message_id", "")),
+        )
+        for row in read_jsonl(str(INPUT_DUPLICATE_PAIRS))
+    }
+    cache = load_success_cache(str(SUCCESS_CACHE_FILE))
+    restored: List[Dict[str, Any]] = []
+    for diff_record in read_jsonl(str(INPUT_DIFF_FILE)):
+        message_key = (
+            str(diff_record.get("project_info", {}).get("message_id", "")),
+            str(diff_record.get("resource_info", {}).get("message_id", "")),
+        )
+        if message_key not in hit_keys:
+            continue
+        cache_entry = cache.get(comparison_key_from_diff_record(diff_record))
+        if cache_entry is None:
+            raise RuntimeError(
+                "Cache HITに対応するSuccess Cache entryがありません: {} / {}".format(
+                    message_key[0], message_key[1]
+                )
+            )
+        restored.append(
+            {
+                "project_info": {"message_id": message_key[0]},
+                "resource_info": {"message_id": message_key[1]},
+                "required_skills": copy.deepcopy(
+                    cache_entry.get("required_skills", [])
+                ),
+                "optional_skills": copy.deepcopy(
+                    cache_entry.get("optional_skills", [])
+                ),
+                "evaluation_meta": copy.deepcopy(
+                    cache_entry.get("evaluation_meta", {})
+                ),
+                "duplicate_proposal_check": True,
+            }
+        )
+    return restored
+
+
 class AdaptiveConcurrency:
     def __init__(self, initial: int, maximum: int):
         if (
@@ -606,7 +672,11 @@ def _concurrent_worker(
         if actual_hash != item["request_body_sha256"]:
             request_body_mismatch = True
             raise RuntimeError("preflight後にproduction request bodyが変化しました")
-        return call_llm(**kwargs, response_observer=observer)
+        return call_llm(
+            **kwargs,
+            response_observer=observer,
+            use_bounded_retry_backoff=True,
+        )
 
     stats: Dict[str, int] = {"note_truncated_count": 0}
     result, error = process_pair(
@@ -639,6 +709,60 @@ def _concurrent_worker(
             "request_body_mismatch": request_body_mismatch,
         },
     }
+
+
+def _valid_completed_skill_list(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    return all(
+        isinstance(item, dict)
+        and isinstance(item.get("skill"), str)
+        and bool(item.get("skill"))
+        and isinstance(item.get("match"), bool)
+        and isinstance(item.get("note"), str)
+        and bool(item.get("note"))
+        for item in value
+    )
+
+
+def _valid_checkpoint_payload(row: Dict[str, Any]) -> bool:
+    status = row.get("status")
+    result = row.get("result")
+    error = row.get("error")
+    project_mid = row.get("project_message_id")
+    resource_mid = row.get("resource_message_id")
+    if status == "success":
+        if not isinstance(result, dict) or error is not None:
+            return False
+        project_info = result.get("project_info")
+        resource_info = result.get("resource_info")
+        if not isinstance(project_info, dict) or not isinstance(resource_info, dict):
+            return False
+        if (
+            project_info.get("message_id") != project_mid
+            or resource_info.get("message_id") != resource_mid
+        ):
+            return False
+        return (
+            _valid_completed_skill_list(result.get("required_skills"))
+            and _valid_completed_skill_list(result.get("optional_skills"))
+            and isinstance(result.get("evaluation_meta"), dict)
+        )
+    if status == "error":
+        if result is not None or not isinstance(error, dict):
+            return False
+        project_info = error.get("project_info")
+        resource_info = error.get("resource_info")
+        if not isinstance(project_info, dict) or not isinstance(resource_info, dict):
+            return False
+        return (
+            project_info.get("message_id") == project_mid
+            and resource_info.get("message_id") == resource_mid
+            and isinstance(error.get("error_type"), str)
+            and bool(error.get("error_type"))
+            and isinstance(error.get("error_message"), str)
+        )
+    return False
 
 
 def collect_concurrent_checkpoints(
@@ -677,6 +801,7 @@ def collect_concurrent_checkpoints(
             and row.get("api_request") is expected_row.get("api_request")
             and row.get("completion_state") == "completed"
             and row.get("status") in ("success", "error")
+            and _valid_checkpoint_payload(row)
         )
         if not valid:
             malformed.append("line={}:{}".format(index, identity))
@@ -881,6 +1006,8 @@ def _run_concurrent(
     existing = (
         list(read_jsonl(str(checkpoint_path))) if checkpoint_path.exists() else []
     )
+    # API fan-out前にCache HIT側のretention入力も検証する。
+    cache_hit_results = load_current_cache_hit_results()
     started = time.time()
     checkpoints, controller, stopped = run_concurrent_scheduler(
         items,
@@ -906,7 +1033,10 @@ def _run_concurrent(
         raise RuntimeError("request body mismatchを検出しました")
     results = [row["result"] for row in ordered if row["status"] == "success"]
     errors = [row["error"] for row in ordered if row["status"] == "error"]
-    retained, retention_stats = build_retention_sidecar(results, skillsheet_map)
+    retained, retention_stats = build_retention_sidecar(
+        results + cache_hit_results, skillsheet_map
+    )
+    retention_stats["cache_hit_rows_evaluated"] = len(cache_hit_results)
 
     write_jsonl(str(OUTPUT_RESULT), results)
     write_jsonl(str(OUTPUT_ERROR), errors)
