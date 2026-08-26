@@ -10,6 +10,7 @@ from attachment_manifest_contract import (
     canonical_ordered_entries,
     ordered_attachment_digest,
     source_payload_digest,
+    validate_authoritative_attachment_entries,
 )
 from identity import attachment_fingerprint
 
@@ -17,6 +18,12 @@ from identity import attachment_fingerprint
 def _authoritative_entry(attachment: Dict[str, Any], position: int) -> Dict[str, Any]:
     if not isinstance(attachment, dict):
         raise ValueError("authoritative attachment must be an object")
+    computed_digest = attachment_fingerprint(attachment)
+    if (
+        "content_digest" in attachment
+        and attachment.get("content_digest") != computed_digest
+    ):
+        raise ValueError("authoritative attachment content digest does not match payload")
     return {
         "position": position,
         "source_entry_id": attachment.get(
@@ -25,7 +32,7 @@ def _authoritative_entry(attachment: Dict[str, Any], position: int) -> Dict[str,
         "filename": attachment.get("filename", ""),
         "mime_type": attachment.get("mime_type", ""),
         "declared_size": attachment.get("size"),
-        "content_digest": attachment_fingerprint(attachment),
+        "content_digest": computed_digest,
         "disposition": attachment.get("disposition", ""),
         "content_id": attachment.get("content_id", ""),
     }
@@ -40,6 +47,9 @@ def build_source_owned_fixture(source_definition: Dict[str, Any]) -> Dict[str, A
         _authoritative_entry(attachment, position)
         for position, attachment in enumerate(authoritative_attachments)
     ]
+    entry_reasons = validate_authoritative_attachment_entries(authoritative_entries)
+    if entry_reasons:
+        raise ValueError("invalid authoritative attachment entry:" + ";".join(entry_reasons))
     canonical_entries = canonical_ordered_entries(authoritative_entries)
     manifest = {
         "source_id": source_definition.get("message_id", ""),

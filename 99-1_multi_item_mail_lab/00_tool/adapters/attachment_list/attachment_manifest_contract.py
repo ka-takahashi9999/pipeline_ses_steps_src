@@ -3,11 +3,50 @@
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Sequence
 
 
 MANIFEST_FIELD = "attachment_acquisition_manifest"
 MANIFEST_SCHEMA_VERSION = "attachment_acquisition_manifest.v1"
+SHA256_DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-fA-F]{64}\Z")
+
+
+def validate_attachment_entry(entry: Any, position: int) -> List[str]:
+    """Validate one authoritative entry before any lossy normalization."""
+    prefix = "manifest_entry:" + str(position) + ":"
+    if not isinstance(entry, dict):
+        return [prefix + "not_object"]
+    reasons: List[str] = []
+    for field_name in ("source_entry_id", "filename", "mime_type"):
+        value = entry.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            reasons.append(prefix + field_name + "_invalid")
+    declared_size = entry.get("declared_size")
+    if (
+        isinstance(declared_size, bool)
+        or not isinstance(declared_size, int)
+        or declared_size < 0
+    ):
+        reasons.append(prefix + "declared_size_invalid")
+    content_digest = entry.get("content_digest")
+    if (
+        not isinstance(content_digest, str)
+        or SHA256_DIGEST_PATTERN.fullmatch(content_digest) is None
+    ):
+        reasons.append(prefix + "content_digest_invalid")
+    return reasons
+
+
+def validate_authoritative_attachment_entries(entries: Any) -> List[str]:
+    """Return entry-contract failures without normalizing missing values."""
+    if not isinstance(entries, list):
+        return ["manifest_authoritative_entries_missing"]
+    return [
+        reason
+        for position, entry in enumerate(entries)
+        for reason in validate_attachment_entry(entry, position)
+    ]
 
 
 def _sha256_json(value: Any) -> str:

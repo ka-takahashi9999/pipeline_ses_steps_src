@@ -236,10 +236,10 @@ def main():
     summary = results["summary"]
     required = {
         "actual_deliveries": 3,
-        "actual_observed_attachment_counts": [4, 2, 2],
-        "actual_profile_counts": [4, 2, 2],
-        "actual_declared_counts": [4, 2, 2],
-        "actual_mapping_counts": [4, 2, 2],
+        "actual_observed_attachment_counts": [2, 4, 2],
+        "actual_profile_counts": [2, 4, 2],
+        "actual_declared_counts": [2, 4, 2],
+        "actual_mapping_counts": [2, 4, 2],
         "actual_mapping_total": 8,
         "actual_station_audit_matches": 8,
         "false_substring_matches": 0,
@@ -272,7 +272,7 @@ def main():
         raise ValueError("ATTACHMENT_LIST actual replay failed:" + ";".join(failures))
     write_attachment_list_results(results)
     logger.ok(
-        "ATTACHMENT_LIST actual replay OK: deliveries=3 observed=4/2/2 "
+        "ATTACHMENT_LIST actual replay OK: deliveries=3 observed=2/4/2 "
         "acquisition=UNVERIFIED mapping=8/8 eligible=0 technical_01-4=8/8 technical_02-1=8/8"
     )
 

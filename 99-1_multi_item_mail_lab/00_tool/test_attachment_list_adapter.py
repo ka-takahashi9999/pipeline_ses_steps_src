@@ -27,6 +27,10 @@ for import_path in (
 from common.json_utils import read_jsonl_as_list
 from attachment_fixture_source import build_source_owned_fixture
 from attachment_list_adapter import AttachmentListAdapter
+from attachment_manifest_contract import (
+    ordered_attachment_digest,
+    source_payload_digest,
+)
 from canonical_overlay import build_canonical_overlay
 
 
@@ -128,6 +132,22 @@ def synthetic_source(profile_count, declared_count=None, attachment_count=None):
     }
 
 
+def _refresh_manifest(fixture):
+    manifest = fixture["attachment_acquisition_manifest"]
+    entries = manifest["authoritative_attachment_entries"]
+    manifest["expected_ordered_count"] = len(entries)
+    manifest["expected_ordered_digest"] = ordered_attachment_digest(entries)
+    manifest["source_payload_digest"] = source_payload_digest(fixture, entries)
+
+
+def _assert_fail_closed(test_case, result):
+    test_case.assertNotEqual("PARSED", result.status)
+    test_case.assertEqual([], result.items)
+    test_case.assertEqual("INCOMPLETE", result.source["source_acquisition_status"])
+    test_case.assertEqual("COMPLETE", result.source["container_enumeration_status"])
+    test_case.assertFalse(result.source["auto_union_eligible"])
+
+
 class AttachmentListAdapterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -150,8 +170,8 @@ class AttachmentListAdapterTest(unittest.TestCase):
         selected = [record for record in records if self.adapter.matches(record)]
         self.assertEqual(3, len(selected))
         results = [self.adapter.parse(record) for record in selected]
-        self.assertEqual([4, 2, 2], [len(record["attachments"]) for record in selected])
-        self.assertEqual([4, 2, 2], [result.source["profile_count"] for result in results])
+        self.assertEqual([2, 4, 2], [len(record["attachments"]) for record in selected])
+        self.assertEqual([2, 4, 2], [result.source["profile_count"] for result in results])
         self.assertTrue(all(result.status == "PARTIAL" for result in results))
         self.assertTrue(all(result.source["source_acquisition_status"] == "UNVERIFIED" for result in results))
         self.assertTrue(all(result.source["container_enumeration_status"] == "COMPLETE" for result in results))
@@ -167,6 +187,152 @@ class AttachmentListAdapterTest(unittest.TestCase):
         self.assertEqual(2, len(manifest["authoritative_attachment_entries"]))
         self.assertNotIn("authoritative_attachments", fixture)
         self.assertEqual("PARSED", self.adapter.parse(fixture).status)
+
+    def test_fixture_producer_rejects_invalid_authoritative_entries(self):
+        mutations = {
+            "source_entry_id_empty": ("source_entry_id", ""),
+            "source_entry_id_whitespace": ("source_entry_id", "   "),
+            "filename_empty": ("filename", ""),
+            "mime_empty": ("mime_type", ""),
+            "size_missing": ("size", None),
+            "size_negative": ("size", -1),
+            "size_string": ("size", "123"),
+            "size_bool": ("size", True),
+            "digest_invalid": ("content_digest", "sha256:short"),
+        }
+        for name, (field, value) in mutations.items():
+            with self.subTest(name=name):
+                source = synthetic_source(1)
+                if value is None:
+                    source["authoritative_attachments"][0].pop(field)
+                else:
+                    source["authoritative_attachments"][0][field] = value
+                with self.assertRaises(ValueError):
+                    build_source_owned_fixture(source)
+
+    def test_manifest_entry_contract_negative_matrix(self):
+        mutations = {
+            "source_entry_id_missing": ("source_entry_id", None, "source_entry_id"),
+            "source_entry_id_empty": ("source_entry_id", "", "source_entry_id"),
+            "source_entry_id_whitespace": ("source_entry_id", "   ", "source_entry_id"),
+            "filename_missing": ("filename", None, "filename"),
+            "filename_empty": ("filename", "", "filename"),
+            "mime_missing": ("mime_type", None, "mime_type"),
+            "mime_empty": ("mime_type", "", "mime_type"),
+            "size_missing": ("declared_size", None, "size"),
+            "size_negative": ("declared_size", -1, "size"),
+            "size_string": ("declared_size", "123", "size"),
+            "digest_missing": ("content_digest", None, None),
+            "digest_malformed": ("content_digest", "sha256:short", None),
+            "digest_non_sha256": ("content_digest", "md5:" + "0" * 32, None),
+        }
+        for name, (manifest_field, value, observed_field) in mutations.items():
+            with self.subTest(name=name):
+                fixture = build_source_owned_fixture(synthetic_source(1))
+                entry = fixture["attachment_acquisition_manifest"][
+                    "authoritative_attachment_entries"
+                ][0]
+                if value is None:
+                    entry.pop(manifest_field)
+                    if observed_field:
+                        fixture["attachments"][0].pop(observed_field)
+                else:
+                    entry[manifest_field] = value
+                    if observed_field:
+                        fixture["attachments"][0][observed_field] = value
+                _refresh_manifest(fixture)
+                result = self.adapter.parse(fixture)
+                _assert_fail_closed(self, result)
+                self.assertEqual("FAIL", result.source["manifest_contract_status"])
+                self.assertTrue(
+                    any(
+                        reason.startswith("manifest_entry:0:")
+                        for reason in result.reasons
+                    )
+                )
+
+    def test_previous_blocker_shared_missing_integrity_is_source_atomic(self):
+        source = synthetic_source(1)
+        source["authoritative_attachments"].append(
+            _attachment("shared-format.xlsx", _xlsx_bytes("shared"))
+        )
+        fixture = build_source_owned_fixture(source)
+        shared_snapshot = fixture["attachments"][1]
+        shared_entry = fixture["attachment_acquisition_manifest"][
+            "authoritative_attachment_entries"
+        ][1]
+        for snapshot_field in ("mime_type", "size", "data"):
+            shared_snapshot.pop(snapshot_field)
+        for manifest_field in ("mime_type", "declared_size", "content_digest"):
+            shared_entry.pop(manifest_field)
+        _refresh_manifest(fixture)
+        result = self.adapter.parse(fixture)
+        _assert_fail_closed(self, result)
+        self.assertEqual("SHARED", result.attachment_enumeration[1]["role"])
+        self.assertEqual("FAIL", result.source["manifest_contract_status"])
+        self.assertEqual("FAIL", result.source["attachment_integrity_status"])
+
+    def test_all_attachment_roles_fail_source_atomic_on_integrity_error(self):
+        source = synthetic_source(1)
+        inline = _attachment("inline-logo.png", b"image", mime_type="image/png")
+        inline.update({"disposition": "inline", "content_id": "logo"})
+        source["authoritative_attachments"].extend(
+            [
+                _attachment("shared-format.xlsx", _xlsx_bytes("shared")),
+                _attachment(
+                    "supporting-readme.pdf", b"synthetic-pdf", mime_type="application/pdf"
+                ),
+                inline,
+            ]
+        )
+        positions = {
+            "ITEM_ATTACHMENT": 0,
+            "SHARED": 1,
+            "SUPPORTING": 2,
+            "INLINE_ASSET": 3,
+        }
+        for role, position in positions.items():
+            with self.subTest(role=role):
+                fixture = build_source_owned_fixture(copy.deepcopy(source))
+                fixture["attachments"][position].pop("data")
+                result = self.adapter.parse(fixture)
+                _assert_fail_closed(self, result)
+                self.assertEqual("FAIL", result.source["attachment_integrity_status"])
+
+        archive_source = synthetic_source(1)
+        archive_source["authoritative_attachments"].append(
+            _attachment(
+                "profiles.zip",
+                _zip_bytes([("inside.xlsx", _xlsx_bytes("inside"))]),
+                mime_type="application/zip",
+            )
+        )
+        archive_fixture = build_source_owned_fixture(archive_source)
+        archive_fixture["attachments"][1].pop("data")
+        archive_result = self.adapter.parse(archive_fixture)
+        _assert_fail_closed(self, archive_result)
+        self.assertEqual("FAIL", archive_result.source["attachment_integrity_status"])
+
+    def test_observed_attachment_integrity_negative_matrix(self):
+        cases = {}
+        for name in ("invalid_base64", "size_mismatch", "digest_mismatch"):
+            fixture = build_source_owned_fixture(synthetic_source(1))
+            if name == "invalid_base64":
+                fixture["attachments"][0]["data"] = "%%%"
+            elif name == "size_mismatch":
+                fixture["attachments"][0]["size"] += 1
+            else:
+                encoded = fixture["attachments"][0]["data"]
+                fixture["attachments"][0]["data"] = (
+                    ("A" if encoded[0] != "A" else "B") + encoded[1:]
+                )
+            cases[name] = fixture
+        for name, fixture in cases.items():
+            with self.subTest(name=name):
+                result = self.adapter.parse(fixture)
+                _assert_fail_closed(self, result)
+                self.assertEqual("PASS", result.source["manifest_contract_status"])
+                self.assertEqual("FAIL", result.source["attachment_integrity_status"])
 
     def test_acquisition_negative_matrix(self):
         base = build_source_owned_fixture(synthetic_source(4))

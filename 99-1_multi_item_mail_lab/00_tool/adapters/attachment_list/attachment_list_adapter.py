@@ -20,6 +20,7 @@ from attachment_manifest_contract import (
     canonical_ordered_entries,
     ordered_attachment_digest,
     source_payload_digest,
+    validate_authoritative_attachment_entries,
 )
 from identity import (
     artifact_set_fingerprint,
@@ -45,7 +46,7 @@ from variable_item_core import (
 
 
 ADAPTER_ID = "attachment_list"
-ADAPTER_VERSION = "1.0.0"
+ADAPTER_VERSION = "1.0.1"
 ATTACHMENT_ROLES = {
     "ITEM_ATTACHMENT",
     "SHARED",
@@ -71,6 +72,8 @@ class ParseResult:
 class AcquisitionValidation:
     status: str
     core_status: str
+    manifest_contract_status: str
+    attachment_integrity_status: str
     reasons: List[str]
     observed_ordered_count: int
     observed_ordered_digest: str
@@ -80,6 +83,8 @@ class AcquisitionValidation:
         return {
             "status": self.status,
             "core_status": self.core_status,
+            "manifest_contract_status": self.manifest_contract_status,
+            "attachment_integrity_status": self.attachment_integrity_status,
             "reasons": self.reasons,
             "observed_ordered_count": self.observed_ordered_count,
             "observed_ordered_digest": self.observed_ordered_digest,
@@ -230,6 +235,24 @@ class AttachmentListAdapter:
         return payload, reasons
 
     @staticmethod
+    def _integrity_reasons(attachment: ClassifiedAttachment) -> List[str]:
+        integrity_prefixes = (
+            "attachment_not_object",
+            "attachment_source_entry_id_missing",
+            "attachment_filename_missing",
+            "attachment_mime_missing",
+            "attachment_data_missing",
+            "attachment_base64url_invalid",
+            "attachment_declared_size_invalid",
+            "attachment_size_mismatch",
+        )
+        return [
+            "attachment:" + str(attachment.position) + ":" + reason
+            for reason in attachment.reasons
+            if reason.startswith(integrity_prefixes)
+        ]
+
+    @staticmethod
     def _valid_xlsx(payload: bytes) -> bool:
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
@@ -264,10 +287,16 @@ class AttachmentListAdapter:
         disposition = attachment.get("disposition", "")
         content_id = attachment.get("content_id", "")
         reasons: List[str] = []
-        if not isinstance(filename, str) or not filename:
+        source_entry_id = attachment.get(
+            "source_entry_id", "part-attachment-" + str(position)
+        )
+        if not isinstance(source_entry_id, str) or not source_entry_id.strip():
+            reasons.append("attachment_source_entry_id_missing")
+            source_entry_id = "" if not isinstance(source_entry_id, str) else source_entry_id
+        if not isinstance(filename, str) or not filename.strip():
             reasons.append("attachment_filename_missing")
             filename = ""
-        if not isinstance(mime_type, str) or not mime_type:
+        if not isinstance(mime_type, str) or not mime_type.strip():
             reasons.append("attachment_mime_missing")
             mime_type = ""
         payload, decode_reasons = self._decode_attachment(attachment)
@@ -305,9 +334,7 @@ class AttachmentListAdapter:
             reasons.append("attachment_role_unknown")
         return ClassifiedAttachment(
             position=position,
-            source_entry_id=str(
-                attachment.get("source_entry_id", "part-attachment-" + str(position))
-            ),
+            source_entry_id=source_entry_id,
             filename=filename,
             mime_type=mime_type,
             declared_size=attachment.get("size"),
@@ -409,11 +436,19 @@ class AttachmentListAdapter:
         observed_entries = self._observed_manifest_entries(attachments)
         observed_digest = ordered_attachment_digest(observed_entries)
         manifest = mail.get(MANIFEST_FIELD)
+        observed_integrity_reasons = [
+            reason
+            for attachment in attachments
+            for reason in self._integrity_reasons(attachment)
+        ]
         if not isinstance(manifest, dict):
             return AcquisitionValidation(
                 "UNVERIFIED",
                 "INCOMPLETE",
-                ["source_owned_attachment_manifest_missing"],
+                "UNVERIFIED",
+                "PASS" if not observed_integrity_reasons else "FAIL",
+                ["source_owned_attachment_manifest_missing"]
+                + observed_integrity_reasons,
                 len(observed_entries),
                 observed_digest,
                 {},
@@ -433,6 +468,10 @@ class AttachmentListAdapter:
         if not isinstance(authoritative, list):
             authoritative = []
             reasons.append("manifest_authoritative_entries_missing")
+        entry_contract_reasons = validate_authoritative_attachment_entries(
+            manifest.get("authoritative_attachment_entries")
+        )
+        reasons.extend(entry_contract_reasons)
         canonical_authoritative = canonical_ordered_entries(authoritative)
         if [entry.get("position") if isinstance(entry, dict) else None for entry in authoritative] != list(
             range(len(authoritative))
@@ -459,9 +498,23 @@ class AttachmentListAdapter:
             reasons.append("observed_attachment_ordered_digest_mismatch")
         if canonical_ordered_entries(observed_entries) != canonical_authoritative:
             reasons.append("observed_attachment_entries_mismatch")
+        reasons.extend(observed_integrity_reasons)
+        manifest_contract_reasons = [
+            reason
+            for reason in reasons
+            if reason.startswith("manifest_")
+            or reason.startswith("source_payload_digest_")
+        ]
+        observed_matches_authority = (
+            canonical_ordered_entries(observed_entries) == canonical_authoritative
+        )
         return AcquisitionValidation(
             "VERIFIED_COMPLETE" if not reasons else "INCOMPLETE",
             "COMPLETE" if not reasons else "INCOMPLETE",
+            "PASS" if not manifest_contract_reasons else "FAIL",
+            "PASS"
+            if not observed_integrity_reasons and observed_matches_authority
+            else "FAIL",
             list(dict.fromkeys(reasons)),
             len(observed_entries),
             observed_digest,
@@ -595,6 +648,8 @@ class AttachmentListAdapter:
                 [],
                 source={
                     "source_acquisition_status": "UNVERIFIED",
+                    "manifest_contract_status": "UNVERIFIED",
+                    "attachment_integrity_status": "FAIL",
                     "container_enumeration_status": "INCOMPLETE",
                     "inline_structure_status": "FAIL",
                     "attachment_mapping_status": "FAIL",
@@ -766,6 +821,8 @@ class AttachmentListAdapter:
         source_dict.update(
             {
                 "source_acquisition_status": acquisition.status,
+                "manifest_contract_status": acquisition.manifest_contract_status,
+                "attachment_integrity_status": acquisition.attachment_integrity_status,
                 "attachment_acquisition_validation": acquisition.to_dict(),
                 "container_enumeration_status": enumeration_status,
                 "inline_structure_status": "PASS" if structural_complete else "FAIL",

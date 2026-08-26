@@ -33,6 +33,7 @@ from run_attachment_list_offline_replay import (
 )
 from test_attachment_list_adapter import (
     _attachment,
+    _refresh_manifest,
     _xlsx_bytes,
     _zip_bytes,
     synthetic_source,
@@ -81,10 +82,10 @@ def main() -> None:
     summary = fresh["summary"]
     required = {
         "actual_deliveries": 3,
-        "actual_observed_attachment_counts": [4, 2, 2],
-        "actual_profile_counts": [4, 2, 2],
-        "actual_declared_counts": [4, 2, 2],
-        "actual_mapping_counts": [4, 2, 2],
+        "actual_observed_attachment_counts": [2, 4, 2],
+        "actual_profile_counts": [2, 4, 2],
+        "actual_declared_counts": [2, 4, 2],
+        "actual_mapping_counts": [2, 4, 2],
         "actual_mapping_total": 8,
         "actual_station_audit_matches": 8,
         "false_substring_matches": 0,
@@ -117,6 +118,8 @@ def main() -> None:
     _check(
         all(
             audit["source"]["source_acquisition_status"] == "UNVERIFIED"
+            and audit["source"]["manifest_contract_status"] == "UNVERIFIED"
+            and audit["source"]["attachment_integrity_status"] == "PASS"
             and audit["source"]["container_enumeration_status"] == "COMPLETE"
             and audit["source"]["inline_structure_status"] == "PASS"
             and audit["source"]["attachment_mapping_status"] == "PASS"
@@ -201,6 +204,121 @@ def main() -> None:
             failures,
         )
 
+    producer_mutations = {
+        "source_entry_id_empty": ("source_entry_id", ""),
+        "filename_empty": ("filename", ""),
+        "mime_empty": ("mime_type", ""),
+        "size_missing": ("size", None),
+        "size_negative": ("size", -1),
+        "size_string": ("size", "123"),
+        "digest_invalid": ("content_digest", "sha256:short"),
+    }
+    for name, (field, value) in producer_mutations.items():
+        source = synthetic_source(1)
+        if value is None:
+            source["authoritative_attachments"][0].pop(field)
+        else:
+            source["authoritative_attachments"][0][field] = value
+        rejected = False
+        try:
+            build_source_owned_fixture(source)
+        except ValueError:
+            rejected = True
+        _check(rejected, "fixture producer accepted invalid entry:" + name, failures)
+
+    manifest_mutations = {
+        "source_entry_id_missing": ("source_entry_id", None, "source_entry_id"),
+        "source_entry_id_empty": ("source_entry_id", "", "source_entry_id"),
+        "filename_missing": ("filename", None, "filename"),
+        "filename_empty": ("filename", "", "filename"),
+        "mime_missing": ("mime_type", None, "mime_type"),
+        "mime_empty": ("mime_type", "", "mime_type"),
+        "size_missing": ("declared_size", None, "size"),
+        "size_negative": ("declared_size", -1, "size"),
+        "size_string": ("declared_size", "123", "size"),
+        "digest_missing": ("content_digest", None, None),
+        "digest_malformed": ("content_digest", "sha256:short", None),
+        "digest_non_sha256": ("content_digest", "md5:" + "0" * 32, None),
+    }
+    for name, (manifest_field, value, observed_field) in manifest_mutations.items():
+        fixture = build_source_owned_fixture(synthetic_source(1))
+        entry = fixture["attachment_acquisition_manifest"][
+            "authoritative_attachment_entries"
+        ][0]
+        if value is None:
+            entry.pop(manifest_field)
+            if observed_field:
+                fixture["attachments"][0].pop(observed_field)
+        else:
+            entry[manifest_field] = value
+            if observed_field:
+                fixture["attachments"][0][observed_field] = value
+        _refresh_manifest(fixture)
+        result = adapter.parse(fixture)
+        _check(
+            result.status != "PARSED"
+            and result.items == []
+            and result.source["source_acquisition_status"] == "INCOMPLETE"
+            and result.source["manifest_contract_status"] == "FAIL"
+            and result.source["container_enumeration_status"] == "COMPLETE",
+            "manifest entry fail-closed failed:" + name,
+            failures,
+        )
+
+    integrity_source = synthetic_source(1)
+    inline = _attachment("inline-logo.png", b"image", mime_type="image/png")
+    inline.update({"disposition": "inline", "content_id": "logo"})
+    integrity_source["authoritative_attachments"].extend(
+        [
+            _attachment("shared-format.xlsx", _xlsx_bytes("shared")),
+            _attachment(
+                "supporting-readme.pdf", b"synthetic-pdf", mime_type="application/pdf"
+            ),
+            inline,
+        ]
+    )
+    for role, position in (
+        ("ITEM_ATTACHMENT", 0),
+        ("SHARED", 1),
+        ("SUPPORTING", 2),
+        ("INLINE_ASSET", 3),
+    ):
+        fixture = build_source_owned_fixture(copy.deepcopy(integrity_source))
+        fixture["attachments"][position].pop("data")
+        result = adapter.parse(fixture)
+        _check(
+            result.status != "PARSED"
+            and result.items == []
+            and result.source["source_acquisition_status"] == "INCOMPLETE"
+            and result.source["attachment_integrity_status"] == "FAIL",
+            "attachment integrity atomic failed:" + role,
+            failures,
+        )
+
+    blocker_source = synthetic_source(1)
+    blocker_source["authoritative_attachments"].append(
+        _attachment("shared-format.xlsx", _xlsx_bytes("shared"))
+    )
+    blocker_fixture = build_source_owned_fixture(blocker_source)
+    for field in ("mime_type", "size", "data"):
+        blocker_fixture["attachments"][1].pop(field)
+    blocker_entry = blocker_fixture["attachment_acquisition_manifest"][
+        "authoritative_attachment_entries"
+    ][1]
+    for field in ("mime_type", "declared_size", "content_digest"):
+        blocker_entry.pop(field)
+    _refresh_manifest(blocker_fixture)
+    blocker_result = adapter.parse(blocker_fixture)
+    _check(
+        blocker_result.status != "PARSED"
+        and blocker_result.items == []
+        and blocker_result.source["manifest_contract_status"] == "FAIL"
+        and blocker_result.source["attachment_integrity_status"] == "FAIL"
+        and blocker_result.source["container_enumeration_status"] == "COMPLETE",
+        "previous SHARED integrity blocker still passes",
+        failures,
+    )
+
     base = build_source_owned_fixture(synthetic_source(4))
     missing = copy.deepcopy(base)
     missing.pop("attachment_acquisition_manifest")
@@ -270,10 +388,10 @@ def main() -> None:
         failures,
     )
 
-    logger.info("ACTUAL: deliveries=3 observed=4/2/2 profiles=4/2/2 declared=4/2/2 mapping=8/8")
+    logger.info("ACTUAL: deliveries=3 observed=2/4/2 profiles=2/4/2 declared=2/4/2 mapping=8/8")
     logger.info("ACTUAL STATUS: acquisition=UNVERIFIED container=COMPLETE inline=PASS mapping=PASS atomic=PARTIAL eligible=0")
     logger.info("TECHNICAL: projection=8/8 01-4=8/8 02-1_resource=8/8 project=0 ambiguous=0 unknown=0")
-    logger.info("SYNTHETIC: N=0/1/2/4/10 PASS acquisition_negative=PASS roles=PASS ZIP=PASS")
+    logger.info("SYNTHETIC: N=0/1/2/4/10 PASS manifest_entry_negative=PASS integrity_atomic=PASS roles=PASS ZIP=PASS")
     for audit in audits[:3]:
         logger.info(
             "representative: delivery=" + audit["original_message_id"]
@@ -284,7 +402,7 @@ def main() -> None:
         logger.error("ATTACHMENT_LIST confirm NG: failures=" + str(len(failures)))
         raise SystemExit(1)
     logger.ok(
-        "ATTACHMENT_LIST confirm OK: actual=3 observed=4/2/2 mapping=8/8 "
+        "ATTACHMENT_LIST confirm OK: actual=3 observed=2/4/2 mapping=8/8 "
         "acquisition=UNVERIFIED eligible=0 technical=8 synthetic=5/5"
     )
 
