@@ -61,6 +61,9 @@ def _audit_record(
         "adapter_version": ADAPTER_VERSION,
         "original_subject": str(mail.get("subject", "")),
         "original_timestamp": str(mail.get("date", "")),
+        "body_fingerprint": item.get("body_fingerprint", ""),
+        "attachment_fingerprint": item.get("attachment_fingerprint", ""),
+        "version_fingerprint": item.get("version_fingerprint", ""),
         "content_fingerprint": item.get("content_fingerprint", ""),
         "parse_status": status,
         "parse_reasons": reasons,
@@ -90,24 +93,35 @@ def process_records(
             audits.append(_audit_record(mail, adapter, result.status, result.reasons))
 
     overlay_by_id: Dict[str, Dict[str, Any]] = {}
-    identity_payload_by_id: Dict[str, Tuple[str, str, str]] = {}
+    identity_payload_by_id: Dict[str, Tuple[str, str, str, str, str]] = {}
     for mail, item in occurrences:
         derived_id = item["derived_item_id"]
         identity_payload = (
             item["logical_item_id"],
-            item["content_fingerprint"],
+            item["body_fingerprint"],
+            item["attachment_fingerprint"],
+            item["version_fingerprint"],
             item["body_text"],
         )
         previous_payload = identity_payload_by_id.get(derived_id)
         if previous_payload is not None and previous_payload != identity_payload:
             raise ValueError(f"derived_item_id collision: {derived_id}")
         identity_payload_by_id[derived_id] = identity_payload
-        overlay_by_id.setdefault(derived_id, build_canonical_overlay(mail, item))
+        if derived_id not in overlay_by_id:
+            overlay_by_id[derived_id] = build_canonical_overlay(mail, item)
 
     overlays = [overlay_by_id[derived_id] for derived_id in sorted(overlay_by_id)]
     input_ids = [{"message_id": record["message_id"]} for record in overlays]
     logical_ids = {item["logical_item_id"] for _, item in occurrences}
-    fingerprints = {item["content_fingerprint"] for _, item in occurrences}
+    body_fingerprints = {item["body_fingerprint"] for _, item in occurrences}
+    attachment_fingerprints = {
+        item["attachment_fingerprint"] for _, item in occurrences
+    }
+    version_fingerprints = {item["version_fingerprint"] for _, item in occurrences}
+    logical_versions = {
+        (item["logical_item_id"], item["version_fingerprint"])
+        for _, item in occurrences
+    }
     derived_ids = [item["derived_item_id"] for _, item in occurrences]
     expected_occurrences = len(selected) * adapter.config["expected_item_count"]
     artifacts = {
@@ -125,7 +139,10 @@ def process_records(
         "parsed_occurrences": len(occurrences),
         "derived_item_occurrences": len(occurrences),
         "logical_distinct": len(logical_ids),
-        "content_distinct": len(fingerprints),
+        "body_distinct": len(body_fingerprints),
+        "attachment_distinct": len(attachment_fingerprints),
+        "version_distinct": len(logical_versions),
+        "content_distinct": len(version_fingerprints),
         "derived_versions": len(set(derived_ids)),
         "attachment_mapping_success": sum(
             item["attachment_mapping"].get("status") == "MAPPED"
@@ -189,7 +206,7 @@ def main() -> None:
         f"mails={first_stats['input_mails']} "
         f"occurrences={first_stats['derived_item_occurrences']} "
         f"logical_distinct={first_stats['logical_distinct']} "
-        f"content_distinct={first_stats['content_distinct']}"
+        f"version_distinct={first_stats['version_distinct']}"
     )
 
 

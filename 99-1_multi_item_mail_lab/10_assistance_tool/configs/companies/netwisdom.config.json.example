@@ -1,6 +1,6 @@
 {
   "config_id": "netwisdom_inline_summary",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "source_company": "NetWisdom",
   "selectors": {
     "sender_domain": "netwisdom.co.jp",
@@ -16,8 +16,10 @@
   "item_type": "resource",
   "footer_end_regex": "(?m)^\\s*以上.*$",
   "attachment_mapping": {
-    "strategy": "normalized_identifier_in_filename",
+    "strategy": "regex_extract_normalized_exact",
     "filename_field": "filename",
+    "filename_identifier_regex": "^(?:skillsheet|履歴書)-(?P<identifier>[^/\\\\]+)\\.xlsx$",
+    "identifier_group": "identifier",
     "require_one_to_one": true
   },
   "offline_expected_input_mails": 4

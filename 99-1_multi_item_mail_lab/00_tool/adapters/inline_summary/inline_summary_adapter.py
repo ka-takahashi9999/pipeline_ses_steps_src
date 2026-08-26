@@ -9,17 +9,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Match, Optional, Pattern, Tuple
 
 from identity import (
+    attachment_fingerprint,
+    body_fingerprint,
     canonical_subject,
-    content_fingerprint,
     derived_item_id,
     logical_item_id,
     normalize_block_identifier,
     normalize_content,
+    version_fingerprint,
 )
 
 
 ADAPTER_ID = "inline_summary"
-ADAPTER_VERSION = "1.0.0"
+ADAPTER_VERSION = "1.1.0"
 VALID_STATUSES = {"PARSED", "PARTIAL", "UNSUPPORTED", "HUMAN_REVIEW"}
 
 
@@ -41,6 +43,14 @@ class InlineSummaryAdapter:
         self._subject_regex: Pattern[str] = re.compile(
             config["selectors"]["subject_regex"], re.IGNORECASE
         )
+        mapping_config = config["attachment_mapping"]
+        self._filename_field = mapping_config["filename_field"]
+        self._filename_identifier_group = mapping_config["identifier_group"]
+        self._filename_identifier_regex: Pattern[str] = re.compile(
+            mapping_config["filename_identifier_regex"], re.IGNORECASE
+        )
+        if self._filename_identifier_group not in self._filename_identifier_regex.groupindex:
+            raise ValueError("filename identifier regex must contain configured named group")
 
     @classmethod
     def from_file(cls, path: Path) -> "InlineSummaryAdapter":
@@ -108,19 +118,45 @@ class InlineSummaryAdapter:
     ) -> Tuple[List[Tuple[int, Dict[str, Any]]], List[str], bool]:
         expected_count = self.config["expected_item_count"]
         if len(attachments) != expected_count:
-            return [], [f"attachment_count:{len(attachments)}:expected:{expected_count}"], False
+            return [], [f"attachment_count:{len(attachments)}:expected:{expected_count}"], True
 
         mapped: List[Tuple[int, Dict[str, Any]]] = []
         reasons: List[str] = []
         used_indices = set()
+        attachment_identifiers: List[Optional[str]] = []
+        for attachment_index, attachment in enumerate(attachments):
+            if not isinstance(attachment, dict):
+                attachment_identifiers.append(None)
+                reasons.append(f"attachment_{attachment_index}:not_an_object")
+                continue
+            filename = attachment.get(self._filename_field)
+            if not isinstance(filename, str) or not filename:
+                attachment_identifiers.append(None)
+                reasons.append(f"attachment_{attachment_index}:filename_missing")
+                continue
+            match = self._filename_identifier_regex.fullmatch(filename)
+            if match is None:
+                attachment_identifiers.append(None)
+                reasons.append(f"attachment_{attachment_index}:identifier_unextractable")
+                continue
+            extracted_identifier = normalize_block_identifier(
+                match.group(self._filename_identifier_group)
+            )
+            if not extracted_identifier:
+                attachment_identifiers.append(None)
+                reasons.append(f"attachment_{attachment_index}:identifier_empty")
+                continue
+            attachment_identifiers.append(extracted_identifier)
+
         for item_index, anchor in enumerate(anchors, 1):
             identifier = normalize_block_identifier(anchor.group("identifier"))
-            candidates = []
-            for attachment_index, attachment in enumerate(attachments):
-                filename = str(attachment.get("filename", ""))
-                normalized_filename = normalize_block_identifier(filename)
-                if identifier and identifier in normalized_filename:
-                    candidates.append(attachment_index)
+            candidates = [
+                attachment_index
+                for attachment_index, attachment_identifier in enumerate(
+                    attachment_identifiers
+                )
+                if identifier and identifier == attachment_identifier
+            ]
             if len(candidates) != 1:
                 reasons.append(
                     f"item_{item_index}:attachment_candidates:{len(candidates)}"
@@ -170,19 +206,36 @@ class InlineSummaryAdapter:
         if ambiguous:
             return ParseResult("HUMAN_REVIEW", mapping_reasons, [])
 
+        fingerprint_rows = []
+        fingerprint_reasons = []
+        for item_index, (block, mapping) in enumerate(zip(blocks, mappings), 1):
+            _, attachment = mapping
+            try:
+                body_digest = body_fingerprint(block)
+                attachment_digest = attachment_fingerprint(attachment)
+            except ValueError as error:
+                fingerprint_reasons.append(
+                    f"item_{item_index}:attachment_digest_unavailable:{error}"
+                )
+                continue
+            version_digest = version_fingerprint(body_digest, attachment_digest)
+            fingerprint_rows.append((body_digest, attachment_digest, version_digest))
+        if fingerprint_reasons or len(fingerprint_rows) != expected_count:
+            return ParseResult("HUMAN_REVIEW", fingerprint_reasons, [])
+
         items: List[Dict[str, Any]] = []
-        for item_index, (anchor, block, mapping) in enumerate(
-            zip(anchors, blocks, mappings), 1
+        for item_index, (anchor, block, mapping, fingerprint_row) in enumerate(
+            zip(anchors, blocks, mappings, fingerprint_rows), 1
         ):
             attachment_index, attachment = mapping
+            body_digest, attachment_digest, version_digest = fingerprint_row
             block_identifier = anchor.group("identifier")
             logical_id = logical_item_id(
                 self.config["source_company"],
                 self.config["item_type"],
                 block_identifier,
             )
-            fingerprint = content_fingerprint(block)
-            derived_id = derived_item_id(logical_id, fingerprint)
+            derived_id = derived_item_id(logical_id, version_digest)
             items.append(
                 {
                     "original_message_id": str(mail.get("message_id", "")),
@@ -191,11 +244,15 @@ class InlineSummaryAdapter:
                     "item_index": item_index,
                     "item_type": self.config["item_type"],
                     "body_text": block,
-                    "content_fingerprint": fingerprint,
+                    "body_fingerprint": body_digest,
+                    "attachment_fingerprint": attachment_digest,
+                    "version_fingerprint": version_digest,
+                    "content_fingerprint": version_digest,
                     "canonical_subject": canonical_subject(
                         self.config["source_company"],
                         self.config["item_type"],
-                        fingerprint,
+                        logical_id,
+                        version_digest,
                     ),
                     "attachment": attachment,
                     "attachment_mapping": {

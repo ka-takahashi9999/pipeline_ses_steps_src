@@ -12,6 +12,7 @@ PROJECT_ROOT = STEP_DIR.parent
 for import_path in (
     PROJECT_ROOT,
     STEP_DIR / "00_tool" / "canonicalize",
+    STEP_DIR / "00_tool" / "source_identity",
 ):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
@@ -19,6 +20,7 @@ for import_path in (
 from common.json_utils import read_jsonl_as_list
 from common.logger import get_logger
 from canonical_overlay import MAIL_MASTER_KEYS
+from identity import canonical_subject, derived_item_id
 
 
 logger = get_logger("confirm_99-1_multi_item_mail_lab")
@@ -42,6 +44,9 @@ AUDIT_KEYS = {
     "adapter_version",
     "original_subject",
     "original_timestamp",
+    "body_fingerprint",
+    "attachment_fingerprint",
+    "version_fingerprint",
     "content_fingerprint",
     "parse_status",
     "parse_reasons",
@@ -74,21 +79,52 @@ def main() -> None:
     statuses = Counter(record.get("parse_status") for record in audits)
     original_ids = {record.get("original_message_id") for record in audits}
     logical_ids = {record.get("logical_item_id") for record in audits}
-    fingerprints = {record.get("content_fingerprint") for record in audits}
+    body_fingerprints = {record.get("body_fingerprint") for record in audits}
+    attachment_fingerprints = {
+        record.get("attachment_fingerprint") for record in audits
+    }
+    version_fingerprints = {record.get("version_fingerprint") for record in audits}
+    logical_versions = {
+        (record.get("logical_item_id"), record.get("version_fingerprint"))
+        for record in audits
+    }
     overlay_ids = [record.get("message_id") for record in overlays]
+    overlay_by_id = {record.get("message_id"): record for record in overlays}
 
     _check(len(original_ids) == 4, "input mail count must be 4", failures)
     _check(len(audits) == 8, "audit item occurrence count must be 8", failures)
     _check(statuses == {"PARSED": 8}, "all 8 occurrences must be PARSED", failures)
     _check(len(logical_ids) == 2, "logical distinct must be 2", failures)
-    _check(len(fingerprints) == 2, "content distinct must be 2", failures)
+    _check(len(body_fingerprints) == 2, "body distinct must be 2", failures)
+    _check(
+        all(
+            record.get("content_fingerprint") == record.get("version_fingerprint")
+            for record in audits
+        ),
+        "content fingerprint must mean version fingerprint",
+        failures,
+    )
+    _check(
+        all(
+            isinstance(fingerprint, str) and fingerprint.startswith("sha256:")
+            for fingerprint in (
+                body_fingerprints | attachment_fingerprints | version_fingerprints
+            )
+        ),
+        "all audit fingerprints must be SHA-256 values",
+        failures,
+    )
     _check(
         all(record.get("attachment_mapping", {}).get("status") == "MAPPED" for record in audits),
         "all 8 attachment mappings must be MAPPED",
         failures,
     )
     _check(all(set(record) == AUDIT_KEYS for record in audits), "audit schema mismatch", failures)
-    _check(len(overlays) == 2, "overlay must contain 2 distinct versions", failures)
+    _check(
+        len(overlays) == len(logical_versions),
+        "overlay count must equal distinct attachment-aware versions",
+        failures,
+    )
     _check(len(overlay_ids) == len(set(overlay_ids)), "duplicate derived ID in overlay", failures)
     _check(
         all(set(record) == MAIL_MASTER_KEYS for record in overlays),
@@ -109,8 +145,56 @@ def main() -> None:
         "derived input IDs do not match overlay order",
         failures,
     )
+    _check(
+        all(
+            record.get("derived_item_id")
+            == derived_item_id(
+                record.get("logical_item_id", ""),
+                record.get("version_fingerprint", ""),
+            )
+            for record in audits
+        ),
+        "derived item ID is not based on logical ID and version fingerprint",
+        failures,
+    )
+    _check(
+        all(
+            record.get("derived_item_id") in overlay_by_id
+            and overlay_by_id[record["derived_item_id"]].get("subject")
+            == canonical_subject(
+                record.get("source_company", ""),
+                record.get("item_type", ""),
+                record.get("logical_item_id", ""),
+                record.get("version_fingerprint", ""),
+            )
+            for record in audits
+        ),
+        "canonical subject is not based on logical ID and version fingerprint",
+        failures,
+    )
     _check(summary.get("idempotency_ok") is True, "idempotency must pass", failures)
-    _check(summary.get("duplicate_occurrences") == 6, "duplicate occurrence count must be 6", failures)
+    _check(summary.get("parsed_mails") == 4, "parsed mail count must be 4", failures)
+    _check(summary.get("partial_mails") == 0, "PARTIAL mail count must be 0", failures)
+    _check(
+        summary.get("human_review_mails") == 0,
+        "HUMAN_REVIEW mail count must be 0",
+        failures,
+    )
+    _check(
+        summary.get("attachment_mapping_success") == 8,
+        "attachment mapping success count must be 8",
+        failures,
+    )
+    _check(
+        summary.get("duplicate_occurrences") == len(audits) - len(overlays),
+        "duplicate occurrence count mismatch",
+        failures,
+    )
+    _check(
+        summary.get("derived_versions") == len(logical_versions),
+        "derived version count mismatch",
+        failures,
+    )
     _check(summary.get("missing_items") == 0, "missing item count must be 0", failures)
     _check(
         summary.get("duplicate_derived_id_in_overlay") == 0,
@@ -119,8 +203,8 @@ def main() -> None:
     )
 
     logger.info(
-        "counts: input=4 expected=8 parsed=8 overlay=2 "
-        "logical=2 content=2 mapped=8"
+        "counts: input=4 expected=8 parsed=8 "
+        f"overlay={len(overlays)} logical=2 mapped=8"
     )
     representative_records = [
         record

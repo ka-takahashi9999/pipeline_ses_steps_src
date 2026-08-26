@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused tests for the 99-1 test-only inline-summary adapter."""
 
+import base64
 import copy
 import hashlib
 import sys
@@ -47,6 +48,15 @@ class InlineSummaryAdapterTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.adapter = InlineSummaryAdapter.from_file(CONFIG_PATH)
         cls.fixtures = read_jsonl_as_list(str(FIXTURE_PATH))
+        payloads = {
+            "skillsheet-RESOURCE-A1.xlsx": b"resource-A-v1",
+            "skillsheet-RESOURCE-B2.xlsx": b"resource-B-v1",
+        }
+        for mail in cls.fixtures:
+            for attachment in mail["attachments"]:
+                payload = payloads[attachment["filename"]]
+                attachment["data"] = base64.urlsafe_b64encode(payload).decode("ascii")
+                attachment["size"] = len(payload)
 
     def test_normal_mail_produces_exactly_two_items(self) -> None:
         result = self.adapter.parse(self.fixtures[0])
@@ -146,6 +156,115 @@ class InlineSummaryAdapterTest(unittest.TestCase):
         process_records(self.fixtures, self.adapter)
         source_after = hashlib.sha256(DEFAULT_INPUT.read_bytes()).hexdigest()
         self.assertEqual(source_before, source_after)
+
+    def test_false_substring_attachment_is_not_mapped(self) -> None:
+        mail = copy.deepcopy(self.fixtures[0])
+        mail["attachments"][0]["filename"] = (
+            "skillsheet-XRESOURCE-A1Y.xlsx"
+        )
+        result = self.adapter.parse(mail)
+        self.assertEqual("HUMAN_REVIEW", result.status)
+        self.assertEqual([], result.items)
+
+    def test_config_extracted_identifier_exact_match_passes(self) -> None:
+        result = self.adapter.parse(copy.deepcopy(self.fixtures[0]))
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(
+            "skillsheet-RESOURCE-A1.xlsx",
+            result.items[0]["attachment_mapping"]["filename"],
+        )
+
+    def test_zero_exact_attachment_candidates_fails_closed(self) -> None:
+        mail = copy.deepcopy(self.fixtures[0])
+        mail["attachments"][0]["filename"] = "skillsheet-RESOURCE-Z9.xlsx"
+        result = self.adapter.parse(mail)
+        self.assertEqual("HUMAN_REVIEW", result.status)
+        self.assertEqual([], result.items)
+
+    def test_two_exact_attachment_candidates_fail_closed(self) -> None:
+        mail = copy.deepcopy(self.fixtures[0])
+        mail["attachments"][1]["filename"] = "skillsheet-RESOURCE-A1.xlsx"
+        result = self.adapter.parse(mail)
+        self.assertEqual("HUMAN_REVIEW", result.status)
+        self.assertEqual([], result.items)
+
+    def test_same_body_and_attachment_preserve_all_version_identity(self) -> None:
+        first = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items[0]
+        second = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items[0]
+        identity_keys = (
+            "logical_item_id",
+            "body_fingerprint",
+            "attachment_fingerprint",
+            "version_fingerprint",
+            "derived_item_id",
+            "canonical_subject",
+        )
+        self.assertEqual(
+            tuple(first[key] for key in identity_keys),
+            tuple(second[key] for key in identity_keys),
+        )
+
+    def test_attachment_only_change_creates_new_version(self) -> None:
+        original = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items[0]
+        changed_mail = copy.deepcopy(self.fixtures[0])
+        changed_payload = b"resource-A-v2"
+        changed_mail["attachments"][0]["data"] = (
+            base64.urlsafe_b64encode(changed_payload).decode("ascii")
+        )
+        changed_mail["attachments"][0]["size"] = len(changed_payload)
+        changed = self.adapter.parse(changed_mail).items[0]
+        self.assertEqual(original["logical_item_id"], changed["logical_item_id"])
+        self.assertEqual(original["body_fingerprint"], changed["body_fingerprint"])
+        self.assertNotEqual(
+            original["attachment_fingerprint"], changed["attachment_fingerprint"]
+        )
+        self.assertNotEqual(original["version_fingerprint"], changed["version_fingerprint"])
+        self.assertNotEqual(original["derived_item_id"], changed["derived_item_id"])
+        self.assertNotEqual(original["canonical_subject"], changed["canonical_subject"])
+
+    def test_attachment_only_new_version_is_not_deduped(self) -> None:
+        original_mail = copy.deepcopy(self.fixtures[0])
+        changed_mail = copy.deepcopy(self.fixtures[0])
+        changed_mail["message_id"] = "fixture-attachment-version-002"
+        changed_payload = b"resource-A-v2"
+        changed_mail["attachments"][0]["data"] = (
+            base64.urlsafe_b64encode(changed_payload).decode("ascii")
+        )
+        changed_mail["attachments"][0]["size"] = len(changed_payload)
+        artifacts, stats = process_records(
+            [original_mail, changed_mail], self.adapter
+        )
+        self.assertEqual(2, stats["logical_distinct"])
+        self.assertEqual(3, stats["derived_versions"])
+        self.assertEqual(1, stats["duplicate_occurrences"])
+        self.assertEqual(3, len(artifacts["derived_mail_master"]))
+
+    def test_body_only_change_creates_new_version(self) -> None:
+        original = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items[0]
+        changed_mail = copy.deepcopy(self.fixtures[0])
+        changed_mail["body_text"] = changed_mail["body_text"].replace(
+            "Java / SQL", "Java / Go"
+        )
+        changed = self.adapter.parse(changed_mail).items[0]
+        self.assertEqual(original["logical_item_id"], changed["logical_item_id"])
+        self.assertNotEqual(original["body_fingerprint"], changed["body_fingerprint"])
+        self.assertEqual(
+            original["attachment_fingerprint"], changed["attachment_fingerprint"]
+        )
+        self.assertNotEqual(original["derived_item_id"], changed["derived_item_id"])
+
+    def test_distinct_items_have_no_id_or_subject_collision(self) -> None:
+        items = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items
+        self.assertEqual(2, len({item["logical_item_id"] for item in items}))
+        self.assertEqual(2, len({item["derived_item_id"] for item in items}))
+        self.assertEqual(2, len({item["canonical_subject"] for item in items}))
+
+    def test_missing_attachment_payload_fails_closed(self) -> None:
+        mail = copy.deepcopy(self.fixtures[0])
+        del mail["attachments"][0]["data"]
+        result = self.adapter.parse(mail)
+        self.assertEqual("HUMAN_REVIEW", result.status)
+        self.assertEqual([], result.items)
 
 
 if __name__ == "__main__":
