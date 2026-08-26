@@ -1,0 +1,24 @@
+{
+  "config_id": "netwisdom_inline_summary",
+  "version": "1.0.0",
+  "source_company": "NetWisdom",
+  "selectors": {
+    "sender_domain": "netwisdom.co.jp",
+    "subject_regex": "NetWisdom"
+  },
+  "item_start_regex": "(?m)^技術者\\s*:\\s*(?P<identifier>\\S+)\\s*$",
+  "separator_regex": "(?m)^-{20,}\\s*$",
+  "required_profile_markers": [
+    "面接予定",
+    "結果待ち"
+  ],
+  "expected_item_count": 2,
+  "item_type": "resource",
+  "footer_end_regex": "(?m)^\\s*以上.*$",
+  "attachment_mapping": {
+    "strategy": "normalized_identifier_in_filename",
+    "filename_field": "filename",
+    "require_one_to_one": true
+  },
+  "offline_expected_input_mails": 4
+}
