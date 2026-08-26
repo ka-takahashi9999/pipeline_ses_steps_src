@@ -266,6 +266,38 @@ class InlineSummaryAdapterTest(unittest.TestCase):
         self.assertEqual("HUMAN_REVIEW", result.status)
         self.assertEqual([], result.items)
 
+    def test_delivery_subject_variations_keep_canonical_subject_stable(self) -> None:
+        subjects_by_logical_id = {}
+        for mail in self.fixtures:
+            result = self.adapter.parse(copy.deepcopy(mail))
+            self.assertEqual("PARSED", result.status)
+            for item in result.items:
+                subjects_by_logical_id.setdefault(item["logical_item_id"], set()).add(
+                    item["canonical_subject"]
+                )
+        self.assertEqual(2, len(subjects_by_logical_id))
+        self.assertTrue(all(len(subjects) == 1 for subjects in subjects_by_logical_id.values()))
+
+    def test_canonical_body_has_context_and_only_its_item(self) -> None:
+        items = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items
+        self.assertIn("要員(個別提案)を提案", items[0]["body_text"])
+        self.assertIn("RESOURCE-A1", items[0]["body_text"])
+        self.assertNotIn("RESOURCE-B2", items[0]["body_text"])
+        self.assertIn("RESOURCE-B2", items[1]["body_text"])
+        self.assertNotIn("RESOURCE-A1", items[1]["body_text"])
+
+    def test_canonical_body_does_not_restore_footer(self) -> None:
+        items = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items
+        self.assertTrue(all("以上、2名です" not in item["body_text"] for item in items))
+        self.assertTrue(all("署名情報" not in item["body_text"] for item in items))
+
+    def test_subject_uses_semantic_part_without_delivery_technology_terms(self) -> None:
+        items = self.adapter.parse(copy.deepcopy(self.fixtures[0])).items
+        for item in items:
+            self.assertIn("要員ご提案", item["canonical_subject"])
+            self.assertNotIn("fixture", item["canonical_subject"])
+            self.assertNotIn("Java", item["canonical_subject"])
+
 
 if __name__ == "__main__":
     unittest.main()

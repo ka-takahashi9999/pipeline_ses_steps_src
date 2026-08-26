@@ -4,6 +4,7 @@
 import contextlib
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -35,6 +36,13 @@ logger = get_logger("99-1_selective_pipeline_test")
 DERIVED_MASTER = STEP_DIR / "01_result" / "derived_mail_master.jsonl"
 DERIVED_INPUT_IDS = STEP_DIR / "01_result" / "derived_input_ids.jsonl"
 P1_AUDIT = STEP_DIR / "01_result" / "audit_items.jsonl"
+P1_CONFIG = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "configs"
+    / "companies"
+    / "netwisdom.config.json.example"
+)
 SELECTIVE_DIR = STEP_DIR / "01_result" / "selective_pipeline_test"
 
 MODULE_PATHS = {
@@ -226,6 +234,8 @@ def _build_success_cache_contract(
     master_records: List[Dict[str, Any]],
     audit_records: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    with P1_CONFIG.open(encoding="utf-8") as file_object:
+        config = json.load(file_object)
     audit_by_derived: Dict[str, Dict[str, Any]] = {}
     for audit in audit_records:
         derived_id = audit.get("derived_item_id")
@@ -240,8 +250,7 @@ def _build_success_cache_contract(
         if audit is None:
             raise ValueError(f"P1 audit join missing: {record['message_id']}")
         stable_subject = canonical_subject(
-            audit["source_company"],
-            audit["item_type"],
+            config["canonical_subject_template"],
             audit["logical_item_id"],
             audit["version_fingerprint"],
         )
@@ -256,8 +265,7 @@ def _build_success_cache_contract(
             audit["body_fingerprint"], changed_attachment
         )
         changed_subject = canonical_subject(
-            audit["source_company"],
-            audit["item_type"],
+            config["canonical_subject_template"],
             audit["logical_item_id"],
             changed_version,
         )
@@ -342,7 +350,9 @@ def _build_five_results(
     return results
 
 
-def build_selective_results() -> Dict[str, Any]:
+def build_selective_results(
+    stop_after_classification: bool = True,
+) -> Dict[str, Any]:
     for path in (DERIVED_MASTER, DERIVED_INPUT_IDS, P1_AUDIT):
         if not path.exists():
             raise FileNotFoundError(f"required P1 artifact not found: {path}")
@@ -492,6 +502,61 @@ def build_selective_results() -> Dict[str, Any]:
             "cleanup": cleanup_records,
             "classification": classification_records,
             "project_route": project_records,
+            "resource_route": resource_records,
+            "fetch_skillsheet": [],
+            "normalize_skillsheet": [],
+            "attachment_identity": attachment_identity_records,
+            "five_results": {key: [] for key in FIVE_REQUIRED_KEYS},
+            "report": report,
+        }
+
+    if stop_after_classification:
+        production_after = _production_artifact_snapshot()
+        production_write = int(production_before != production_after)
+        if production_write:
+            raise ValueError("production artifact changed during selective test")
+        report = {
+            "result": "PASS",
+            "blocking_stage": "",
+            "blocking_reason": "",
+            "derived_input": len(ordered_ids),
+            "cleanup_output": len(cleanup_records),
+            "classification_output": len(classification_records),
+            "resource_output": len(resource_records),
+            "project_classified": len(project_records),
+            "ambiguous_classified": len(ambiguous_records),
+            "unknown_classified": len(unknown_records),
+            "project_route_output": 0,
+            "skillsheet_output": 0,
+            "normalized_skillsheet_output": 0,
+            "five_step_count": 0,
+            "five_records_per_step": 0,
+            "message_id_continuity": True,
+            "join_missing": 0,
+            "duplicate_ids": 0,
+            "body_cross_contamination": body_cross_contamination,
+            "attachment_cross_contamination": 0,
+            "profile_marker_retained": profile_marker_retained,
+            "attachment_identity_distinct": len(attachment_digests),
+            "skillsheet_identity_distinct": 0,
+            "from_subject_collision": success_cache["from_subject_collision"],
+            "success_cache_stable": success_cache["stable_subject_count"] == 2,
+            "success_cache_version_subject_change": (
+                success_cache["version_changed_subject_count"] == 2
+            ),
+            "contract_06_ready": False,
+            "steps_03_04_05_executed": False,
+            "steps_06_plus_executed": False,
+            "llm_api_calls": 0,
+            "external_url_calls": 0,
+            "production_changes": 0,
+            "production_write": production_write,
+        }
+        return {
+            "derived_input": master_records,
+            "cleanup": cleanup_records,
+            "classification": classification_records,
+            "project_route": [],
             "resource_route": resource_records,
             "fetch_skillsheet": [],
             "normalize_skillsheet": [],

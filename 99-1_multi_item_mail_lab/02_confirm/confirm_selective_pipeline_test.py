@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confirm the selective test stopped safely at the observed 02-1 blocker."""
+"""Confirm 99-1 derived mails pass 01-4 and 02-1 as resources."""
 
 import sys
 from pathlib import Path
@@ -65,15 +65,15 @@ def main() -> None:
     _check(len(cleanup) == 2, "01-4 output count must be 2", failures)
     _check(derived_ids == cleanup_ids == classification_ids, "message_id continuity failed", failures)
     _check(
-        distribution == {"resource": 0, "project": 1, "ambiguous": 1, "unknown": 0},
+        distribution == {"resource": 2, "project": 0, "ambiguous": 0, "unknown": 0},
         "observed 02-1 distribution changed",
         failures,
     )
-    _check(report.get("result") == "FAIL", "selective result must be FAIL", failures)
-    _check(report.get("blocking_stage") == "02-1", "blocking stage must be 02-1", failures)
-    _check(len(project_route) == 1, "project route evidence must contain 1 item", failures)
-    _check(len(resource_route) == 0, "resource route must contain 0 items", failures)
-    _check(fetch == [] and normalized == [], "04 must not execute after STOP", failures)
+    _check(report.get("result") == "PASS", "selective result must be PASS", failures)
+    _check(report.get("blocking_stage") == "", "blocking stage must be empty", failures)
+    _check(len(project_route) == 0, "project route must contain 0 items", failures)
+    _check(len(resource_route) == 2, "resource route must contain 2 items", failures)
+    _check(fetch == [] and normalized == [], "04 must not execute in classification-only scope", failures)
     _check(
         len(attachment_identity) == 2
         and len({record.get("attachment_fingerprint") for record in attachment_identity}) == 2,
@@ -95,8 +95,7 @@ def main() -> None:
         logger.error(f"selective confirm NG: failures={len(failures)}")
         raise SystemExit(1)
     logger.ok(
-        "selective confirm OK (expected HOLD): "
-        "derived=2 cleanup=2 resource=0 project=1 ambiguous=1"
+        "selective confirm OK: derived=2 cleanup=2 resource=2 project=0 ambiguous=0"
     )
 
 

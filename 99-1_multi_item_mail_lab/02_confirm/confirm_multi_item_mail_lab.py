@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Confirm 99-1 offline replay counts, schema, mapping, and identities."""
 
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -29,6 +30,13 @@ AUDIT_PATH = RESULT_DIR / "audit_items.jsonl"
 OVERLAY_PATH = RESULT_DIR / "derived_mail_master.jsonl"
 INPUT_IDS_PATH = RESULT_DIR / "derived_input_ids.jsonl"
 SUMMARY_PATH = RESULT_DIR / "replay_summary.jsonl"
+CONFIG_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "configs"
+    / "companies"
+    / "netwisdom.config.json.example"
+)
 
 AUDIT_KEYS = {
     "original_message_id",
@@ -75,6 +83,8 @@ def main() -> None:
     if not summaries:
         sys.exit(1)
     summary = summaries[0]
+    with CONFIG_PATH.open(encoding="utf-8") as file_object:
+        config = json.load(file_object)
 
     statuses = Counter(record.get("parse_status") for record in audits)
     original_ids = {record.get("original_message_id") for record in audits}
@@ -162,8 +172,7 @@ def main() -> None:
             record.get("derived_item_id") in overlay_by_id
             and overlay_by_id[record["derived_item_id"]].get("subject")
             == canonical_subject(
-                record.get("source_company", ""),
-                record.get("item_type", ""),
+                config["canonical_subject_template"],
                 record.get("logical_item_id", ""),
                 record.get("version_fingerprint", ""),
             )

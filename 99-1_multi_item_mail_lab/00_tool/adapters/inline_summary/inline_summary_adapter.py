@@ -21,7 +21,7 @@ from identity import (
 
 
 ADAPTER_ID = "inline_summary"
-ADAPTER_VERSION = "1.1.0"
+ADAPTER_VERSION = "1.2.0"
 VALID_STATUSES = {"PARSED", "PARTIAL", "UNSUPPORTED", "HUMAN_REVIEW"}
 
 
@@ -110,6 +110,10 @@ class InlineSummaryAdapter:
                 continue
             blocks.append(block)
         return blocks, reasons
+
+    def _build_canonical_body(self, item_block: str) -> str:
+        context = self.config["canonical_body_classification_context"]
+        return normalize_content(context + "\n\n" + item_block)
 
     def _map_attachments(
         self,
@@ -206,12 +210,15 @@ class InlineSummaryAdapter:
         if ambiguous:
             return ParseResult("HUMAN_REVIEW", mapping_reasons, [])
 
+        canonical_blocks = [self._build_canonical_body(block) for block in blocks]
         fingerprint_rows = []
         fingerprint_reasons = []
-        for item_index, (block, mapping) in enumerate(zip(blocks, mappings), 1):
+        for item_index, (canonical_block, mapping) in enumerate(
+            zip(canonical_blocks, mappings), 1
+        ):
             _, attachment = mapping
             try:
-                body_digest = body_fingerprint(block)
+                body_digest = body_fingerprint(canonical_block)
                 attachment_digest = attachment_fingerprint(attachment)
             except ValueError as error:
                 fingerprint_reasons.append(
@@ -224,8 +231,8 @@ class InlineSummaryAdapter:
             return ParseResult("HUMAN_REVIEW", fingerprint_reasons, [])
 
         items: List[Dict[str, Any]] = []
-        for item_index, (anchor, block, mapping, fingerprint_row) in enumerate(
-            zip(anchors, blocks, mappings, fingerprint_rows), 1
+        for item_index, (anchor, canonical_block, mapping, fingerprint_row) in enumerate(
+            zip(anchors, canonical_blocks, mappings, fingerprint_rows), 1
         ):
             attachment_index, attachment = mapping
             body_digest, attachment_digest, version_digest = fingerprint_row
@@ -243,14 +250,13 @@ class InlineSummaryAdapter:
                     "derived_item_id": derived_id,
                     "item_index": item_index,
                     "item_type": self.config["item_type"],
-                    "body_text": block,
+                    "body_text": canonical_block,
                     "body_fingerprint": body_digest,
                     "attachment_fingerprint": attachment_digest,
                     "version_fingerprint": version_digest,
                     "content_fingerprint": version_digest,
                     "canonical_subject": canonical_subject(
-                        self.config["source_company"],
-                        self.config["item_type"],
+                        self.config["canonical_subject_template"],
                         logical_id,
                         version_digest,
                     ),

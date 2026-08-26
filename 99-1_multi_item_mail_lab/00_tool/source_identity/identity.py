@@ -82,11 +82,13 @@ def derived_item_id(logical_id: str, version_digest: str) -> str:
 
 
 def canonical_subject(
-    source_company: str,
-    item_type: str,
+    subject_template: str,
     logical_id: str,
     version_digest: str,
 ) -> str:
     short_logical_id = logical_id.removeprefix("li_")[:10]
     short_version = version_digest.removeprefix("sha256:")[:12]
-    return f"[MI {item_type} {short_logical_id} {short_version}] {source_company}"
+    return subject_template.format(
+        logical_short=short_logical_id,
+        version_short=short_version,
+    )

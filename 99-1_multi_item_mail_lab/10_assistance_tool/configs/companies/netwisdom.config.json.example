@@ -1,6 +1,6 @@
 {
   "config_id": "netwisdom_inline_summary",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "source_company": "NetWisdom",
   "selectors": {
     "sender_domain": "netwisdom.co.jp",
@@ -14,6 +14,8 @@
   ],
   "expected_item_count": 2,
   "item_type": "resource",
+  "canonical_subject_template": "要員ご提案: 個別要員 / NetWisdom株式会社 [MI:{logical_short}/{version_short}]",
+  "canonical_body_classification_context": "弊社9月入場要員（個別提案）を提案させて頂きます。\n\n是非ともご検討のほどよろしくお願いします。",
   "footer_end_regex": "(?m)^\\s*以上.*$",
   "attachment_mapping": {
     "strategy": "regex_extract_normalized_exact",

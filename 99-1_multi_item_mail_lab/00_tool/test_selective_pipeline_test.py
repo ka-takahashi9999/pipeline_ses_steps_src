@@ -35,12 +35,12 @@ class SelectivePipelineTest(unittest.TestCase):
             )
         self.assertTrue(self.report["message_id_continuity"])
 
-    def test_existing_02_1_exposes_resource_classification_blocker(self) -> None:
-        self.assertEqual("FAIL", self.report["result"])
-        self.assertEqual("02-1", self.report["blocking_stage"])
-        self.assertEqual(0, self.report["resource_output"])
-        self.assertEqual(1, self.report["project_classified"])
-        self.assertEqual(1, self.report["ambiguous_classified"])
+    def test_existing_02_1_classifies_both_as_resource(self) -> None:
+        self.assertEqual("PASS", self.report["result"])
+        self.assertEqual("", self.report["blocking_stage"])
+        self.assertEqual(2, self.report["resource_output"])
+        self.assertEqual(0, self.report["project_classified"])
+        self.assertEqual(0, self.report["ambiguous_classified"])
 
     def test_completed_stage_join_has_no_missing_or_duplicate(self) -> None:
         self.assertEqual(0, self.report["join_missing"])
@@ -62,7 +62,7 @@ class SelectivePipelineTest(unittest.TestCase):
         self.assertEqual([], self.results["fetch_skillsheet"])
         self.assertEqual([], self.results["normalize_skillsheet"])
 
-    def test_no_05_schema_is_claimed_after_02_1_failure(self) -> None:
+    def test_no_05_schema_is_claimed_in_classification_only_scope(self) -> None:
         self.assertEqual(0, self.report["five_step_count"])
         self.assertEqual(set(FIVE_REQUIRED_KEYS), set(self.results["five_results"]))
         self.assertTrue(all(not records for records in self.results["five_results"].values()))
@@ -83,6 +83,12 @@ class SelectivePipelineTest(unittest.TestCase):
     def test_no_llm_api_or_external_url_calls(self) -> None:
         self.assertEqual(0, self.report["llm_api_calls"])
         self.assertEqual(0, self.report["external_url_calls"])
+
+    def test_item_type_metadata_is_not_classification_input(self) -> None:
+        self.assertTrue(all("item_type" not in record for record in self.results["derived_input"]))
+        self.assertTrue(
+            all(set(record) == {"message_id", "mail_type"} for record in self.results["classification"])
+        )
 
 
 if __name__ == "__main__":
