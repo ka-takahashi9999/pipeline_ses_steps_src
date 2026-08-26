@@ -1,0 +1,38 @@
+{
+  "config_id": "archive_security",
+  "config_version": "1.0.0",
+  "archive_format": "ZIP",
+  "archive_schema_version": "archive_container.v1",
+  "member_manifest_schema_version": "archive_member_manifest.v1",
+  "limits": {
+    "max_archive_compressed_bytes": 33554432,
+    "max_member_count": 256,
+    "max_single_member_uncompressed_bytes": 67108864,
+    "max_total_uncompressed_bytes": 134217728,
+    "max_expansion_ratio": 100.0,
+    "max_filename_unicode_chars": 255,
+    "max_full_path_utf8_bytes": 1024,
+    "max_path_depth_segments": 16,
+    "future_cumulative_nested_member_count": 256,
+    "future_cumulative_nested_expanded_bytes": 134217728
+  },
+  "allowed_compression_methods": [0, 8],
+  "expansion_depth": 0,
+  "member_roles": {
+    "item_candidate_regex": "(?:^|/)item-[0-9]+\\.(?:xlsx|xls|csv)$",
+    "supporting_regex": "(?:^|/)supporting(?:/|$)",
+    "shared_regex": "(?:^|/)shared(?:/|$)"
+  },
+  "credential_matching": {
+    "credential_matching_enabled": false,
+    "archive_sender_allowlist": [],
+    "archive_subject_regex": "",
+    "credential_sender_allowlist": [],
+    "credential_subject_regex": "",
+    "filename_token_rule": "",
+    "subject_token_rule": "",
+    "max_time_window_seconds": 0,
+    "credential_body_value_regex": ""
+  },
+  "password_persistence": "EPHEMERAL_ONLY"
+}
