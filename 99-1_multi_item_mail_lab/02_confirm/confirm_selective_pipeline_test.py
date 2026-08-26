@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confirm 99-1 derived mails pass 01-4 and 02-1 as resources."""
+"""Confirm the 99-1 derived resource selective 03/04/05 contract."""
 
 import sys
 from pathlib import Path
@@ -18,6 +18,19 @@ from common.logger import get_logger
 
 logger = get_logger("confirm_99-1_selective_pipeline_test")
 RESULT_DIR = STEP_DIR / "01_result" / "selective_pipeline_test"
+
+FIVE_FILES = (
+    "05-1_extract_resource_budget.jsonl",
+    "05-2_extract_resource_age.jsonl",
+    "05-3_extract_resource_remote.jsonl",
+    "05-4_extract_resource_foreign.jsonl",
+    "05-5_extract_resource_freelance.jsonl",
+    "05-6_extract_resource_workload.jsonl",
+    "05-7_extract_resource_vendor_tiers.jsonl",
+    "05-8_extract_resource_skill_category.jsonl",
+    "05-9_extract_resource_phase_category.jsonl",
+    "05-10_extract_resource_location.jsonl",
+)
 
 
 def _check(condition: bool, message: str, failures: List[str]) -> None:
@@ -40,10 +53,12 @@ def main() -> None:
         cleanup = _read("01-4_cleanup.jsonl")
         classifications = _read("02-1_classification.jsonl")
         project_route = _read("03_project_input.jsonl")
+        resource_bypass = _read("03_resource_bypass.jsonl")
         resource_route = _read("05_resource_input.jsonl")
         fetch = _read("04-1_fetch_skillsheets_text.jsonl")
         normalized = _read("04-2_normalize_skillsheets_text.jsonl")
         attachment_identity = _read("04_attachment_identity.jsonl")
+        five_outputs = {filename: _read(filename) for filename in FIVE_FILES}
         reports = _read("contract_report.jsonl")
     except Exception as error:
         logger.error(str(error))
@@ -54,37 +69,90 @@ def main() -> None:
         raise SystemExit(1)
     report = reports[0]
     derived_ids = {record.get("message_id") for record in derived}
-    cleanup_ids = {record.get("message_id") for record in cleanup}
-    classification_ids = {record.get("message_id") for record in classifications}
     distribution = {
         mail_type: sum(1 for record in classifications if record.get("mail_type") == mail_type)
         for mail_type in ("resource", "project", "ambiguous", "unknown")
     }
 
-    _check(len(derived) == 2, "derived input count must be 2", failures)
+    _check(len(derived) == 2 and len(derived_ids) == 2, "derived input must be unique 2", failures)
     _check(len(cleanup) == 2, "01-4 output count must be 2", failures)
-    _check(derived_ids == cleanup_ids == classification_ids, "message_id continuity failed", failures)
     _check(
         distribution == {"resource": 2, "project": 0, "ambiguous": 0, "unknown": 0},
         "observed 02-1 distribution changed",
         failures,
     )
-    _check(report.get("result") == "PASS", "selective result must be PASS", failures)
-    _check(report.get("blocking_stage") == "", "blocking stage must be empty", failures)
-    _check(len(project_route) == 0, "project route must contain 0 items", failures)
-    _check(len(resource_route) == 2, "resource route must contain 2 items", failures)
-    _check(fetch == [] and normalized == [], "04 must not execute in classification-only scope", failures)
+    _check(project_route == [], "resource items must not enter project-only 03", failures)
     _check(
-        len(attachment_identity) == 2
-        and len({record.get("attachment_fingerprint") for record in attachment_identity}) == 2,
-        "derived input attachment isolation failed",
+        len(resource_bypass) == 2
+        and {record.get("message_id") for record in resource_bypass} == derived_ids,
+        "03 resource bypass identity must be 2/2",
         failures,
     )
+    _check(
+        len(resource_route) == 2
+        and {record.get("message_id") for record in resource_route} == derived_ids,
+        "05 resource route identity must be 2/2",
+        failures,
+    )
+    _check(
+        len(fetch) == 2
+        and all(record.get("success") is True for record in fetch)
+        and all(record.get("source") == "attachment" for record in fetch),
+        "04-1 attachment fetch must succeed 2/2",
+        failures,
+    )
+    _check(
+        len(normalized) == 2
+        and all(record.get("clean_char_count", 0) > 0 for record in normalized),
+        "04-2 normalization must succeed 2/2",
+        failures,
+    )
+    _check(
+        len(attachment_identity) == 2
+        and all(record.get("attachment_count") == 1 for record in attachment_identity)
+        and all(record.get("mapping_correct") is True for record in attachment_identity),
+        "04 attachment mapping must be correct 2/2",
+        failures,
+    )
+    _check(
+        all(record.get("own_content_marker_found") is True for record in attachment_identity)
+        and all(
+            record.get("foreign_content_marker_found") is False
+            for record in attachment_identity
+        ),
+        "skillsheet content crossed derived items",
+        failures,
+    )
+    _check(
+        all(
+            len(records) == 2
+            and {record.get("message_id") for record in records} == derived_ids
+            for records in five_outputs.values()
+        ),
+        "05 output join must be 2/2 for all resource steps",
+        failures,
+    )
+    _check(report.get("result") == "PASS", "selective result must be PASS", failures)
+    _check(report.get("message_id_continuity") is True, "message_id continuity failed", failures)
     _check(report.get("body_cross_contamination") == 0, "body contamination detected", failures)
-    _check(report.get("join_missing") == 0, "completed-stage join missing detected", failures)
-    _check(report.get("from_subject_collision") == 0, "Success Cache identity collision", failures)
-    _check(report.get("contract_06_ready") is False, "06 contract must not be marked ready", failures)
-    _check(report.get("steps_03_04_05_executed") is False, "03/04/05 execution guard failed", failures)
+    _check(report.get("skillsheet_cross_contamination") == 0, "skillsheet contamination detected", failures)
+    _check(report.get("attachment_cross_contamination") == 0, "attachment contamination detected", failures)
+    _check(report.get("attachment_missing") == 0, "attachment missing detected", failures)
+    _check(report.get("duplicate_attachment_mapping") == 0, "duplicate attachment detected", failures)
+    _check(report.get("join_missing") == 0, "05/skillsheet join missing detected", failures)
+    _check(report.get("duplicate_ids") == 0, "derived ID duplicate detected", failures)
+    _check(report.get("original_id_join_key_uses") == 0, "original Gmail ID used as join key", failures)
+    _check(report.get("schema_compatibility") is True, "05 schema incompatibility", failures)
+    _check(report.get("normalized_schema_errors") == 0, "04 normalized schema incompatibility", failures)
+    _check(report.get("resource_text_schema_errors") == 0, "resource text schema incompatibility", failures)
+    _check(report.get("contract_06_ready") is True, "06 contract is not ready", failures)
+    _check(
+        report.get("selective_03_04_05_contract_completed") is True,
+        "selective 03/04/05 contract is incomplete",
+        failures,
+    )
+    _check(report.get("project_steps_03_executed") is False, "project-only 03 executed", failures)
+    _check(report.get("resource_steps_04_05_executed") is True, "04/05 did not execute", failures)
     _check(report.get("steps_06_plus_executed") is False, "06+ execution guard failed", failures)
     _check(report.get("llm_api_calls") == 0, "LLM/API call count must be 0", failures)
     _check(report.get("external_url_calls") == 0, "external URL call count must be 0", failures)
@@ -95,7 +163,7 @@ def main() -> None:
         logger.error(f"selective confirm NG: failures={len(failures)}")
         raise SystemExit(1)
     logger.ok(
-        "selective confirm OK: derived=2 cleanup=2 resource=2 project=0 ambiguous=0"
+        "selective confirm OK: derived=2 03_bypass=2 04=2 05=2x10 06_READY=YES"
     )
 
 

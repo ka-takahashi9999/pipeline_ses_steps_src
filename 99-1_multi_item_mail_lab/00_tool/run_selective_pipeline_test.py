@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -126,6 +127,42 @@ FIVE_REQUIRED_KEYS = {
     "resource_location": {"message_id", "location", "location_raw", "location_source"},
 }
 
+FIVE_06_FIELD_TYPES = {
+    "resource_budget": {"desired_unit_price": int},
+    "resource_age": {"current_age": int},
+    "resource_remote": {"remote_preference": str},
+    "resource_foreign": {"nationality": str},
+    "resource_freelance": {"employment_type": str},
+    "resource_workload": {"workload_min": int, "workload_max": int},
+    "resource_vendor": {"vendor_flow": int},
+    "resource_skill": {"skills": list},
+    "resource_phase": {"phases": list},
+    "resource_location": {"location": str},
+}
+
+NORMALIZED_REQUIRED_KEYS = {
+    "message_id",
+    "success",
+    "source",
+    "urls",
+    "skillsheet",
+    "raw_char_count",
+    "clean_char_count",
+    "reduction_char_count",
+    "reduction_rate",
+    "cleanup_flags",
+    "cleanup_stats",
+    "source_step",
+}
+
+GENERIC_ATTACHMENT_MARKERS = {
+    "スキルシート",
+    "履歴書",
+    "技術経歴書",
+    "職務経歴書",
+    "経歴書",
+}
+
 
 @contextlib.contextmanager
 def _prepend_paths(paths: Iterable[Path]) -> Iterable[None]:
@@ -207,6 +244,71 @@ def _index(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             raise ValueError(f"duplicate message_id: {message_id}")
         result[message_id] = record
     return result
+
+
+def _expected_attachment_fingerprints(
+    audit_records: List[Dict[str, Any]],
+    expected_ids: Set[str],
+) -> Dict[str, str]:
+    expected: Dict[str, str] = {}
+    for message_id in expected_ids:
+        fingerprints = {
+            record.get("attachment_fingerprint")
+            for record in audit_records
+            if record.get("derived_item_id") == message_id
+        }
+        if len(fingerprints) != 1 or None in fingerprints or "" in fingerprints:
+            raise ValueError(f"P1 attachment audit is inconsistent: {message_id}")
+        expected[message_id] = next(iter(fingerprints))
+    return expected
+
+
+def _exclusive_skillsheet_markers(
+    master_records: List[Dict[str, Any]],
+) -> Dict[str, Set[str]]:
+    marker_sets: Dict[str, Set[str]] = {}
+    for record in master_records:
+        attachments = record.get("attachments") or []
+        filename = str(attachments[0].get("filename", "")) if attachments else ""
+        markers = {
+            marker
+            for marker in re.findall(r"[\u3400-\u9fff]+", Path(filename).stem)
+            if marker not in GENERIC_ATTACHMENT_MARKERS
+        }
+        marker_sets[record["message_id"]] = markers
+
+    exclusive: Dict[str, Set[str]] = {}
+    for message_id, markers in marker_sets.items():
+        other_markers: Set[str] = set()
+        for other_id, other_values in marker_sets.items():
+            if other_id != message_id:
+                other_markers.update(other_values)
+        exclusive[message_id] = markers - other_markers
+        if not exclusive[message_id]:
+            raise ValueError(f"no item-specific skillsheet marker: {message_id}")
+    return exclusive
+
+
+def _five_schema_error_count(
+    results: Dict[str, List[Dict[str, Any]]],
+) -> int:
+    errors = 0
+    for key, records in results.items():
+        required_keys = FIVE_REQUIRED_KEYS[key]
+        field_types = FIVE_06_FIELD_TYPES[key]
+        for record in records:
+            if not required_keys <= set(record):
+                errors += 1
+                continue
+            if not isinstance(record.get("message_id"), str) or not record["message_id"]:
+                errors += 1
+                continue
+            if any(
+                not isinstance(record.get(field), expected_type)
+                for field, expected_type in field_types.items()
+            ):
+                errors += 1
+    return errors
 
 
 def _exclusive_body_lines(master_records: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
@@ -351,7 +453,7 @@ def _build_five_results(
 
 
 def build_selective_results(
-    stop_after_classification: bool = True,
+    stop_after_classification: bool = False,
 ) -> Dict[str, Any]:
     for path in (DERIVED_MASTER, DERIVED_INPUT_IDS, P1_AUDIT):
         if not path.exists():
@@ -369,10 +471,22 @@ def build_selective_results(
         raise ValueError("selective test requires exactly two P1 derived items")
     master_by_id = _index(master_records)
     ordered_ids = [record["message_id"] for record in input_id_records]
+    expected_ids = set(ordered_ids)
     if len(set(ordered_ids)) != 2 or set(ordered_ids) != set(master_by_id):
         raise ValueError("derived input IDs do not match derived mail master")
     if not all(message_id.startswith("mi_") for message_id in ordered_ids):
         raise ValueError("non-derived message_id found in selective input")
+    original_ids = {
+        record.get("original_message_id")
+        for record in audit_records
+        if record.get("original_message_id")
+    }
+    if expected_ids & original_ids:
+        raise ValueError("derived and original Gmail identities overlap")
+    expected_attachment_by_id = _expected_attachment_fingerprints(
+        audit_records, expected_ids
+    )
+    skillsheet_markers = _exclusive_skillsheet_markers(master_records)
 
     exclusive_lines = _exclusive_body_lines(master_records)
     cleanup_module = modules["cleanup"]
@@ -437,11 +551,25 @@ def build_selective_results(
     success_cache = _build_success_cache_contract(master_records, audit_records)
     attachment_identity_records: List[Dict[str, Any]] = []
     attachment_digests: Set[str] = set()
+    correct_attachment_mapping = 0
+    attachment_cross_contamination = 0
     for message_id in ordered_ids:
         attachments = master_by_id[message_id].get("attachments")
         if not isinstance(attachments, list) or len(attachments) != 1:
             raise ValueError(f"derived item must have one attachment: {message_id}")
         attachment_digest = attachment_fingerprint(attachments[0])
+        mapping_correct = attachment_digest == expected_attachment_by_id[message_id]
+        if not mapping_correct:
+            raise ValueError(f"P1 attachment mapping mismatch: {message_id}")
+        correct_attachment_mapping += 1
+        other_expected_digests = {
+            digest
+            for other_id, digest in expected_attachment_by_id.items()
+            if other_id != message_id
+        }
+        attachment_cross_contamination += int(
+            attachment_digest in other_expected_digests
+        )
         attachment_digests.add(attachment_digest)
         attachment_identity_records.append(
             {
@@ -450,6 +578,7 @@ def build_selective_results(
                 "skillsheet_fingerprint": "",
                 "attachment_count": 1,
                 "source": "derived_input",
+                "mapping_correct": mapping_correct,
             }
         )
     if len(attachment_digests) != 2:
@@ -472,6 +601,7 @@ def build_selective_results(
             "ambiguous_classified": len(ambiguous_records),
             "unknown_classified": len(unknown_records),
             "project_route_output": len(project_records),
+            "resource_03_bypass_output": len(resource_records),
             "skillsheet_output": 0,
             "normalized_skillsheet_output": 0,
             "five_step_count": 0,
@@ -480,7 +610,10 @@ def build_selective_results(
             "join_missing": 0,
             "duplicate_ids": 0,
             "body_cross_contamination": body_cross_contamination,
-            "attachment_cross_contamination": 0,
+            "attachment_cross_contamination": attachment_cross_contamination,
+            "correct_attachment_mapping": correct_attachment_mapping,
+            "attachment_missing": 0,
+            "duplicate_attachment_mapping": 0,
             "profile_marker_retained": profile_marker_retained,
             "attachment_identity_distinct": len(attachment_digests),
             "skillsheet_identity_distinct": 0,
@@ -490,7 +623,8 @@ def build_selective_results(
                 success_cache["version_changed_subject_count"] == 2
             ),
             "contract_06_ready": False,
-            "steps_03_04_05_executed": False,
+            "selective_03_04_05_contract_completed": False,
+            "project_steps_03_executed": False,
             "steps_06_plus_executed": False,
             "llm_api_calls": 0,
             "external_url_calls": 0,
@@ -502,6 +636,7 @@ def build_selective_results(
             "cleanup": cleanup_records,
             "classification": classification_records,
             "project_route": project_records,
+            "resource_03_bypass": resource_records,
             "resource_route": resource_records,
             "fetch_skillsheet": [],
             "normalize_skillsheet": [],
@@ -527,6 +662,7 @@ def build_selective_results(
             "ambiguous_classified": len(ambiguous_records),
             "unknown_classified": len(unknown_records),
             "project_route_output": 0,
+            "resource_03_bypass_output": len(resource_records),
             "skillsheet_output": 0,
             "normalized_skillsheet_output": 0,
             "five_step_count": 0,
@@ -535,7 +671,10 @@ def build_selective_results(
             "join_missing": 0,
             "duplicate_ids": 0,
             "body_cross_contamination": body_cross_contamination,
-            "attachment_cross_contamination": 0,
+            "attachment_cross_contamination": attachment_cross_contamination,
+            "correct_attachment_mapping": correct_attachment_mapping,
+            "attachment_missing": 0,
+            "duplicate_attachment_mapping": 0,
             "profile_marker_retained": profile_marker_retained,
             "attachment_identity_distinct": len(attachment_digests),
             "skillsheet_identity_distinct": 0,
@@ -545,7 +684,8 @@ def build_selective_results(
                 success_cache["version_changed_subject_count"] == 2
             ),
             "contract_06_ready": False,
-            "steps_03_04_05_executed": False,
+            "selective_03_04_05_contract_completed": False,
+            "project_steps_03_executed": False,
             "steps_06_plus_executed": False,
             "llm_api_calls": 0,
             "external_url_calls": 0,
@@ -557,6 +697,7 @@ def build_selective_results(
             "cleanup": cleanup_records,
             "classification": classification_records,
             "project_route": [],
+            "resource_03_bypass": resource_records,
             "resource_route": resource_records,
             "fetch_skillsheet": [],
             "normalize_skillsheet": [],
@@ -577,53 +718,112 @@ def build_selective_results(
     attachment_identity_records = []
     attachment_digests = set()
     skillsheet_digests: Set[str] = set()
-    for message_id in ordered_ids:
-        attachments = master_by_id[message_id].get("attachments")
-        if not isinstance(attachments, list) or len(attachments) != 1:
-            raise ValueError(f"derived item must have one attachment: {message_id}")
-        attachment = attachments[0]
-        if not fetch_module.is_eligible_attachment(attachment):
-            raise ValueError(f"04-1 attachment is not eligible: {message_id}")
-        skillsheet_text = fetch_module.extract_from_attachment(attachment)
-        quality_error = fetch_module.validate_skillsheet_text(skillsheet_text)
-        if quality_error is not None:
-            raise ValueError(f"04-1 skillsheet quality failure: {message_id}:{quality_error}")
-        fetch_record = {
-            "message_id": message_id,
-            "skillsheet": skillsheet_text,
-            "source": "attachment",
-            "success": True,
-            "urls": False,
-        }
-        fetch_records.append(fetch_record)
-        normalized_records.append(normalize_module.build_record(fetch_record))
-        attachment_digest = attachment_fingerprint(attachment)
-        skillsheet_digest = "sha256:" + hashlib.sha256(
-            skillsheet_text.encode("utf-8")
-        ).hexdigest()
-        attachment_digests.add(attachment_digest)
-        skillsheet_digests.add(skillsheet_digest)
-        attachment_identity_records.append(
-            {
-                "message_id": message_id,
-                "attachment_fingerprint": attachment_digest,
-                "skillsheet_fingerprint": skillsheet_digest,
-                "attachment_count": 1,
-                "source": "attachment",
-            }
-        )
+    skillsheet_content_mapping = 0
+    skillsheet_cross_contamination = 0
+
+    def _forbid_url_path(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("external URL path is forbidden in selective replay")
+
+    original_url_builder = fetch_module.build_url_candidates
+    fetch_module.build_url_candidates = _forbid_url_path
+    try:
+        for message_id in ordered_ids:
+            attachments = master_by_id[message_id].get("attachments")
+            if not isinstance(attachments, list) or len(attachments) != 1:
+                raise ValueError(f"derived item must have one attachment: {message_id}")
+            attachment = attachments[0]
+            fetch_record = fetch_module.fetch_skillsheet(
+                message_id,
+                master_by_id[message_id],
+                cleanup_by_id[message_id],
+            )
+            if (
+                fetch_record.get("success") is not True
+                or fetch_record.get("source") != "attachment"
+                or fetch_record.get("urls") is not False
+            ):
+                raise ValueError(f"04-1 attachment-only fetch failed: {message_id}")
+            skillsheet_text = str(fetch_record.get("skillsheet", ""))
+            own_marker_found = any(
+                marker in skillsheet_text for marker in skillsheet_markers[message_id]
+            )
+            foreign_marker_found = False
+            for other_id in ordered_ids:
+                if other_id == message_id:
+                    continue
+                if any(
+                    marker in skillsheet_text
+                    for marker in skillsheet_markers[other_id]
+                ):
+                    foreign_marker_found = True
+            if not own_marker_found or foreign_marker_found:
+                raise ValueError(f"04 skillsheet item contamination: {message_id}")
+            skillsheet_content_mapping += 1
+            skillsheet_cross_contamination += int(foreign_marker_found)
+            fetch_records.append(fetch_record)
+            normalized_record = normalize_module.build_record(fetch_record)
+            if not any(
+                marker in str(normalized_record.get("skillsheet", ""))
+                for marker in skillsheet_markers[message_id]
+            ):
+                raise ValueError(f"04-2 removed item identity marker: {message_id}")
+            normalized_records.append(normalized_record)
+            attachment_digest = attachment_fingerprint(attachment)
+            skillsheet_digest = "sha256:" + hashlib.sha256(
+                skillsheet_text.encode("utf-8")
+            ).hexdigest()
+            attachment_digests.add(attachment_digest)
+            skillsheet_digests.add(skillsheet_digest)
+            attachment_identity_records.append(
+                {
+                    "message_id": message_id,
+                    "attachment_fingerprint": attachment_digest,
+                    "expected_attachment_fingerprint": expected_attachment_by_id[message_id],
+                    "skillsheet_fingerprint": skillsheet_digest,
+                    "attachment_count": 1,
+                    "source": "attachment",
+                    "mapping_correct": attachment_digest
+                    == expected_attachment_by_id[message_id],
+                    "own_content_marker_found": own_marker_found,
+                    "foreign_content_marker_found": foreign_marker_found,
+                }
+            )
+    finally:
+        fetch_module.build_url_candidates = original_url_builder
     if len(attachment_digests) != 2 or len(skillsheet_digests) != 2:
         raise ValueError("04 attachment or skillsheet identity is not isolated")
 
     five_results = _build_five_results(
         modules, ordered_ids, master_by_id, cleanup_by_id
     )
-    expected_ids = set(ordered_ids)
     for key, records in five_results.items():
         if len(records) != 2 or {record.get("message_id") for record in records} != expected_ids:
             raise ValueError(f"05 join failure: {key}")
         if not all(FIVE_REQUIRED_KEYS[key] <= set(record) for record in records):
             raise ValueError(f"05 schema failure: {key}")
+
+    five_schema_errors = _five_schema_error_count(five_results)
+    if five_schema_errors:
+        raise ValueError(f"05/06 schema type failure: {five_schema_errors}")
+    normalized_schema_errors = sum(
+        int(
+            not NORMALIZED_REQUIRED_KEYS <= set(record)
+            or record.get("success") is not True
+            or not isinstance(record.get("skillsheet"), str)
+            or not record.get("skillsheet")
+        )
+        for record in normalized_records
+    )
+    resource_text_schema_errors = sum(
+        int(
+            not isinstance(record.get("message_id"), str)
+            or not isinstance(record.get("body_text"), str)
+            or not record.get("body_text")
+        )
+        for record in cleanup_records
+    )
+    if normalized_schema_errors or resource_text_schema_errors:
+        raise ValueError("04/06 resource text or skillsheet schema failure")
 
     all_stage_records = [cleanup_records, classification_records, fetch_records, normalized_records]
     all_stage_records.extend(five_results.values())
@@ -635,6 +835,14 @@ def build_selective_results(
         len(records) - len({record.get("message_id") for record in records})
         for records in all_stage_records
     )
+    joined_item_ids = set(expected_ids)
+    for records in (fetch_records, normalized_records, *five_results.values()):
+        joined_item_ids &= {record.get("message_id") for record in records}
+    original_id_join_key_uses = sum(
+        record.get("message_id") in original_ids
+        for records in all_stage_records
+        for record in records
+    )
     production_after = _production_artifact_snapshot()
     production_write = int(production_before != production_after)
     if production_write:
@@ -642,19 +850,41 @@ def build_selective_results(
 
     report = {
         "result": "PASS",
+        "blocking_stage": "",
+        "blocking_reason": "",
         "derived_input": len(ordered_ids),
         "cleanup_output": len(cleanup_records),
+        "classification_output": len(classification_records),
         "resource_output": len(resource_records),
+        "project_classified": len(project_records),
+        "ambiguous_classified": len(ambiguous_records),
+        "unknown_classified": len(unknown_records),
         "project_route_output": len(project_records),
+        "resource_03_bypass_output": len(resource_records),
         "skillsheet_output": len(fetch_records),
         "normalized_skillsheet_output": len(normalized_records),
         "five_step_count": len(five_results),
         "five_records_per_step": 2,
+        "five_joined_items": len(joined_item_ids),
+        "skillsheet_five_joined_items": len(joined_item_ids),
+        "five_schema_errors": five_schema_errors,
+        "normalized_schema_errors": normalized_schema_errors,
+        "resource_text_schema_errors": resource_text_schema_errors,
+        "schema_compatibility": (
+            five_schema_errors == 0
+            and normalized_schema_errors == 0
+            and resource_text_schema_errors == 0
+        ),
         "message_id_continuity": join_missing == 0 and duplicate_ids == 0,
         "join_missing": join_missing,
         "duplicate_ids": duplicate_ids,
         "body_cross_contamination": body_cross_contamination,
-        "attachment_cross_contamination": 0,
+        "attachment_cross_contamination": attachment_cross_contamination,
+        "skillsheet_cross_contamination": skillsheet_cross_contamination,
+        "correct_attachment_mapping": correct_attachment_mapping,
+        "skillsheet_content_mapping": skillsheet_content_mapping,
+        "attachment_missing": 0,
+        "duplicate_attachment_mapping": 0,
         "profile_marker_retained": profile_marker_retained,
         "attachment_identity_distinct": len(attachment_digests),
         "skillsheet_identity_distinct": len(skillsheet_digests),
@@ -664,14 +894,23 @@ def build_selective_results(
             success_cache["version_changed_subject_count"] == 2
         ),
         "contract_06_ready": True,
-        "steps_03_04_05_executed": True,
+        "selective_03_04_05_contract_completed": True,
+        "project_steps_03_executed": False,
+        "resource_steps_04_05_executed": True,
         "steps_06_plus_executed": False,
+        "original_id_join_key_uses": original_id_join_key_uses,
         "llm_api_calls": 0,
         "external_url_calls": 0,
         "production_changes": 0,
         "production_write": production_write,
     }
-    if body_cross_contamination or join_missing or duplicate_ids:
+    if (
+        body_cross_contamination
+        or skillsheet_cross_contamination
+        or join_missing
+        or duplicate_ids
+        or original_id_join_key_uses
+    ):
         raise ValueError("selective pipeline contract failed")
 
     return {
@@ -679,6 +918,7 @@ def build_selective_results(
         "cleanup": cleanup_records,
         "classification": classification_records,
         "project_route": project_records,
+        "resource_03_bypass": resource_records,
         "resource_route": resource_records,
         "fetch_skillsheet": fetch_records,
         "normalize_skillsheet": normalized_records,
@@ -696,6 +936,7 @@ def write_selective_results(results: Dict[str, Any]) -> None:
     write_jsonl(str(result_dir / "01-4_cleanup.jsonl"), results["cleanup"])
     write_jsonl(str(result_dir / "02-1_classification.jsonl"), results["classification"])
     write_jsonl(str(result_dir / "03_project_input.jsonl"), results["project_route"])
+    write_jsonl(str(result_dir / "03_resource_bypass.jsonl"), results["resource_03_bypass"])
     write_jsonl(str(result_dir / "05_resource_input.jsonl"), results["resource_route"])
     write_jsonl(str(result_dir / "04-1_fetch_skillsheets_text.jsonl"), results["fetch_skillsheet"])
     write_jsonl(str(result_dir / "04-2_normalize_skillsheets_text.jsonl"), results["normalize_skillsheet"])
