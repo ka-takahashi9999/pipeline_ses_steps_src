@@ -1,10 +1,11 @@
 {
   "config_id": "ichi_r_inline_summary",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "source_company": "イチアール株式会社",
+  "delivery_semantics": "UNKNOWN",
   "selectors": {
     "sender_domain": "1-r.co.jp",
-    "subject_regex": "サーバエンジニアのご紹介です！.*2名で1人月希望.*【弊社フリーランス】"
+    "subject_regex": "サーバエンジニアのご紹介です！.*【弊社フリーランス】"
   },
   "item_start_regex": "(?m)^■氏名：(?P<identifier>[A-Z](?:\\.[A-Z]\\.?|[A-Z]))[ \\t]*$",
   "separator_regex": "(?m)^＝{4,}[ \\t]*$",
@@ -15,14 +16,26 @@
     "■所属",
     "■スキル"
   ],
-  "expected_item_count": 2,
+  "cardinality": {
+    "primary": {
+      "authority": "DECLARED_COUNT",
+      "source": "subject",
+      "count_regex": "[（(](?P<count>[0-9]+)名で1人月希望[）)]"
+    },
+    "cross_checks": [
+      {
+        "authority": "STRUCTURAL_COMPLETE",
+        "source": "INLINE_BODY"
+      }
+    ]
+  },
   "item_type": "resource",
   "canonical_subject_semantic_part": "要員ご紹介: サーバエンジニア / イチアール株式会社",
   "canonical_subject_template": "要員ご紹介: サーバエンジニア / イチアール株式会社 [MI:{logical_short}/{version_short}]",
-  "canonical_body_classification_context": "弊社フリーランスのサーバエンジニアを2名ご紹介いたします。",
+  "canonical_body_classification_context": "弊社フリーランスのサーバエンジニアを{delivery_count}名ご紹介いたします。",
   "footer_end_regex": "(?m)^＝{4,}[ \\t]*\\n(?:[ \\t]*\\n)?(?:なお、弊社で営業中の要員リストは以下のスプレッドシートにてご確認いただけます。[ \\t]*\\n)?【営業中エンジニア一覧スプレッドシート】[ \\t]*$",
   "attachment_mapping": {
-    "strategy": "regex_extract_normalized_exact",
+    "strategy": "ONE_ARTIFACT_PER_ITEM_EXACT_KEY",
     "filename_field": "filename",
     "filename_identifier_regex": "^(?:(?P<label>スキルシート\\())?(?P<identifier>(?(label)[A-Z]\\.[A-Z]|[A-Z]{2}))(?(label)\\)_[0-9]{8}|【[^/\\\\【】]+駅】)\\.xlsx$",
     "identifier_group": "identifier",

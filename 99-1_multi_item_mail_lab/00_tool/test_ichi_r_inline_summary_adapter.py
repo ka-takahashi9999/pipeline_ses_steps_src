@@ -17,6 +17,7 @@ for import_path in (
     STEP_DIR / "00_tool",
     STEP_DIR / "00_tool" / "adapters" / "inline_summary",
     STEP_DIR / "00_tool" / "canonicalize",
+    STEP_DIR / "00_tool" / "core",
     STEP_DIR / "00_tool" / "source_identity",
 ):
     if str(import_path) not in sys.path:
@@ -254,7 +255,7 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
         )
 
     def test_16_classification_context_is_natural_resource_signal(self) -> None:
-        context = self.adapter.config["canonical_body_classification_context"]
+        context = self._parse_fixture().items[0]["body_text"]
         self.assertIn("弊社フリーランス", context)
         self.assertIn("サーバエンジニア", context)
         self.assertIn("2名", context)

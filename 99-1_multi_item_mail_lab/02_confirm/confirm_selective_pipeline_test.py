@@ -69,49 +69,63 @@ def main() -> None:
         raise SystemExit(1)
     report = reports[0]
     derived_ids = {record.get("message_id") for record in derived}
+    expected_count = len(derived)
+    derived_attachment_counts = {
+        record.get("message_id"): len(record.get("attachments", []))
+        for record in derived
+    }
     distribution = {
         mail_type: sum(1 for record in classifications if record.get("mail_type") == mail_type)
         for mail_type in ("resource", "project", "ambiguous", "unknown")
     }
 
-    _check(len(derived) == 2 and len(derived_ids) == 2, "derived input must be unique 2", failures)
-    _check(len(cleanup) == 2, "01-4 output count must be 2", failures)
     _check(
-        distribution == {"resource": 2, "project": 0, "ambiguous": 0, "unknown": 0},
+        len(derived_ids) == expected_count,
+        "derived input cardinality must be unique",
+        failures,
+    )
+    _check(len(cleanup) == expected_count, "01-4 output count mismatch", failures)
+    _check(
+        distribution
+        == {"resource": expected_count, "project": 0, "ambiguous": 0, "unknown": 0},
         "observed 02-1 distribution changed",
         failures,
     )
     _check(project_route == [], "resource items must not enter project-only 03", failures)
     _check(
-        len(resource_bypass) == 2
+        len(resource_bypass) == expected_count
         and {record.get("message_id") for record in resource_bypass} == derived_ids,
-        "03 resource bypass identity must be 2/2",
+        "03 resource bypass identity cardinality mismatch",
         failures,
     )
     _check(
-        len(resource_route) == 2
+        len(resource_route) == expected_count
         and {record.get("message_id") for record in resource_route} == derived_ids,
-        "05 resource route identity must be 2/2",
+        "05 resource route identity cardinality mismatch",
         failures,
     )
     _check(
-        len(fetch) == 2
+        len(fetch) == expected_count
         and all(record.get("success") is True for record in fetch)
         and all(record.get("source") == "attachment" for record in fetch),
-        "04-1 attachment fetch must succeed 2/2",
+        "04-1 attachment fetch cardinality mismatch",
         failures,
     )
     _check(
-        len(normalized) == 2
+        len(normalized) == expected_count
         and all(record.get("clean_char_count", 0) > 0 for record in normalized),
-        "04-2 normalization must succeed 2/2",
+        "04-2 normalization cardinality mismatch",
         failures,
     )
     _check(
-        len(attachment_identity) == 2
-        and all(record.get("attachment_count") == 1 for record in attachment_identity)
+        len(attachment_identity) == expected_count
+        and all(
+            record.get("attachment_count")
+            == derived_attachment_counts.get(record.get("message_id"))
+            for record in attachment_identity
+        )
         and all(record.get("mapping_correct") is True for record in attachment_identity),
-        "04 attachment mapping must be correct 2/2",
+        "04 attachment mapping cardinality mismatch",
         failures,
     )
     _check(
@@ -125,11 +139,11 @@ def main() -> None:
     )
     _check(
         all(
-            len(records) == 2
+            len(records) == expected_count
             and {record.get("message_id") for record in records} == derived_ids
             for records in five_outputs.values()
         ),
-        "05 output join must be 2/2 for all resource steps",
+        "05 output join cardinality mismatch for resource steps",
         failures,
     )
     _check(report.get("result") == "PASS", "selective result must be PASS", failures)
@@ -163,7 +177,9 @@ def main() -> None:
         logger.error(f"selective confirm NG: failures={len(failures)}")
         raise SystemExit(1)
     logger.ok(
-        "selective confirm OK: derived=2 03_bypass=2 04=2 05=2x10 06_READY=YES"
+        f"selective confirm OK: derived={expected_count} "
+        f"03_bypass={len(resource_bypass)} 04={len(fetch)} "
+        f"05={expected_count}x{len(five_outputs)} 06_READY=YES"
     )
 
 

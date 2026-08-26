@@ -14,6 +14,7 @@ for import_path in (
     PROJECT_ROOT,
     STEP_DIR / "00_tool" / "adapters" / "inline_summary",
     STEP_DIR / "00_tool" / "canonicalize",
+    STEP_DIR / "00_tool" / "core",
     STEP_DIR / "00_tool" / "source_identity",
 ):
     if str(import_path) not in sys.path:
@@ -45,8 +46,11 @@ def _audit_record(
     status: str,
     reasons: List[str],
     item: Dict[str, Any] = None,
+    source: Dict[str, Any] = None,
+    containers: List[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     item = item or {}
+    source = source or {}
     return {
         "original_message_id": str(mail.get("message_id", "")),
         "logical_item_id": item.get("logical_item_id", ""),
@@ -55,6 +59,13 @@ def _audit_record(
         "item_type": adapter.config["item_type"],
         "source_type": "inline_summary",
         "source_company": adapter.config["source_company"],
+        "source_fingerprint": source.get("source_fingerprint", ""),
+        "delivery_semantics": source.get("delivery_semantics", "UNKNOWN"),
+        "acquisition_status": source.get("acquisition_status", "INCOMPLETE"),
+        "cardinality_evidence": source.get("cardinality_evidence", []),
+        "completeness_result": source.get("completeness_result", {}),
+        "container_references": source.get("container_references", []),
+        "container_contracts": containers or [],
         "config_id": adapter.config["config_id"],
         "config_version": adapter.config["version"],
         "adapter_id": ADAPTER_ID,
@@ -63,11 +74,17 @@ def _audit_record(
         "original_timestamp": str(mail.get("date", "")),
         "body_fingerprint": item.get("body_fingerprint", ""),
         "attachment_fingerprint": item.get("attachment_fingerprint", ""),
+        "artifact_set_fingerprint": item.get("artifact_set_fingerprint", ""),
+        "version_relevant_artifact_set_fingerprint": item.get(
+            "version_relevant_artifact_set_fingerprint", ""
+        ),
         "version_fingerprint": item.get("version_fingerprint", ""),
         "content_fingerprint": item.get("content_fingerprint", ""),
         "parse_status": status,
         "parse_reasons": reasons,
         "attachment_mapping": item.get("attachment_mapping", {}),
+        "item_artifacts": item.get("item_artifacts", []),
+        "identity_evidence": item.get("identity_evidence", {}),
     }
 
 
@@ -81,16 +98,41 @@ def process_records(
     audits: List[Dict[str, Any]] = []
     occurrences: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     mail_statuses = Counter()
+    expected_occurrences = 0
 
     for mail in selected:
         result = adapter.parse(mail)
         mail_statuses[result.status] += 1
+        validated_count = result.source.get("completeness_result", {}).get(
+            "expected_count"
+        )
+        if isinstance(validated_count, int) and not isinstance(validated_count, bool):
+            expected_occurrences += validated_count
         if result.status == "PARSED":
             for item in result.items:
-                audits.append(_audit_record(mail, adapter, result.status, result.reasons, item))
+                audits.append(
+                    _audit_record(
+                        mail,
+                        adapter,
+                        result.status,
+                        result.reasons,
+                        item,
+                        result.source,
+                        result.containers,
+                    )
+                )
                 occurrences.append((mail, item))
         else:
-            audits.append(_audit_record(mail, adapter, result.status, result.reasons))
+            audits.append(
+                _audit_record(
+                    mail,
+                    adapter,
+                    result.status,
+                    result.reasons,
+                    source=result.source,
+                    containers=result.containers,
+                )
+            )
 
     overlay_by_id: Dict[str, Dict[str, Any]] = {}
     identity_payload_by_id: Dict[str, Tuple[str, str, str, str, str]] = {}
@@ -99,7 +141,7 @@ def process_records(
         identity_payload = (
             item["logical_item_id"],
             item["body_fingerprint"],
-            item["attachment_fingerprint"],
+            item["artifact_set_fingerprint"],
             item["version_fingerprint"],
             item["body_text"],
         )
@@ -115,7 +157,12 @@ def process_records(
     logical_ids = {item["logical_item_id"] for _, item in occurrences}
     body_fingerprints = {item["body_fingerprint"] for _, item in occurrences}
     attachment_fingerprints = {
-        item["attachment_fingerprint"] for _, item in occurrences
+        item["attachment_fingerprint"]
+        for _, item in occurrences
+        if item["attachment_fingerprint"]
+    }
+    artifact_set_fingerprints = {
+        item["artifact_set_fingerprint"] for _, item in occurrences
     }
     version_fingerprints = {item["version_fingerprint"] for _, item in occurrences}
     logical_versions = {
@@ -123,7 +170,6 @@ def process_records(
         for _, item in occurrences
     }
     derived_ids = [item["derived_item_id"] for _, item in occurrences]
-    expected_occurrences = len(selected) * adapter.config["expected_item_count"]
     artifacts = {
         "audit_items": audits,
         "derived_mail_master": overlays,
@@ -136,11 +182,13 @@ def process_records(
         "partial_mails": mail_statuses["PARTIAL"],
         "human_review_mails": mail_statuses["HUMAN_REVIEW"],
         "unsupported_mails": mail_statuses["UNSUPPORTED"],
+        "system_failure_mails": mail_statuses["SYSTEM_FAILURE"],
         "parsed_occurrences": len(occurrences),
         "derived_item_occurrences": len(occurrences),
         "logical_distinct": len(logical_ids),
         "body_distinct": len(body_fingerprints),
         "attachment_distinct": len(attachment_fingerprints),
+        "artifact_set_distinct": len(artifact_set_fingerprints),
         "version_distinct": len(logical_versions),
         "content_distinct": len(version_fingerprints),
         "derived_versions": len(set(derived_ids)),

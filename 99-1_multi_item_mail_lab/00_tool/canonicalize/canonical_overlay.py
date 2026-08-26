@@ -31,6 +31,6 @@ def build_canonical_overlay(source_mail: Dict[str, Any], item: Dict[str, Any]) -
         "reply_to": source_mail.get("reply_to", ""),
         "subject": item["canonical_subject"],
         "body_text": item["body_text"],
-        "attachments": [item["attachment"]],
+        "attachments": list(item.get("attachments", [])),
         "html_links": item.get("html_links", []),
     }

@@ -1,7 +1,8 @@
 {
   "config_id": "netwisdom_inline_summary",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "source_company": "NetWisdom",
+  "delivery_semantics": "UNKNOWN",
   "selectors": {
     "sender_domain": "netwisdom.co.jp",
     "subject_regex": "NetWisdom"
@@ -12,13 +13,19 @@
     "面接予定",
     "結果待ち"
   ],
-  "expected_item_count": 2,
+  "cardinality": {
+    "primary": {
+      "authority": "STRUCTURAL_COMPLETE",
+      "source": "INLINE_BODY"
+    },
+    "cross_checks": []
+  },
   "item_type": "resource",
   "canonical_subject_template": "要員ご提案: 個別要員 / NetWisdom株式会社 [MI:{logical_short}/{version_short}]",
   "canonical_body_classification_context": "弊社9月入場要員（個別提案）を提案させて頂きます。\n\n是非ともご検討のほどよろしくお願いします。",
   "footer_end_regex": "(?m)^\\s*以上.*$",
   "attachment_mapping": {
-    "strategy": "regex_extract_normalized_exact",
+    "strategy": "ONE_ARTIFACT_PER_ITEM_EXACT_KEY",
     "filename_field": "filename",
     "filename_identifier_regex": "^(?:skillsheet|履歴書)-(?P<identifier>[^/\\\\]+)\\.xlsx$",
     "identifier_group": "identifier",

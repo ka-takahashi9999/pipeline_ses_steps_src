@@ -4,9 +4,10 @@
 import base64
 import binascii
 import hashlib
+import json
 import re
 import unicodedata
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 
 def normalize_content(value: str) -> str:
@@ -59,8 +60,57 @@ def attachment_fingerprint(attachment: Dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def version_fingerprint(body_digest: str, attachment_digest: str) -> str:
-    source = body_digest + "|" + attachment_digest
+def artifact_set_fingerprint(
+    item_artifacts: Iterable[Dict[str, Any]],
+    version_relevant_only: bool = False,
+) -> str:
+    """Hash a deterministic set of 0..N item-artifact relations."""
+    canonical_rows: List[Dict[str, Any]] = []
+    for relation in item_artifacts:
+        if version_relevant_only and relation.get("version_relevant") is not True:
+            continue
+        row = {
+            "role": relation.get("role"),
+            "artifact_kind": relation.get("artifact_kind"),
+            "stable_locator": relation.get("stable_locator"),
+            "content_sha256": relation.get("content_sha256"),
+            "version_relevant": relation.get("version_relevant"),
+        }
+        if row["role"] not in {"PRIMARY", "SUPPORTING", "SHARED", "SOURCE_EVIDENCE"}:
+            raise ValueError("artifact relation role is unsupported")
+        if not isinstance(row["artifact_kind"], str) or not row["artifact_kind"]:
+            raise ValueError("artifact kind is missing")
+        if not isinstance(row["stable_locator"], str):
+            raise ValueError("artifact stable locator is not a string")
+        if (
+            not isinstance(row["content_sha256"], str)
+            or not row["content_sha256"].startswith("sha256:")
+        ):
+            raise ValueError("artifact content SHA-256 is missing")
+        if not isinstance(row["version_relevant"], bool):
+            raise ValueError("artifact version relevance is not boolean")
+        canonical_rows.append(row)
+
+    canonical_rows.sort(
+        key=lambda row: (
+            row["role"],
+            row["artifact_kind"],
+            row["stable_locator"],
+            row["content_sha256"],
+            row["version_relevant"],
+        )
+    )
+    encoded = json.dumps(
+        canonical_rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def version_fingerprint(body_digest: str, relevant_artifact_set_digest: str) -> str:
+    source = body_digest + "|" + relevant_artifact_set_digest
     return "sha256:" + hashlib.sha256(source.encode("ascii")).hexdigest()
 
 

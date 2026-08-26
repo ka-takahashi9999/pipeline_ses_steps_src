@@ -16,6 +16,7 @@ for import_path in (
     STEP_DIR / "00_tool",
     STEP_DIR / "00_tool" / "adapters" / "inline_summary",
     STEP_DIR / "00_tool" / "canonicalize",
+    STEP_DIR / "00_tool" / "core",
     STEP_DIR / "00_tool" / "source_identity",
 ):
     if str(import_path) not in sys.path:
@@ -69,13 +70,14 @@ class InlineSummaryAdapterTest(unittest.TestCase):
         self.assertGreaterEqual(mail["body_text"].count("-" * 20), 3)
         self.assertEqual("PARSED", self.adapter.parse(mail).status)
 
-    def test_one_block_when_two_expected_is_partial_and_atomic(self) -> None:
+    def test_one_complete_block_and_one_artifact_is_parsed(self) -> None:
         mail = copy.deepcopy(self.fixtures[0])
         second_anchor = mail["body_text"].index("技術者: RESOURCE-B2")
         mail["body_text"] = mail["body_text"][:second_anchor] + "以上、1名です。"
+        mail["attachments"] = mail["attachments"][:1]
         result = self.adapter.parse(mail)
-        self.assertEqual("PARTIAL", result.status)
-        self.assertEqual([], result.items)
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(1, len(result.items))
 
     def test_attachments_map_one_to_one(self) -> None:
         result = self.adapter.parse(self.fixtures[0])

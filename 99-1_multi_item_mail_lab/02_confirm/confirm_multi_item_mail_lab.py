@@ -46,6 +46,13 @@ AUDIT_KEYS = {
     "item_type",
     "source_type",
     "source_company",
+    "source_fingerprint",
+    "delivery_semantics",
+    "acquisition_status",
+    "cardinality_evidence",
+    "completeness_result",
+    "container_references",
+    "container_contracts",
     "config_id",
     "config_version",
     "adapter_id",
@@ -54,11 +61,15 @@ AUDIT_KEYS = {
     "original_timestamp",
     "body_fingerprint",
     "attachment_fingerprint",
+    "artifact_set_fingerprint",
+    "version_relevant_artifact_set_fingerprint",
     "version_fingerprint",
     "content_fingerprint",
     "parse_status",
     "parse_reasons",
     "attachment_mapping",
+    "item_artifacts",
+    "identity_evidence",
 }
 
 
@@ -94,6 +105,9 @@ def main() -> None:
         record.get("attachment_fingerprint") for record in audits
     }
     version_fingerprints = {record.get("version_fingerprint") for record in audits}
+    artifact_set_fingerprints = {
+        record.get("artifact_set_fingerprint") for record in audits
+    }
     logical_versions = {
         (record.get("logical_item_id"), record.get("version_fingerprint"))
         for record in audits
@@ -102,8 +116,17 @@ def main() -> None:
     overlay_by_id = {record.get("message_id"): record for record in overlays}
 
     _check(len(original_ids) == 4, "input mail count must be 4", failures)
-    _check(len(audits) == 8, "audit item occurrence count must be 8", failures)
-    _check(statuses == {"PARSED": 8}, "all 8 occurrences must be PARSED", failures)
+    expected_occurrences = summary.get("expected_item_occurrences")
+    _check(
+        len(audits) == expected_occurrences,
+        "audit item occurrence count must match validated cardinality",
+        failures,
+    )
+    _check(
+        statuses == {"PARSED": expected_occurrences},
+        "all validated occurrences must be PARSED",
+        failures,
+    )
     _check(len(logical_ids) == 2, "logical distinct must be 2", failures)
     _check(len(body_fingerprints) == 2, "body distinct must be 2", failures)
     _check(
@@ -118,7 +141,10 @@ def main() -> None:
         all(
             isinstance(fingerprint, str) and fingerprint.startswith("sha256:")
             for fingerprint in (
-                body_fingerprints | attachment_fingerprints | version_fingerprints
+                body_fingerprints
+                | attachment_fingerprints
+                | artifact_set_fingerprints
+                | version_fingerprints
             )
         ),
         "all audit fingerprints must be SHA-256 values",
@@ -126,7 +152,7 @@ def main() -> None:
     )
     _check(
         all(record.get("attachment_mapping", {}).get("status") == "MAPPED" for record in audits),
-        "all 8 attachment mappings must be MAPPED",
+        "all attachment mappings must be MAPPED",
         failures,
     )
     _check(all(set(record) == AUDIT_KEYS for record in audits), "audit schema mismatch", failures)
@@ -141,13 +167,17 @@ def main() -> None:
         "mail master overlay schema mismatch",
         failures,
     )
+    audit_by_derived = {}
+    for record in audits:
+        audit_by_derived.setdefault(record.get("derived_item_id"), record)
     _check(
         all(
             isinstance(record.get("attachments"), list)
-            and len(record["attachments"]) == 1
+            and len(record["attachments"])
+            == len(audit_by_derived[record["message_id"]].get("item_artifacts", []))
             for record in overlays
         ),
-        "every overlay item must have exactly one attachment",
+        "overlay attachment cardinality must match item-artifact relations",
         failures,
     )
     _check(
@@ -190,8 +220,13 @@ def main() -> None:
         failures,
     )
     _check(
-        summary.get("attachment_mapping_success") == 8,
-        "attachment mapping success count must be 8",
+        summary.get("system_failure_mails") == 0,
+        "SYSTEM_FAILURE mail count must be 0",
+        failures,
+    )
+    _check(
+        summary.get("attachment_mapping_success") == expected_occurrences,
+        "attachment mapping success count must match validated cardinality",
         failures,
     )
     _check(
@@ -212,8 +247,9 @@ def main() -> None:
     )
 
     logger.info(
-        "counts: input=4 expected=8 parsed=8 "
-        f"overlay={len(overlays)} logical=2 mapped=8"
+        f"counts: input=4 expected={expected_occurrences} "
+        f"parsed={len(audits)} overlay={len(overlays)} "
+        f"logical={len(logical_ids)} mapped={summary.get('attachment_mapping_success')}"
     )
     representative_records = [
         record

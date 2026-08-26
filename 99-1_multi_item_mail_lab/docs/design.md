@@ -1,15 +1,26 @@
-# 99-1 P1 Inline Multi-resource Adapter
+# 99-1 Variable Multi-item Core
 
 This directory is a test-only lab. It is not imported by the production pipeline.
 
-The shared `inline_summary` adapter reads company-specific structure from JSON config.
-For NetWisdom, two `技術者:` anchors and long separators delimit two resource blocks.
-Each anchor identifier must match exactly one normalized attachment filename. Any mail-level
-count mismatch becomes `PARTIAL`; ambiguous attachment mapping becomes `HUMAN_REVIEW`.
-Only `PARSED` items are emitted to the canonical overlay.
+The lab contract is `Source -> Container -> 0..N ItemCandidate -> Completeness Gate ->
+Identity / Version -> Canonical Item`. Runtime company config does not declare a fixed item
+count. NetWisdom uses complete inline structure as its cardinality authority. Ichi-R reads a
+declared count from the subject and cross-checks complete inline structure. Unknown or
+incomplete cardinality emits no canonical items.
 
-Logical identity hashes company, item type, and the normalized block identifier. Content
-identity hashes the normalized item body. The derived ID hashes both, so an unchanged resend
-is deduplicated while a content change creates another deterministic version. Audit output
-retains every delivery occurrence; the mail-master-compatible overlay retains one record per
-derived version.
+`INLINE_BODY` and `ATTACHMENT_FILE` containers are implemented. Other container kinds are
+contract values only and have no parser in this issue. NetWisdom and Ichi-R retain their
+exact filename relation as the `ONE_ARTIFACT_PER_ITEM_EXACT_KEY` strategy; it is one strategy
+on top of the shared 0..N item-artifact relation model.
+
+The source-atomic completeness gate checks acquisition, required containers, enumeration,
+cardinality agreement, candidate parsing, artifact relations, and delivery-local identity
+collisions. Only `PARSED` emits all candidates; every other status emits zero items.
+
+Logical identity hashes company, item type, and the normalized block identifier. Version
+identity combines the normalized item-body fingerprint with a deterministically sorted
+artifact-set fingerprint. Artifact order therefore does not affect the version, while a
+version-relevant artifact content change does. Audit output retains Source, Container,
+cardinality, completeness, identity evidence, and every delivery occurrence. The canonical
+overlay remains an ordinary mail equivalent with item-only body, 0..N attachments, and
+item-specific links.

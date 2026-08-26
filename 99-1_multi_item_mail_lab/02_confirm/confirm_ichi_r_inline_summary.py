@@ -14,6 +14,7 @@ for import_path in (
     STEP_DIR / "00_tool",
     STEP_DIR / "00_tool" / "adapters" / "inline_summary",
     STEP_DIR / "00_tool" / "canonicalize",
+    STEP_DIR / "00_tool" / "core",
     STEP_DIR / "00_tool" / "source_identity",
 ):
     if str(import_path) not in sys.path:

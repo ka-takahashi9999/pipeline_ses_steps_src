@@ -27,6 +27,7 @@ from common.file_utils import ensure_result_dirs
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from identity import (
+    artifact_set_fingerprint,
     attachment_fingerprint,
     canonical_subject,
     version_fingerprint,
@@ -249,17 +250,26 @@ def _index(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 def _expected_attachment_fingerprints(
     audit_records: List[Dict[str, Any]],
     expected_ids: Set[str],
-) -> Dict[str, str]:
-    expected: Dict[str, str] = {}
+) -> Dict[str, List[str]]:
+    expected: Dict[str, List[str]] = {}
     for message_id in expected_ids:
-        fingerprints = {
-            record.get("attachment_fingerprint")
+        artifact_sets = {
+            tuple(
+                sorted(
+                    artifact.get("content_sha256")
+                    for artifact in record.get("item_artifacts", [])
+                    if artifact.get("artifact_kind") == "ATTACHMENT_FILE"
+                )
+            )
             for record in audit_records
             if record.get("derived_item_id") == message_id
         }
-        if len(fingerprints) != 1 or None in fingerprints or "" in fingerprints:
+        if len(artifact_sets) != 1:
             raise ValueError(f"P1 attachment audit is inconsistent: {message_id}")
-        expected[message_id] = next(iter(fingerprints))
+        fingerprints = list(next(iter(artifact_sets)))
+        if any(not fingerprint for fingerprint in fingerprints):
+            raise ValueError(f"P1 attachment fingerprint is missing: {message_id}")
+        expected[message_id] = fingerprints
     return expected
 
 
@@ -363,8 +373,13 @@ def _build_success_cache_contract(
         changed_attachment = "sha256:" + hashlib.sha256(
             (audit["attachment_fingerprint"] + "|selective-change").encode("ascii")
         ).hexdigest()
+        changed_relations = [dict(relation) for relation in audit["item_artifacts"]]
+        changed_relations[0]["content_sha256"] = changed_attachment
+        changed_artifact_set = artifact_set_fingerprint(
+            changed_relations, version_relevant_only=True
+        )
         changed_version = version_fingerprint(
-            audit["body_fingerprint"], changed_attachment
+            audit["body_fingerprint"], changed_artifact_set
         )
         changed_subject = canonical_subject(
             config["canonical_subject_template"],
@@ -467,12 +482,13 @@ def build_selective_results(
     master_records = read_jsonl_as_list(str(DERIVED_MASTER))
     input_id_records = read_jsonl_as_list(str(DERIVED_INPUT_IDS))
     audit_records = read_jsonl_as_list(str(P1_AUDIT))
-    if len(master_records) != 2 or len(input_id_records) != 2:
-        raise ValueError("selective test requires exactly two P1 derived items")
+    if len(master_records) != len(input_id_records):
+        raise ValueError("derived master and validated input cardinality differ")
     master_by_id = _index(master_records)
     ordered_ids = [record["message_id"] for record in input_id_records]
     expected_ids = set(ordered_ids)
-    if len(set(ordered_ids)) != 2 or set(ordered_ids) != set(master_by_id):
+    expected_count = len(ordered_ids)
+    if len(set(ordered_ids)) != expected_count or set(ordered_ids) != set(master_by_id):
         raise ValueError("derived input IDs do not match derived mail master")
     if not all(message_id.startswith("mi_") for message_id in ordered_ids):
         raise ValueError("non-derived message_id found in selective input")
@@ -555,36 +571,39 @@ def build_selective_results(
     attachment_cross_contamination = 0
     for message_id in ordered_ids:
         attachments = master_by_id[message_id].get("attachments")
-        if not isinstance(attachments, list) or len(attachments) != 1:
-            raise ValueError(f"derived item must have one attachment: {message_id}")
-        attachment_digest = attachment_fingerprint(attachments[0])
-        mapping_correct = attachment_digest == expected_attachment_by_id[message_id]
+        if not isinstance(attachments, list):
+            raise ValueError(f"derived attachments must be a list: {message_id}")
+        attachment_values = [attachment_fingerprint(value) for value in attachments]
+        mapping_correct = sorted(attachment_values) == sorted(
+            expected_attachment_by_id[message_id]
+        )
         if not mapping_correct:
             raise ValueError(f"P1 attachment mapping mismatch: {message_id}")
         correct_attachment_mapping += 1
         other_expected_digests = {
             digest
-            for other_id, digest in expected_attachment_by_id.items()
+            for other_id, digests in expected_attachment_by_id.items()
             if other_id != message_id
+            for digest in digests
         }
-        attachment_cross_contamination += int(
-            attachment_digest in other_expected_digests
+        attachment_cross_contamination += sum(
+            digest in other_expected_digests for digest in attachment_values
         )
-        attachment_digests.add(attachment_digest)
+        attachment_digests.update(attachment_values)
         attachment_identity_records.append(
             {
                 "message_id": message_id,
-                "attachment_fingerprint": attachment_digest,
+                "attachment_fingerprint": attachment_values[0]
+                if len(attachment_values) == 1
+                else "",
                 "skillsheet_fingerprint": "",
-                "attachment_count": 1,
+                "attachment_count": len(attachment_values),
                 "source": "derived_input",
                 "mapping_correct": mapping_correct,
             }
         )
-    if len(attachment_digests) != 2:
-        raise ValueError("derived attachment identities are not isolated")
 
-    if len(resource_records) != 2 or project_records or ambiguous_records or unknown_records:
+    if len(resource_records) != expected_count or project_records or ambiguous_records or unknown_records:
         production_after = _production_artifact_snapshot()
         production_write = int(production_before != production_after)
         if production_write:
@@ -592,7 +611,7 @@ def build_selective_results(
         report = {
             "result": "FAIL",
             "blocking_stage": "02-1",
-            "blocking_reason": "expected resource=2",
+            "blocking_reason": f"expected resource={expected_count}",
             "derived_input": len(ordered_ids),
             "cleanup_output": len(cleanup_records),
             "classification_output": len(classification_records),
@@ -618,9 +637,9 @@ def build_selective_results(
             "attachment_identity_distinct": len(attachment_digests),
             "skillsheet_identity_distinct": 0,
             "from_subject_collision": success_cache["from_subject_collision"],
-            "success_cache_stable": success_cache["stable_subject_count"] == 2,
+            "success_cache_stable": success_cache["stable_subject_count"] == expected_count,
             "success_cache_version_subject_change": (
-                success_cache["version_changed_subject_count"] == 2
+                success_cache["version_changed_subject_count"] == expected_count
             ),
             "contract_06_ready": False,
             "selective_03_04_05_contract_completed": False,
@@ -679,9 +698,9 @@ def build_selective_results(
             "attachment_identity_distinct": len(attachment_digests),
             "skillsheet_identity_distinct": 0,
             "from_subject_collision": success_cache["from_subject_collision"],
-            "success_cache_stable": success_cache["stable_subject_count"] == 2,
+            "success_cache_stable": success_cache["stable_subject_count"] == expected_count,
             "success_cache_version_subject_change": (
-                success_cache["version_changed_subject_count"] == 2
+                success_cache["version_changed_subject_count"] == expected_count
             ),
             "contract_06_ready": False,
             "selective_03_04_05_contract_completed": False,
@@ -729,8 +748,15 @@ def build_selective_results(
     try:
         for message_id in ordered_ids:
             attachments = master_by_id[message_id].get("attachments")
-            if not isinstance(attachments, list) or len(attachments) != 1:
-                raise ValueError(f"derived item must have one attachment: {message_id}")
+            if not isinstance(attachments, list):
+                raise ValueError(f"derived attachments must be a list: {message_id}")
+            expected_artifacts = expected_attachment_by_id[message_id]
+            if len(attachments) != len(expected_artifacts):
+                raise ValueError(f"P1 exact artifact count mismatch: {message_id}")
+            if len(attachments) != 1:
+                raise ValueError(
+                    f"P1 downstream compatibility requires its validated single artifact: {message_id}"
+                )
             attachment = attachments[0]
             fetch_record = fetch_module.fetch_skillsheet(
                 message_id,
@@ -778,26 +804,26 @@ def build_selective_results(
                 {
                     "message_id": message_id,
                     "attachment_fingerprint": attachment_digest,
-                    "expected_attachment_fingerprint": expected_attachment_by_id[message_id],
+                    "expected_attachment_fingerprint": expected_attachment_by_id[message_id][0],
                     "skillsheet_fingerprint": skillsheet_digest,
                     "attachment_count": 1,
                     "source": "attachment",
                     "mapping_correct": attachment_digest
-                    == expected_attachment_by_id[message_id],
+                    == expected_attachment_by_id[message_id][0],
                     "own_content_marker_found": own_marker_found,
                     "foreign_content_marker_found": foreign_marker_found,
                 }
             )
     finally:
         fetch_module.build_url_candidates = original_url_builder
-    if len(attachment_digests) != 2 or len(skillsheet_digests) != 2:
-        raise ValueError("04 attachment or skillsheet identity is not isolated")
+    if correct_attachment_mapping != expected_count:
+        raise ValueError("P1 attachment mapping count is incomplete")
 
     five_results = _build_five_results(
         modules, ordered_ids, master_by_id, cleanup_by_id
     )
     for key, records in five_results.items():
-        if len(records) != 2 or {record.get("message_id") for record in records} != expected_ids:
+        if len(records) != expected_count or {record.get("message_id") for record in records} != expected_ids:
             raise ValueError(f"05 join failure: {key}")
         if not all(FIVE_REQUIRED_KEYS[key] <= set(record) for record in records):
             raise ValueError(f"05 schema failure: {key}")
@@ -864,7 +890,7 @@ def build_selective_results(
         "skillsheet_output": len(fetch_records),
         "normalized_skillsheet_output": len(normalized_records),
         "five_step_count": len(five_results),
-        "five_records_per_step": 2,
+        "five_records_per_step": expected_count,
         "five_joined_items": len(joined_item_ids),
         "skillsheet_five_joined_items": len(joined_item_ids),
         "five_schema_errors": five_schema_errors,
@@ -889,9 +915,9 @@ def build_selective_results(
         "attachment_identity_distinct": len(attachment_digests),
         "skillsheet_identity_distinct": len(skillsheet_digests),
         "from_subject_collision": success_cache["from_subject_collision"],
-        "success_cache_stable": success_cache["stable_subject_count"] == 2,
+        "success_cache_stable": success_cache["stable_subject_count"] == expected_count,
         "success_cache_version_subject_change": (
-            success_cache["version_changed_subject_count"] == 2
+            success_cache["version_changed_subject_count"] == expected_count
         ),
         "contract_06_ready": True,
         "selective_03_04_05_contract_completed": True,
