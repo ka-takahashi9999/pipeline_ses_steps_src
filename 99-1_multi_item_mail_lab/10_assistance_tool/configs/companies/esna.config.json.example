@@ -1,0 +1,44 @@
+{
+  "config_id": "esna_inline_summary",
+  "version": "1.0.0",
+  "source_company": "株式会社ESNA",
+  "delivery_semantics": "UNKNOWN",
+  "selectors": {
+    "sender_domain": "esna.jp",
+    "subject_regex": "^【ESNA要員情報】弊社プロパをご紹介いたします"
+  },
+  "item_start_regex": "(?m)^━{10,}[ \\t]*\\n(?:[ \\t]*\\n)*■氏[ \\t　]*名[：:][ \\t]*(?P<identifier>[A-ZＡ-Ｚ](?:[・.．]?[A-ZＡ-Ｚ]))(?=[ \\t]*＜)",
+  "separator_regex": "(?m)^━{10,}[ \\t]*$",
+  "required_profile_markers": [
+    "■所 属",
+    "■最 寄",
+    "■稼 働",
+    "■単 価",
+    "■備 考"
+  ],
+  "cardinality": {
+    "primary": {
+      "authority": "DECLARED_COUNT",
+      "source": "subject",
+      "count_regex": "(?P<count>[0-9０-９]+)名"
+    },
+    "cross_checks": [
+      {
+        "authority": "STRUCTURAL_COMPLETE",
+        "source": "INLINE_BODY"
+      }
+    ]
+  },
+  "item_type": "resource",
+  "canonical_subject_template": "【ESNA要員情報】弊社プロパ 個別ご紹介 [MI:{logical_short}/{version_short}]",
+  "canonical_body_classification_context": "【ESNA要員情報】弊社プロパを{delivery_count}名ご紹介いたします。",
+  "footer_end_regex": "(?m)^━{10,}[ \\t]*\\n(?:[ \\t]*\\n)*以上です。[ \\t]*$",
+  "attachment_mapping": {
+    "strategy": "ONE_ARTIFACT_PER_ITEM_EXACT_KEY",
+    "filename_field": "filename",
+    "filename_identifier_regex": "^(?:(?:スキルシート|スキルシー)_)?(?P<identifier>[A-ZＡ-Ｚ](?:[・.．]?[A-ZＡ-Ｚ]))\\.xlsx$",
+    "identifier_group": "identifier",
+    "require_one_to_one": true
+  },
+  "offline_expected_input_mails": 2
+}
