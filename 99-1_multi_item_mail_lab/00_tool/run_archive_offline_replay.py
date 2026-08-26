@@ -5,7 +5,7 @@ import copy
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 
 sys.dont_write_bytecode = True
@@ -34,6 +34,13 @@ CONFIG_PATH = (
     / "configs"
     / "archive"
     / "archive_security.v1.json.example"
+)
+ENFAST_ROLE_CONFIG_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "configs"
+    / "companies"
+    / "enfast_archive.config.json.example"
 )
 ACTUAL_INPUT = (
     PROJECT_ROOT / "01-1_fetch_gmail" / "01_result" / "fetch_gmail_mail_master.jsonl"
@@ -69,8 +76,7 @@ def _definitions(count: int) -> List[Dict[str, Any]]:
     return variable_n_definitions(count, extras)
 
 
-def _actual_record() -> Dict[str, Any]:
-    records = read_jsonl_as_list(str(ACTUAL_INPUT))
+def _actual_record(records: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     matches = [
         record
         for record in records
@@ -81,13 +87,41 @@ def _actual_record() -> Dict[str, Any]:
             if isinstance(attachment, dict)
         )
     ]
-    if not matches:
-        raise ValueError("saved Enfast archive observation not found")
-    return sorted(matches, key=lambda row: str(row.get("date", "")), reverse=True)[0]
+    return (
+        sorted(matches, key=lambda row: str(row.get("date", "")), reverse=True)[0]
+        if matches
+        else None
+    )
 
 
-def build_results() -> Dict[str, Any]:
+def _sales_supporting_contract(parser: ArchiveParser) -> Any:
+    definitions = [
+        member_definition(
+            "resource-" + chr(ord("A") + index) + ".xlsx",
+            ("resource-" + str(index)).encode("utf-8"),
+            "ITEM_CANDIDATE",
+        )
+        for index in range(4)
+    ] + [
+        member_definition(
+            "営業案内.pdf", b"sales-guidance", "SUPPORTING", zipfile.ZIP_STORED
+        )
+    ]
+    return parser.parse(
+        build_archive_fixture(
+            definitions,
+            4,
+            "synthetic-enfast-sales-supporting",
+            source_from="Enfast <common@enfast-tech.com>",
+        )
+    )
+
+
+def build_results(
+    actual_records: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     parser = ArchiveParser.from_file(CONFIG_PATH)
+    enfast_parser = ArchiveParser.from_files(CONFIG_PATH, ENFAST_ROLE_CONFIG_PATH)
     fixtures = [
         build_archive_fixture(
             _definitions(count), count, "synthetic-archive-n-" + str(count)
@@ -98,8 +132,17 @@ def build_results() -> Dict[str, Any]:
     repeated = [parser.parse(copy.deepcopy(fixture)) for fixture in fixtures]
     if [result.to_dict() for result in synthetic_results] != [result.to_dict() for result in repeated]:
         raise ValueError("archive replay is not idempotent")
-    actual_result = parser.parse(_actual_record())
-    results = synthetic_results + [actual_result]
+    supporting_result = _sales_supporting_contract(enfast_parser)
+    if supporting_result.status != "PARSED":
+        raise ValueError("Enfast supporting role synthetic contract failed")
+    records = (
+        read_jsonl_as_list(str(ACTUAL_INPUT))
+        if actual_records is None
+        else list(actual_records)
+    )
+    actual_record = _actual_record(records)
+    actual_result = enfast_parser.parse(actual_record) if actual_record else None
+    results = synthetic_results + ([actual_result] if actual_result else [])
     source_audits = [result.source for result in results]
     archive_audits = [
         dict(result.archive, source_id=result.source["source_id"], overall_status=result.status)
@@ -132,19 +175,43 @@ def build_results() -> Dict[str, Any]:
         "synthetic_child_container_total": sum(
             max(0, len(result.containers) - 2) for result in synthetic_results
         ),
+        "synthetic_container_total": sum(
+            len(result.containers) for result in synthetic_results
+        ),
         "idempotency_ok": True,
-        "actual_observation_count": 1,
-        "actual_source_id": actual_result.source["source_id"],
-        "actual_source_acquisition": actual_result.source["source_acquisition_status"],
-        "actual_zip_integrity": actual_result.archive["integrity_status"],
-        "actual_member_enumeration": actual_result.archive["enumeration_status"],
-        "actual_member_count": actual_result.archive["totals"]["members"],
-        "actual_technical_child_count": max(0, len(actual_result.containers) - 2),
-        "actual_technical_child_kinds": [
-            container["kind"] for container in actual_result.containers[2:]
-        ],
-        "actual_eligible": actual_result.eligible_item_candidate_count,
-        "actual_auto_union": actual_result.source["auto_union_eligible"],
+        "supporting_role_contract": {
+            "status": supporting_result.status,
+            "member_count": supporting_result.archive["totals"]["members"],
+            "item_candidate_count": supporting_result.archive["totals"]["item_candidates"],
+            "supporting_count": sum(
+                member["role"] == "SUPPORTING" for member in supporting_result.members
+            ),
+            "eligible_item_count": supporting_result.eligible_item_candidate_count,
+        },
+        "actual_availability": "OBSERVATION" if actual_result else "DATA_UNAVAILABLE",
+        "actual_observation_count": 1 if actual_result else 0,
+        "actual_source_id": actual_result.source["source_id"] if actual_result else None,
+        "actual_source_acquisition": (
+            actual_result.source["source_acquisition_status"] if actual_result else "DATA_UNAVAILABLE"
+        ),
+        "actual_inspection_status": actual_result.status if actual_result else "DATA_UNAVAILABLE",
+        "actual_zip_integrity": actual_result.archive["integrity_status"] if actual_result else None,
+        "actual_member_enumeration": actual_result.archive["enumeration_status"] if actual_result else None,
+        "actual_member_count": (
+            actual_result.archive.get("totals", {}).get("members")
+            if actual_result
+            else None
+        ),
+        "actual_technical_child_count": max(0, len(actual_result.containers) - 2) if actual_result else None,
+        "actual_container_tree_count": len(actual_result.containers) if actual_result else None,
+        "actual_technical_child_kinds": (
+            [container["kind"] for container in actual_result.containers[2:]]
+            if actual_result
+            else None
+        ),
+        "actual_eligible": actual_result.eligible_item_candidate_count if actual_result else None,
+        "actual_auto_union": actual_result.source["auto_union_eligible"] if actual_result else None,
+        "actual_runtime_fixed_oracle": 0,
         "production_changes": 0,
         "production_write": 0,
         "llm_api_calls": 0,
@@ -167,9 +234,10 @@ def main() -> None:
     write_jsonl(str(RESULT_DIR / "child_containers.jsonl"), results["child_containers"])
     write_jsonl(str(RESULT_DIR / "replay_summary.jsonl"), [results["summary"]])
     logger.ok(
-        "P6 archive replay OK: synthetic_N=0/1/2/4/10 actual_member="
+        "P6 archive replay OK: synthetic_N=0/1/2/4/10 supporting=PASS actual="
+        + str(results["summary"]["actual_availability"])
+        + " observed_members="
         + str(results["summary"]["actual_member_count"])
-        + " actual_eligible=0"
     )
 
 

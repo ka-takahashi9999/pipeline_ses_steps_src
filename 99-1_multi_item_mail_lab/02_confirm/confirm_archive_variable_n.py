@@ -28,7 +28,12 @@ for import_path in (
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from archive_fixture_source import build_archive_fixture, build_zip_bytes, member_definition, variable_n_definitions
-from archive_parser import ArchiveParser, MEMBER_MANIFEST_FIELD, _parse_structure
+from archive_parser import (
+    ArchiveParser,
+    MEMBER_MANIFEST_FIELD,
+    SOURCE_ITEM_EVIDENCE_FIELD,
+    _parse_structure,
+)
 from attachment_manifest_contract import canonical_ordered_entries, ordered_attachment_digest, source_payload_digest
 
 
@@ -39,6 +44,13 @@ CONFIG_PATH = (
     / "configs"
     / "archive"
     / "archive_security.v1.json.example"
+)
+ENFAST_ROLE_CONFIG_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "configs"
+    / "companies"
+    / "enfast_archive.config.json.example"
 )
 RESULT_DIR = STEP_DIR / "01_result" / "archive_variable_n"
 CONFIRM_PATH = STEP_DIR / "02_confirm" / "archive_variable_n" / "confirm_report.jsonl"
@@ -70,7 +82,9 @@ def _replace_payload(fixture: Dict[str, Any], payload: bytes) -> Dict[str, Any]:
     return result
 
 
-def _negative_contracts(parser: ArchiveParser) -> Dict[str, bool]:
+def _negative_contracts(
+    parser: ArchiveParser, enfast_parser: ArchiveParser
+) -> Dict[str, bool]:
     original_definitions = variable_n_definitions(4)
     original = build_archive_fixture(original_definitions, 4, "confirm-middle-authority")
     deleted = build_archive_fixture(
@@ -85,6 +99,73 @@ def _negative_contracts(parser: ArchiveParser) -> Dict[str, bool]:
             [member_definition("../item-001.xlsx", b"unsafe", "ITEM_CANDIDATE", zipfile.ZIP_STORED)],
             1,
             "confirm-traversal",
+        )
+    )
+    fullwidth_traversal_result = parser.parse(
+        build_archive_fixture(
+            [
+                member_definition(
+                    "supporting/..＼escape.txt",
+                    b"unsafe",
+                    "SUPPORTING",
+                    zipfile.ZIP_STORED,
+                )
+            ],
+            0,
+            "confirm-fullwidth-traversal",
+        )
+    )
+    fullwidth_collision_result = parser.parse(
+        build_archive_fixture(
+            [
+                member_definition(
+                    "supporting/dir＼a.txt", b"a", "SUPPORTING", zipfile.ZIP_STORED
+                ),
+                member_definition(
+                    "supporting/dir/a.txt", b"b", "SUPPORTING", zipfile.ZIP_STORED
+                ),
+            ],
+            0,
+            "confirm-fullwidth-collision",
+        )
+    )
+
+    sales_items = [
+        member_definition(
+            "resource-" + chr(ord("A") + index) + ".xlsx",
+            b"resource",
+            "ITEM_CANDIDATE",
+        )
+        for index in range(4)
+    ]
+    sales_supporting = member_definition(
+        "営業案内.pdf", b"sales", "SUPPORTING", zipfile.ZIP_STORED
+    )
+    sales_result = enfast_parser.parse(
+        build_archive_fixture(
+            sales_items + [sales_supporting],
+            4,
+            "confirm-sales-supporting",
+            source_from="Enfast <common@enfast-tech.com>",
+        )
+    )
+    sales_mismatch = build_archive_fixture(
+        sales_items[:3] + [sales_supporting],
+        3,
+        "confirm-sales-mismatch",
+        source_from="Enfast <common@enfast-tech.com>",
+    )
+    sales_mismatch[SOURCE_ITEM_EVIDENCE_FIELD].update(
+        {"count": 4, "item_keys": ["resource-A", "resource-B", "resource-C", "resource-D"]}
+    )
+    sales_mismatch_result = enfast_parser.parse(sales_mismatch)
+    sales_unknown_result = enfast_parser.parse(
+        build_archive_fixture(
+            sales_items
+            + [member_definition("謎ファイル.pdf", b"unknown", "UNKNOWN")],
+            4,
+            "confirm-sales-unknown",
+            source_from="Enfast <common@enfast-tech.com>",
         )
     )
 
@@ -129,6 +210,32 @@ def _negative_contracts(parser: ArchiveParser) -> Dict[str, bool]:
             traversal_result.archive["security_status"] == "FAIL"
             and traversal_result.eligible_item_candidate_count == 0
         ),
+        "fullwidth_path_traversal": (
+            fullwidth_traversal_result.archive["security_status"] == "FAIL"
+            and fullwidth_traversal_result.eligible_item_candidate_count == 0
+        ),
+        "fullwidth_normalized_collision": (
+            fullwidth_collision_result.archive["security_status"] == "FAIL"
+            and any(
+                reason.startswith("duplicate_normalized_member:")
+                for reason in fullwidth_collision_result.reasons
+            )
+        ),
+        "sales_supporting_role": (
+            sales_result.status == "PARSED"
+            and sales_result.archive["totals"]["members"] == 5
+            and sales_result.archive["totals"]["item_candidates"] == 4
+            and sales_result.members[4]["role"] == "SUPPORTING"
+            and sales_result.eligible_item_candidate_count == 4
+        ),
+        "sales_cardinality_mismatch": (
+            sales_mismatch_result.eligible_item_candidate_count == 0
+            and "source_item_candidate_count_mismatch" in sales_mismatch_result.reasons
+        ),
+        "sales_unknown_fail_closed": (
+            sales_unknown_result.status == "HUMAN_REVIEW"
+            and sales_unknown_result.eligible_item_candidate_count == 0
+        ),
         "nested_detect_only": (
             nested_result.status == "UNSUPPORTED"
             and nested_result.archive["nested_expansion_performed"] is False
@@ -166,12 +273,21 @@ def main() -> None:
     if not records["summary"]:
         sys.exit(1)
     summary = records["summary"][0]
-    _check(len(records["source"]) == 6, "source audit count must be 5 synthetic + 1 actual", failures)
-    _check(len(records["archive"]) == 6, "archive audit count must match source count", failures)
-    _check(len(records["member"]) == summary.get("synthetic_member_total") + summary.get("actual_member_count"), "member audit count mismatch", failures)
+    actual_observation_count = summary.get("actual_observation_count")
+    _check(actual_observation_count in {0, 1}, "actual observation count must be zero or one", failures)
+    _check(len(records["source"]) == 5 + actual_observation_count, "source audit count mismatch", failures)
+    _check(len(records["archive"]) == len(records["source"]), "archive audit count must match source count", failures)
+    _check(
+        len(records["member"])
+        == summary.get("synthetic_member_total")
+        + (summary.get("actual_member_count") or 0),
+        "member audit count mismatch",
+        failures,
+    )
     _check(
         len(records["containers"])
-        == 2 * len(records["source"]) + summary.get("synthetic_child_container_total") + summary.get("actual_technical_child_count"),
+        == summary.get("synthetic_container_total")
+        + (summary.get("actual_container_tree_count") or 0),
         "container tree count mismatch",
         failures,
     )
@@ -179,12 +295,34 @@ def main() -> None:
     _check(summary.get("synthetic_eligible_counts") == [0, 1, 2, 4, 10], "eligible variable-N mismatch", failures)
     _check(summary.get("synthetic_statuses") == ["PARSED"] * 5, "synthetic archive status mismatch", failures)
     _check(summary.get("idempotency_ok") is True, "idempotency failed", failures)
-    _check(summary.get("actual_source_acquisition") == "UNVERIFIED", "actual acquisition must remain unverified", failures)
-    _check(summary.get("actual_zip_integrity") == "COMPLETE", "actual ZIP integrity mismatch", failures)
-    _check(summary.get("actual_member_enumeration") == "COMPLETE", "actual enumeration mismatch", failures)
-    _check(summary.get("actual_member_count") == 1, "actual observed member must be one", failures)
-    _check(summary.get("actual_technical_child_kinds") == ["SPREADSHEET"], "actual technical child mismatch", failures)
-    _check(summary.get("actual_eligible") == 0 and summary.get("actual_auto_union") is False, "actual must remain ineligible", failures)
+    _check(
+        summary.get("supporting_role_contract")
+        == {
+            "status": "PARSED",
+            "member_count": 5,
+            "item_candidate_count": 4,
+            "supporting_count": 1,
+            "eligible_item_count": 4,
+        },
+        "sales supporting role contract mismatch",
+        failures,
+    )
+    _check(summary.get("actual_runtime_fixed_oracle") == 0, "actual fixed oracle must be zero", failures)
+    if actual_observation_count == 1:
+        _check(summary.get("actual_availability") == "OBSERVATION", "actual availability mismatch", failures)
+        _check(summary.get("actual_source_acquisition") == "UNVERIFIED", "actual acquisition must remain unverified", failures)
+        _check(summary.get("actual_eligible") == 0, "actual must remain ineligible", failures)
+        _check(summary.get("actual_auto_union") is False, "actual auto-union must remain disabled", failures)
+        _check(isinstance(summary.get("actual_technical_child_kinds"), list), "actual observed child kinds type mismatch", failures)
+        if summary.get("actual_member_enumeration") == "COMPLETE":
+            _check(isinstance(summary.get("actual_member_count"), int), "actual observed member count type mismatch", failures)
+        else:
+            _check(summary.get("actual_member_count") is None, "failed actual inspection must not invent member count", failures)
+    else:
+        _check(summary.get("actual_availability") == "DATA_UNAVAILABLE", "missing actual must be explicit", failures)
+        _check(summary.get("actual_source_acquisition") == "DATA_UNAVAILABLE", "missing actual acquisition status mismatch", failures)
+        _check(summary.get("actual_member_count") is None, "missing actual member count must be unknown", failures)
+        _check(summary.get("actual_technical_child_kinds") is None, "missing actual child kinds must be unknown", failures)
     _check(
         all(
             isinstance(row.get("position"), int)
@@ -208,7 +346,10 @@ def main() -> None:
         failures,
     )
 
-    negative = _negative_contracts(ArchiveParser.from_file(CONFIG_PATH))
+    negative = _negative_contracts(
+        ArchiveParser.from_file(CONFIG_PATH),
+        ArchiveParser.from_files(CONFIG_PATH, ENFAST_ROLE_CONFIG_PATH),
+    )
     for name, passed in negative.items():
         _check(passed, "negative contract failed:" + name, failures)
 
@@ -221,7 +362,10 @@ def main() -> None:
         "error_count": len(failures),
         "variable_n": [0, 1, 2, 4, 10],
         "negative_contracts": negative,
+        "supporting_role_contract": summary.get("supporting_role_contract"),
+        "actual_availability": summary.get("actual_availability"),
         "actual_source_acquisition": summary.get("actual_source_acquisition"),
+        "actual_inspection_status": summary.get("actual_inspection_status"),
         "actual_member_count": summary.get("actual_member_count"),
         "actual_eligible": summary.get("actual_eligible"),
         "failures": failures,
@@ -237,9 +381,12 @@ def main() -> None:
         logger.error("P6 archive confirm NG: failures=" + str(len(failures)))
         sys.exit(1)
     logger.ok(
-        "P6 archive confirm OK: sources=6 members="
+        "P6 archive confirm OK: sources="
+        + str(len(records["source"]))
+        + " members="
         + str(len(records["member"]))
-        + " variable_N=0/1/2/4/10 actual=UNVERIFIED/eligible0"
+        + " variable_N=0/1/2/4/10 supporting=PASS actual="
+        + str(summary.get("actual_availability"))
     )
 
 

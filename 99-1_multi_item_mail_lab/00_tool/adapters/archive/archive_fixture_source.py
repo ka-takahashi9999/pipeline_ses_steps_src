@@ -26,12 +26,10 @@ VALID_ROLES = {
 
 
 def _producer_collision_key(name: str, is_directory: bool) -> str:
-    value = name.replace("\\", "/")
+    value = unicodedata.normalize("NFKC", name).replace("\\", "/")
     if is_directory and value.endswith("/"):
         value = value[:-1]
-    return "/".join(
-        unicodedata.normalize("NFKC", segment) for segment in value.split("/")
-    ).casefold()
+    return value.casefold()
 
 
 def _producer_technical_kind(name: str, is_directory: bool) -> str:
@@ -136,6 +134,7 @@ def build_archive_fixture(
     item_count: int,
     message_id: str = "synthetic-archive-p6",
     archive_filename: str = "profiles.zip",
+    source_from: str = "Synthetic <archive@example.invalid>",
 ) -> Dict[str, Any]:
     payload, expected = build_zip_bytes(definitions)
     source_item_keys = [
@@ -149,7 +148,7 @@ def build_archive_fixture(
         "message_id": message_id,
         "thread_id": "synthetic-archive-thread",
         "date": "Thu, 27 Aug 2026 00:00:00 +0000",
-        "from": "Synthetic <archive@example.invalid>",
+        "from": source_from,
         "to": ["test@example.invalid"],
         "cc": "",
         "reply_to": "",

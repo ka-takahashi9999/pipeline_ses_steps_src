@@ -13,6 +13,7 @@ import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field, replace
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -212,6 +213,11 @@ def _strict_base64url_decode(value: Any) -> bytes:
     return decoded
 
 
+def _canonical_separator_path(raw_name: str) -> str:
+    """Apply Unicode normalization before the final separator interpretation."""
+    return unicodedata.normalize("NFKC", raw_name).replace("\\", "/")
+
+
 def _path_contract(raw_name: str, is_directory: bool, limits: Dict[str, Any]) -> Tuple[str, List[str]]:
     reasons: List[str] = []
     if not raw_name:
@@ -220,22 +226,23 @@ def _path_contract(raw_name: str, is_directory: bool, limits: Dict[str, Any]) ->
         reasons.append("path_control_character")
     if "\x00" in raw_name:
         reasons.append("path_nul")
-    separator_name = raw_name.replace("\\", "/")
-    if raw_name.startswith(("/", "\\")):
+    separator_name = _canonical_separator_path(raw_name)
+    if any(ord(character) < 32 or ord(character) == 127 for character in separator_name):
+        reasons.append("path_normalized_control_character")
+    if separator_name.startswith("/"):
         reasons.append("path_absolute_or_unc")
     if separator_name.startswith("//"):
         reasons.append("path_unc")
     if re.match(r"^[A-Za-z]:", separator_name):
         reasons.append("path_windows_drive")
     path_for_segments = separator_name[:-1] if is_directory and separator_name.endswith("/") else separator_name
-    raw_segments = path_for_segments.split("/")
-    if any(segment == "" for segment in raw_segments):
+    normalized_segments = path_for_segments.split("/")
+    if any(segment == "" for segment in normalized_segments):
         reasons.append("path_empty_segment")
-    if any(segment == "." for segment in raw_segments):
+    if any(segment == "." for segment in normalized_segments):
         reasons.append("path_dot_segment")
-    if any(segment == ".." for segment in raw_segments):
+    if any(segment == ".." for segment in normalized_segments):
         reasons.append("path_parent_segment")
-    normalized_segments = [unicodedata.normalize("NFKC", segment) for segment in raw_segments]
     if any(segment in {"", ".", ".."} for segment in normalized_segments):
         reasons.append("path_normalized_unsafe_segment")
     if any(segment.endswith((".", " ")) for segment in normalized_segments):
@@ -288,7 +295,7 @@ def _member_type(version_made_by: int, external_attr: int, name: str) -> Tuple[s
 def _technical_kind(name: str, member_type: str) -> str:
     if member_type == "DIRECTORY":
         return ContainerKind.ATTACHMENT_FILE.value
-    lower = name.casefold()
+    lower = _canonical_separator_path(name).casefold()
     if lower.endswith((".xlsx", ".xls", ".csv")):
         return ContainerKind.SPREADSHEET.value
     if lower.endswith(".pdf"):
@@ -298,8 +305,34 @@ def _technical_kind(name: str, member_type: str) -> str:
     return ContainerKind.ATTACHMENT_FILE.value
 
 
-def _classify_role(name: str, member_type: str, technical_kind: str, config: Dict[str, Any]) -> Tuple[str, str]:
-    normalized = name.replace("\\", "/")
+def _member_rule_matches(normalized_path: str, rules: Dict[str, Any]) -> bool:
+    basename = normalized_path.rsplit("/", 1)[-1]
+    exact_filenames = [
+        unicodedata.normalize("NFKC", value)
+        for value in rules.get("exact_filenames", [])
+        if isinstance(value, str)
+    ]
+    if basename in exact_filenames:
+        return True
+    if any(
+        re.fullmatch(pattern, basename, re.IGNORECASE)
+        for pattern in rules.get("anchored_filename_regexes", [])
+    ):
+        return True
+    return any(
+        re.fullmatch(pattern, normalized_path, re.IGNORECASE)
+        for pattern in rules.get("explicit_path_regexes", [])
+    )
+
+
+def _classify_role(
+    name: str,
+    member_type: str,
+    technical_kind: str,
+    config: Dict[str, Any],
+    member_role_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    normalized = _canonical_separator_path(name)
     if member_type == "DIRECTORY":
         return "DIRECTORY", ""
     if technical_kind == ContainerKind.ARCHIVE.value:
@@ -307,6 +340,19 @@ def _classify_role(name: str, member_type: str, technical_kind: str, config: Dic
     rules = config["member_roles"]
     basename = normalized.rsplit("/", 1)[-1]
     role_key = basename.rsplit(".", 1)[0].casefold()
+    explicit_rules = member_role_config or {}
+    if _member_rule_matches(
+        normalized, explicit_rules.get("item_candidate_member_rules", {})
+    ):
+        return "ITEM_CANDIDATE", role_key
+    if _member_rule_matches(
+        normalized, explicit_rules.get("supporting_member_rules", {})
+    ):
+        return "SUPPORTING", ""
+    if _member_rule_matches(
+        normalized, explicit_rules.get("shared_member_rules", {})
+    ):
+        return "SHARED", ""
     if re.search(rules["item_candidate_regex"], normalized, re.IGNORECASE):
         return "ITEM_CANDIDATE", role_key
     if re.search(rules["supporting_regex"], normalized, re.IGNORECASE):
@@ -362,7 +408,11 @@ def _find_eocd(payload: bytes) -> Tuple[int, Dict[str, Any]]:
     }
 
 
-def _parse_structure(payload: bytes, config: Dict[str, Any]) -> StructureResult:
+def _parse_structure(
+    payload: bytes,
+    config: Dict[str, Any],
+    member_role_config: Optional[Dict[str, Any]] = None,
+) -> StructureResult:
     if len(payload) < 22 or payload[:4] not in {LOCAL_SIGNATURE, EOCD_SIGNATURE}:
         raise ArchiveInputError("zip_signature_invalid")
     eocd_offset, eocd = _find_eocd(payload)
@@ -414,7 +464,9 @@ def _parse_structure(payload: bytes, config: Dict[str, Any]) -> StructureResult:
         member_type, type_reasons = _member_type(version_made_by, external_attr, name)
         collision_key, path_reasons = _path_contract(name, member_type == "DIRECTORY", config["limits"])
         technical_kind = _technical_kind(name, member_type)
-        role, role_key = _classify_role(name, member_type, technical_kind, config)
+        role, role_key = _classify_role(
+            name, member_type, technical_kind, config, member_role_config
+        )
         members.append(
             CentralMember(
                 position, name, raw_name.hex(), collision_key, compressed_size,
@@ -730,8 +782,13 @@ def validate_child_container_proof(
 class ArchiveParser:
     """Enumerate one depth-0 ZIP attachment into technical child Containers."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        member_role_config: Optional[Dict[str, Any]] = None,
+    ):
         self.config = config
+        self.member_role_config = member_role_config or {}
         if config.get("archive_format") != "ZIP":
             raise ValueError("only ZIP config is supported")
         if config.get("expansion_depth") != 0:
@@ -748,6 +805,29 @@ class ArchiveParser:
     def from_file(cls, path: Path) -> "ArchiveParser":
         with path.open(encoding="utf-8") as file_object:
             return cls(json.load(file_object))
+
+    @classmethod
+    def from_files(cls, security_path: Path, member_role_path: Path) -> "ArchiveParser":
+        with security_path.open(encoding="utf-8") as file_object:
+            security_config = json.load(file_object)
+        with member_role_path.open(encoding="utf-8") as file_object:
+            member_role_config = json.load(file_object)
+        if not isinstance(member_role_config.get("role_config_id"), str):
+            raise ValueError("member role config id is required")
+        if not isinstance(member_role_config.get("role_config_version"), str):
+            raise ValueError("member role config version is required")
+        selectors = member_role_config.get("selectors", {})
+        if not isinstance(selectors.get("sender_domain"), str) or not selectors["sender_domain"]:
+            raise ValueError("member role config sender domain is required")
+        return cls(security_config, member_role_config)
+
+    def _active_member_role_config(self, mail: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.member_role_config:
+            return {}
+        sender = parseaddr(str(mail.get("from", "")))[1]
+        sender_domain = sender.rsplit("@", 1)[-1].casefold() if "@" in sender else ""
+        configured_domain = self.member_role_config["selectors"]["sender_domain"].casefold()
+        return self.member_role_config if sender_domain == configured_domain else {}
 
     @staticmethod
     def _archive_position(mail: Dict[str, Any]) -> int:
@@ -817,6 +897,7 @@ class ArchiveParser:
         mail: Dict[str, Any],
         payload: bytes,
         source_validation: Dict[str, Any],
+        member_role_config: Dict[str, Any],
     ) -> ArchiveParseResult:
         reason = "limit_archive_compressed_bytes_exceeded"
         source_id = str(mail.get("message_id", ""))
@@ -849,6 +930,8 @@ class ArchiveParser:
                 "parser_version": PARSER_VERSION,
                 "config_id": self.config["config_id"],
                 "config_version": self.config["config_version"],
+                "member_role_config_id": member_role_config.get("role_config_id"),
+                "member_role_config_version": member_role_config.get("role_config_version"),
                 "archive_sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
                 "archive_compressed_bytes": len(payload),
                 "archive_complete": False,
@@ -1003,9 +1086,12 @@ class ArchiveParser:
         payload = _strict_base64url_decode(attachment.get("data"))
         archive_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
         source_validation = _validate_source_manifest(mail, position, payload)
+        member_role_config = self._active_member_role_config(mail)
         if len(payload) > self.config["limits"]["max_archive_compressed_bytes"]:
-            return self._archive_size_failure(mail, payload, source_validation)
-        structure = _parse_structure(payload, self.config)
+            return self._archive_size_failure(
+                mail, payload, source_validation, member_role_config
+            )
+        structure = _parse_structure(payload, self.config, member_role_config)
         members = structure.members
         central_rows = [member.authority_tuple() for member in members]
         authority = _validate_member_authority(
@@ -1170,6 +1256,8 @@ class ArchiveParser:
             "parser_version": PARSER_VERSION,
             "config_id": self.config["config_id"],
             "config_version": self.config["config_version"],
+            "member_role_config_id": member_role_config.get("role_config_id"),
+            "member_role_config_version": member_role_config.get("role_config_version"),
             "archive_sha256": archive_digest,
             "archive_compressed_bytes": len(payload),
             "eocd": structure.eocd,

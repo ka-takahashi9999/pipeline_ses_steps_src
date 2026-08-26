@@ -1,0 +1,27 @@
+{
+  "role_config_id": "enfast_archive_member_roles",
+  "role_config_version": "1.0.0",
+  "source_company": "Enfast-Tech",
+  "selectors": {
+    "sender_domain": "enfast-tech.com"
+  },
+  "item_candidate_member_rules": {
+    "exact_filenames": [],
+    "anchored_filename_regexes": [
+      "resource-[A-Za-z0-9_-]+\\.(?:xlsx|xls|csv)"
+    ],
+    "explicit_path_regexes": []
+  },
+  "supporting_member_rules": {
+    "exact_filenames": [
+      "営業案内.pdf"
+    ],
+    "anchored_filename_regexes": [],
+    "explicit_path_regexes": []
+  },
+  "shared_member_rules": {
+    "exact_filenames": [],
+    "anchored_filename_regexes": [],
+    "explicit_path_regexes": []
+  }
+}

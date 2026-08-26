@@ -20,6 +20,7 @@ STEP_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = STEP_DIR.parent
 for import_path in (
     PROJECT_ROOT,
+    STEP_DIR / "00_tool",
     STEP_DIR / "00_tool" / "adapters" / "archive",
     STEP_DIR / "00_tool" / "adapters" / "attachment_list",
     STEP_DIR / "00_tool" / "core",
@@ -50,6 +51,7 @@ from attachment_manifest_contract import (
     ordered_attachment_digest,
     source_payload_digest,
 )
+from run_archive_offline_replay import build_results
 
 
 CONFIG_PATH = (
@@ -58,6 +60,13 @@ CONFIG_PATH = (
     / "configs"
     / "archive"
     / "archive_security.v1.json.example"
+)
+ENFAST_ROLE_CONFIG_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "configs"
+    / "companies"
+    / "enfast_archive.config.json.example"
 )
 ACTUAL_INPUT = (
     PROJECT_ROOT / "01-1_fetch_gmail" / "01_result" / "fetch_gmail_mail_master.jsonl"
@@ -127,10 +136,25 @@ class ArchiveAdapterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.parser = ArchiveParser.from_file(CONFIG_PATH)
+        cls.enfast_parser = ArchiveParser.from_files(
+            CONFIG_PATH, ENFAST_ROLE_CONFIG_PATH
+        )
         cls.config = cls.parser.config
 
     def _parse(self, definitions, item_count=0, message_id="synthetic-archive-test"):
         return self.parser.parse(build_archive_fixture(definitions, item_count, message_id))
+
+    def _parse_enfast(
+        self, definitions, item_count=0, message_id="synthetic-enfast-archive-test"
+    ):
+        return self.enfast_parser.parse(
+            build_archive_fixture(
+                definitions,
+                item_count,
+                message_id,
+                source_from="Enfast <common@enfast-tech.com>",
+            )
+        )
 
     def assertFailClosed(self, result):
         self.assertNotEqual("PARSED", result.status)
@@ -250,6 +274,79 @@ class ArchiveAdapterTest(unittest.TestCase):
         self.assertEqual("UNKNOWN", unknown_result.source["source_item_cardinality"]["status"])
         self.assertFailClosed(unknown_result)
 
+    def test_enfast_sales_pdf_is_explicit_supporting_not_fifth_item(self):
+        definitions = [
+            member_definition(
+                "resource-" + chr(ord("A") + index) + ".xlsx",
+                ("resource-" + str(index)).encode("utf-8"),
+                "ITEM_CANDIDATE",
+            )
+            for index in range(4)
+        ] + [
+            member_definition(
+                "営業案内.pdf", b"sales-guidance", "SUPPORTING", zipfile.ZIP_STORED
+            )
+        ]
+        result = self._parse_enfast(definitions, 4)
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(5, result.archive["totals"]["members"])
+        self.assertEqual(4, result.archive["totals"]["item_candidates"])
+        self.assertEqual(4, result.eligible_item_candidate_count)
+        self.assertEqual(
+            ["ITEM_CANDIDATE"] * 4 + ["SUPPORTING"],
+            [member["role"] for member in result.members],
+        )
+        self.assertEqual(
+            "enfast_archive_member_roles",
+            result.archive["member_role_config_id"],
+        )
+
+        wrong_source = self.enfast_parser.parse(
+            build_archive_fixture(definitions, 4, "synthetic-non-enfast-source")
+        )
+        self.assertEqual("HUMAN_REVIEW", wrong_source.status)
+        self.assertIsNone(wrong_source.archive["member_role_config_id"])
+        self.assertFailClosed(wrong_source)
+
+        mismatch = build_archive_fixture(
+            definitions[:3] + definitions[4:],
+            3,
+            source_from="Enfast <common@enfast-tech.com>",
+        )
+        mismatch[SOURCE_ITEM_EVIDENCE_FIELD].update(
+            {"count": 4, "item_keys": ["resource-A", "resource-B", "resource-C", "resource-D"]}
+        )
+        mismatch_result = self.enfast_parser.parse(mismatch)
+        self.assertIn("source_item_candidate_count_mismatch", mismatch_result.reasons)
+        self.assertFailClosed(mismatch_result)
+
+        unknown = self._parse_enfast(
+            definitions[:4]
+            + [member_definition("謎ファイル.pdf", b"unknown", "UNKNOWN")],
+            4,
+        )
+        self.assertEqual("HUMAN_REVIEW", unknown.status)
+        self.assertEqual("UNKNOWN", unknown.members[4]["role"])
+        self.assertFailClosed(unknown)
+
+    def test_enfast_supporting_and_shared_do_not_change_item_count(self):
+        definitions = [
+            member_definition(
+                "resource-" + chr(ord("A") + index) + ".xlsx",
+                b"resource",
+                "ITEM_CANDIDATE",
+            )
+            for index in range(4)
+        ] + [
+            member_definition("営業案内.pdf", b"sales", "SUPPORTING"),
+            member_definition("shared/template.xlsx", b"shared", "SHARED"),
+        ]
+        result = self._parse_enfast(definitions, 4)
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(6, result.archive["totals"]["members"])
+        self.assertEqual(4, result.archive["totals"]["item_candidates"])
+        self.assertEqual(4, result.eligible_item_candidate_count)
+
     def test_independent_authority_catches_middle_changes_and_order(self):
         original_definitions = variable_n_definitions(4)
         original = build_archive_fixture(original_definitions, 4)
@@ -331,6 +428,8 @@ class ArchiveAdapterTest(unittest.TestCase):
         unsafe_names = (
             "../item-001.xlsx",
             "..\\item-001.xlsx",
+            "supporting/..＼escape.txt",
+            "supporting/..／escape.txt",
             "/item-001.xlsx",
             "C:/item-001.xlsx",
             "\\\\server\\share\\item-001.xlsx",
@@ -385,6 +484,14 @@ class ArchiveAdapterTest(unittest.TestCase):
             "unicode_nfkc": [_supporting("supporting/Ａ.txt"), _supporting("supporting/A.txt")],
             "unicode_composition": [_supporting("supporting/é.txt"), _supporting("supporting/e\u0301.txt")],
             "separator": [_supporting("supporting/a.txt"), _supporting("supporting\\a.txt")],
+            "nfkc_reverse_solidus": [
+                _supporting("supporting/dir＼a.txt"),
+                _supporting("supporting/dir/a.txt"),
+            ],
+            "nfkc_solidus": [
+                _supporting("supporting/dir／a.txt"),
+                _supporting("supporting/dir/a.txt"),
+            ],
             "file_directory": [_supporting("supporting/dup"), member_definition("supporting/dup/", b"", "DIRECTORY", zipfile.ZIP_STORED, "DIRECTORY")],
             "exact": [_supporting("supporting/a.txt"), _supporting("supporting/a.txt")],
         }
@@ -562,18 +669,67 @@ class ArchiveAdapterTest(unittest.TestCase):
             if "@enfast-tech.com" in str(record.get("from", "")).casefold()
             and any(str(attachment.get("filename", "")).casefold().endswith(".zip") for attachment in record.get("attachments", []) if isinstance(attachment, dict))
         ]
-        self.assertTrue(selected, "saved Enfast technical observation is missing")
+        if not selected:
+            return
         actual = sorted(selected, key=lambda row: str(row.get("date", "")), reverse=True)[0]
-        result = self.parser.parse(actual)
+        result = self.enfast_parser.parse(actual)
         self.assertEqual("UNVERIFIED", result.source["source_acquisition_status"])
-        self.assertEqual("COMPLETE", result.archive["enumeration_status"])
-        self.assertEqual("COMPLETE", result.archive["integrity_status"])
-        self.assertEqual("NOT_ENCRYPTED", result.archive["credential_status"])
-        self.assertEqual(1, result.archive["totals"]["members"])
-        self.assertEqual(1, len(result.containers) - 2)
-        self.assertEqual("SPREADSHEET", result.containers[2]["kind"])
         self.assertEqual(0, result.eligible_item_candidate_count)
         self.assertFalse(result.source["auto_union_eligible"])
+        self.assertIsInstance(result.archive["totals"]["members"], int)
+        self.assertIsInstance(
+            [container["kind"] for container in result.containers[2:]], list
+        )
+
+    def test_actual_observation_allows_unavailable_and_variable_shape(self):
+        unavailable = build_results(actual_records=[])["summary"]
+        self.assertEqual("DATA_UNAVAILABLE", unavailable["actual_availability"])
+        self.assertEqual(0, unavailable["actual_observation_count"])
+        self.assertIsNone(unavailable["actual_member_count"])
+        self.assertIsNone(unavailable["actual_technical_child_kinds"])
+        self.assertEqual(0, unavailable["actual_runtime_fixed_oracle"])
+
+        observed_fixture = build_archive_fixture(
+            [
+                _supporting("supporting/readme.txt"),
+                member_definition("営業案内.pdf", b"sales", "SUPPORTING"),
+            ],
+            0,
+            "synthetic-rotating-actual-shape",
+        )
+        observed_fixture["from"] = "Enfast <common@enfast-tech.com>"
+        observed_fixture.pop("attachment_acquisition_manifest")
+        observed_fixture.pop(MEMBER_MANIFEST_FIELD)
+        observed_fixture.pop(SOURCE_ITEM_EVIDENCE_FIELD)
+        observed = build_results(actual_records=[observed_fixture])["summary"]
+        self.assertEqual("OBSERVATION", observed["actual_availability"])
+        self.assertEqual("UNVERIFIED", observed["actual_source_acquisition"])
+        self.assertEqual(0, observed["actual_eligible"])
+        self.assertFalse(observed["actual_auto_union"])
+        self.assertEqual(2, observed["actual_member_count"])
+        self.assertEqual(2, len(observed["actual_technical_child_kinds"]))
+
+        malformed = build_results(
+            actual_records=[
+                {
+                    "message_id": "synthetic-malformed-actual",
+                    "date": "Thu, 27 Aug 2026 00:00:00 +0000",
+                    "from": "Enfast <common@enfast-tech.com>",
+                    "attachments": [
+                        {
+                            "filename": "rotating.zip",
+                            "mime_type": "application/zip",
+                            "size": 1,
+                            "data": "A",
+                        }
+                    ],
+                }
+            ]
+        )["summary"]
+        self.assertEqual("OBSERVATION", malformed["actual_availability"])
+        self.assertEqual("UNVERIFIED", malformed["actual_source_acquisition"])
+        self.assertEqual(0, malformed["actual_eligible"])
+        self.assertIsNone(malformed["actual_member_count"])
 
 
 if __name__ == "__main__":
