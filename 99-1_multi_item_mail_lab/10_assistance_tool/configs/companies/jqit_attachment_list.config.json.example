@@ -1,0 +1,32 @@
+{
+  "config_id": "jqit_attachment_list",
+  "version": "1.0.0",
+  "source_company": "株式会社JQIT",
+  "selectors": {
+    "sender_domain": "jqit.co.jp",
+    "subject_regex": "【JQITプロパー情報】"
+  },
+  "inline_profile": {
+    "declared_count_regex": "(?m)^■[^\\n]*[（(](?P<count>[0-9]+)名[）)]",
+    "item_start_regex": "(?m)^【名[　 ]*前】[：:](?P<identifier>[A-Z]\\.[A-Z])(?:[（(][^\\n]*[）)])?[ \\t]*$",
+    "station_regex": "(?m)^【最[　 ]*寄】[：:](?P<station>[^\\n]+)$",
+    "footer_regex": "(?m)^見合う案件が御座いましたら",
+    "required_profile_markers": [
+      "【名",
+      "【最",
+      "【スキル】"
+    ]
+  },
+  "attachment_roles": {
+    "item_filename_regex": "^(?:0_)?(?P<identifier>[A-Z]\\.[A-Z])(?P<station>[^_]+)_スキルシート(?:_[0-9]{8})?\\.xlsx$",
+    "shared_filename_regex": "^shared-[A-Za-z0-9._-]+\\.xlsx$",
+    "supporting_filename_regex": "^supporting-[A-Za-z0-9._-]+\\.(?:xlsx|pdf)$",
+    "inline_mime_regex": "image/.*",
+    "xlsx_mime_types": [
+      "application/octet-stream",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ]
+  },
+  "canonical_subject_template": "要員ご紹介: JQITプロパー [MI:{logical_short}/{version_short}]",
+  "canonical_body_classification_context": "株式会社JQIT所属のエンジニアを{delivery_count}名ご紹介いたします。"
+}

@@ -22,6 +22,7 @@ class DeliverySemantics(str, Enum):
 
 class ContainerKind(str, Enum):
     INLINE_BODY = "INLINE_BODY"
+    ATTACHMENT_LIST = "ATTACHMENT_LIST"
     ATTACHMENT_FILE = "ATTACHMENT_FILE"
     ARCHIVE = "ARCHIVE"
     SPREADSHEET = "SPREADSHEET"
