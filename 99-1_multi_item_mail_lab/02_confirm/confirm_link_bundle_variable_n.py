@@ -25,6 +25,7 @@ from common.json_utils import read_jsonl_as_list
 from common.logger import get_logger
 from canonical_overlay import MAIL_MASTER_KEYS
 from link_bundle_adapter import LinkBundleAdapter
+from link_bundle_fixture_source import build_source_owned_fixtures
 from run_link_bundle_offline_replay import (
     CONFIG_PATH,
     RESULT_SUBDIR,
@@ -63,11 +64,24 @@ def main() -> None:
     saved = {
         "source_audit": _read("source_audit.jsonl"),
         "link_enumeration": _read("link_enumeration.jsonl"),
-        "audit_items": _read("audit_items.jsonl"),
-        "derived_mail_master": _read("derived_mail_master.jsonl"),
-        "derived_input_ids": _read("derived_input_ids.jsonl"),
-        "cleanup": _read("01-4_cleanup.jsonl"),
-        "classification": _read("02-1_classification.jsonl"),
+        "canonical_eligible_audit_items": _read(
+            "canonical_eligible_audit_items.jsonl"
+        ),
+        "canonical_eligible_mail_master": _read(
+            "canonical_eligible_mail_master.jsonl"
+        ),
+        "canonical_eligible_input_ids": _read("canonical_eligible_input_ids.jsonl"),
+        "technical_projection_audit_items": _read(
+            "technical_projection_audit_items.jsonl"
+        ),
+        "technical_projection_mail_master": _read(
+            "technical_projection_mail_master.jsonl"
+        ),
+        "technical_projection_input_ids": _read(
+            "technical_projection_input_ids.jsonl"
+        ),
+        "technical_cleanup": _read("technical_01-4_cleanup.jsonl"),
+        "technical_classification": _read("technical_02-1_classification.jsonl"),
     }
     summaries = _read("replay_summary.jsonl")
     _check(len(summaries) == 1, "summary must contain one JSONL record", failures)
@@ -75,12 +89,24 @@ def main() -> None:
         raise SystemExit(1)
     saved["summary"] = summaries[0]
     _check(saved == fresh, "saved P4 outputs are not fresh Core/parser results", failures)
+    for legacy_canonical_filename in (
+        "audit_items.jsonl",
+        "derived_mail_master.jsonl",
+        "derived_input_ids.jsonl",
+        "01-4_cleanup.jsonl",
+        "02-1_classification.jsonl",
+    ):
+        _check(
+            _read(legacy_canonical_filename) == [],
+            f"legacy canonical path must be empty:{legacy_canonical_filename}",
+            failures,
+        )
 
     summary = fresh["summary"]
     required = {
         "input_sources": 1,
-        "parsed_sources": 1,
-        "partial_sources": 0,
+        "parsed_sources": 0,
+        "partial_sources": 1,
         "human_review_sources": 0,
         "system_failure_sources": 0,
         "actual_links": 104,
@@ -93,9 +119,13 @@ def main() -> None:
         "non_item_links": 4,
         "unknown_links": 0,
         "duplicate_item_locators": 0,
-        "canonical_resources": 50,
-        "canonical_projects": 50,
-        "canonical_total": 100,
+        "observed_canonical_candidates": 100,
+        "technical_projection_resources": 50,
+        "technical_projection_projects": 50,
+        "technical_projection_total": 100,
+        "canonical_eligible_resources": 0,
+        "canonical_eligible_projects": 0,
+        "canonical_eligible_total": 0,
         "cross_item_contamination": 0,
         "logical_distinct": 100,
         "derived_distinct": 100,
@@ -122,21 +152,54 @@ def main() -> None:
         "derived IDs must be deterministic",
         failures,
     )
+    for key, expected in {
+        "actual_acquisition_status": "UNVERIFIED",
+        "actual_container_enumeration_status": "COMPLETE",
+        "actual_role_classification_status": "PASS",
+        "actual_source_atomic_status": "PARTIAL",
+        "actual_auto_union_eligible": False,
+    }.items():
+        _check(
+            summary.get(key) == expected,
+            f"{key}:{summary.get(key)}:expected:{expected}",
+            failures,
+        )
 
     source = fresh["source_audit"][0]["source"]
     _check(
-        source.get("completeness_result", {}).get("status") == "PARSED",
-        "actual source completeness status must be PARSED",
+        source.get("source_acquisition_status") == "UNVERIFIED",
+        "actual acquisition must remain UNVERIFIED without a source manifest",
         failures,
     )
     _check(
-        all(source.get("completeness_result", {}).get("checks", {}).values()),
-        "actual completeness gate has a failed check",
+        source.get("completeness_result", {}).get("status") == "PARTIAL"
+        and source.get("completeness_result", {})
+        .get("checks", {})
+        .get("source_acquisition_complete")
+        is False,
+        "actual source atomic status must fail closed on acquisition evidence",
+        failures,
+    )
+    _check(
+        source.get("container_enumeration_status") == "COMPLETE",
+        "actual container enumeration regression failed",
+        failures,
+    )
+    _check(
+        source.get("role_classification_status") == "PASS"
+        and source.get("role_classification_count") == 104
+        and source.get("role_classification_total") == 104,
+        "actual role classification regression failed",
+        failures,
+    )
+    _check(
+        source.get("auto_union_eligible") is False,
+        "actual source must not be auto-union eligible",
         failures,
     )
     _check(
         [row.get("authority") for row in source.get("cardinality_evidence", [])]
-        == ["CONTAINER_ENUMERATION", "STRUCTURAL_COMPLETE", "SNAPSHOT_SET"],
+        == ["CONTAINER_ENUMERATION", "STRUCTURAL_COMPLETE"],
         "cardinality authority order mismatch",
         failures,
     )
@@ -159,8 +222,15 @@ def main() -> None:
         failures,
     )
 
-    audits = fresh["audit_items"]
-    overlays = fresh["derived_mail_master"]
+    _check(
+        fresh["canonical_eligible_audit_items"] == []
+        and fresh["canonical_eligible_mail_master"] == []
+        and fresh["canonical_eligible_input_ids"] == [],
+        "actual canonical eligible outputs must be empty",
+        failures,
+    )
+    audits = fresh["technical_projection_audit_items"]
+    overlays = fresh["technical_projection_mail_master"]
     _check(
         all(set(record) == MAIL_MASTER_KEYS for record in overlays),
         "canonical mail-master schema mismatch",
@@ -182,7 +252,9 @@ def main() -> None:
     )
     _check(
         all(
-            audit.get("parse_status") == "PARSED"
+            audit.get("parse_status") == "TECHNICAL_PROJECTION"
+            and audit.get("projection_kind") == "TECHNICAL_PROJECTION"
+            and audit.get("auto_union_eligible") is False
             and audit.get("identity_durability") == "PROVISIONAL_DURABLE"
             and audit.get("version_scope") == "MAIL_SNAPSHOT_LIST_ITEM"
             and audit.get("item_artifacts", [{}])[0].get("role") == "PRIMARY"
@@ -193,7 +265,8 @@ def main() -> None:
     )
 
     classifications = {
-        row["message_id"]: row["mail_type"] for row in fresh["classification"]
+        row["message_id"]: row["mail_type"]
+        for row in fresh["technical_classification"]
     }
     _check(
         all(
@@ -205,7 +278,7 @@ def main() -> None:
     )
 
     adapter = LinkBundleAdapter.from_file(CONFIG_PATH)
-    fixtures = read_jsonl_as_list(str(FIXTURE_PATH))
+    fixtures = build_source_owned_fixtures(read_jsonl_as_list(str(FIXTURE_PATH)))
     expected_counts = {(0, 0), (1, 1), (2, 1), (1, 2), (10, 4), (4, 10)}
     observed_counts = set()
     for fixture in fixtures:
@@ -214,6 +287,8 @@ def main() -> None:
         observed_counts.add((counts.get("resource"), counts.get("project")))
         _check(
             result.status == "PARSED"
+            and result.source.get("source_acquisition_status")
+            == "VERIFIED_COMPLETE"
             and len(result.items) == counts.get("resource", 0) + counts.get("project", 0),
             f"synthetic variable-N failed:{fixture.get('message_id')}",
             failures,
@@ -248,9 +323,67 @@ def main() -> None:
         failures,
     )
 
+    acquisition_cases = {"middle_insertion": unknown_result}
+    missing = copy.deepcopy(fixtures[2])
+    missing.pop("link_bundle_acquisition_manifest")
+    acquisition_cases["manifest_missing"] = adapter.parse(missing)
+
+    deletion = copy.deepcopy(fixtures[2])
+    del deletion["html_links"][4]
+    acquisition_cases["middle_deletion"] = adapter.parse(deletion)
+
+    replacement = copy.deepcopy(fixtures[2])
+    replacement["html_links"][4]["text"] = "replacement"
+    replacement["html_links"][4]["href"] = (
+        "https://cho-tatsu.com/boost/talents/replacement"
+    )
+    acquisition_cases["replacement"] = adapter.parse(replacement)
+
+    reordered = copy.deepcopy(fixtures[2])
+    reordered["html_links"][3], reordered["html_links"][4] = (
+        reordered["html_links"][4],
+        reordered["html_links"][3],
+    )
+    acquisition_cases["order"] = adapter.parse(reordered)
+
+    for field, value in (
+        ("source_id", "stale-source"),
+        ("ordered_entry_count", 999),
+        ("ordered_entry_digest", "sha256:" + "0" * 64),
+    ):
+        stale = copy.deepcopy(fixtures[2])
+        stale["link_bundle_acquisition_manifest"][field] = value
+        acquisition_cases[field] = adapter.parse(stale)
+
+    for name, result in acquisition_cases.items():
+        expected_status = "UNVERIFIED" if name == "manifest_missing" else "INCOMPLETE"
+        _check(
+            result.status != "PARSED"
+            and result.items == []
+            and result.source.get("source_acquisition_status") == expected_status,
+            f"acquisition evidence case failed:{name}",
+            failures,
+        )
+    _check(
+        acquisition_cases["middle_deletion"].source.get(
+            "container_enumeration_status"
+        )
+        == "COMPLETE",
+        "middle deletion must preserve container-complete/source-incomplete split",
+        failures,
+    )
+
     logger.info(
-        "counts: source=1 links=104 resource=50 project=50 non_item=4 "
-        "canonical=100 01-4=100 02-1=50+50"
+        "ACTUAL: acquisition=UNVERIFIED container_parse=PASS observed_links=104 "
+        "observed_candidates=100 auto_union_eligible=NO"
+    )
+    logger.info(
+        "ACTUAL TECHNICAL PROJECTION: resource=50 project=50 "
+        "01-4=100/100 02-1=50/50+50/50 ambiguous=0"
+    )
+    logger.info(
+        "SYNTHETIC: acquisition_manifest=PASS middle_deletion=PASS "
+        "insertion_replacement_order=PASS variable_N=PASS source_atomic=PASS"
     )
     for audit in audits[:3]:
         logger.info(
@@ -262,8 +395,8 @@ def main() -> None:
         logger.error(f"LINK_BUNDLE confirm NG: failures={len(failures)}")
         raise SystemExit(1)
     logger.ok(
-        "LINK_BUNDLE confirm OK: actual=104/104 canonical=100 "
-        "resource=50/50 project=50/50 synthetic=6/6 negative=fail-closed"
+        "LINK_BUNDLE confirm OK: actual_acquisition=UNVERIFIED actual_container=PASS "
+        "actual_auto_union=NO technical=100 synthetic=6/6 evidence_negative=PASS"
     )
 
 

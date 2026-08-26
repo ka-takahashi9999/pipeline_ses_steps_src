@@ -85,6 +85,7 @@ def _audit_item(
     adapter: LinkBundleAdapter,
     result: Any,
     item: Dict[str, Any],
+    projection_kind: str,
 ) -> Dict[str, Any]:
     return {
         "original_message_id": str(mail.get("message_id", "")),
@@ -97,6 +98,14 @@ def _audit_item(
         "source_fingerprint": result.source["source_fingerprint"],
         "delivery_semantics": result.source["delivery_semantics"],
         "acquisition_status": result.source["acquisition_status"],
+        "source_acquisition_status": result.source["source_acquisition_status"],
+        "container_enumeration_status": result.source[
+            "container_enumeration_status"
+        ],
+        "role_classification_status": result.source["role_classification_status"],
+        "source_atomic_status": result.source["source_atomic_status"],
+        "auto_union_eligible": result.source["auto_union_eligible"],
+        "projection_kind": projection_kind,
         "cardinality_evidence": result.source["cardinality_evidence"],
         "completeness_result": result.source["completeness_result"],
         "link_role_counts": result.source["link_role_counts"],
@@ -117,7 +126,11 @@ def _audit_item(
         ],
         "version_fingerprint": item["version_fingerprint"],
         "content_fingerprint": item["content_fingerprint"],
-        "parse_status": result.status,
+        "parse_status": (
+            result.status
+            if projection_kind == "CANONICAL_ELIGIBLE"
+            else "TECHNICAL_PROJECTION"
+        ),
         "parse_reasons": result.reasons,
         "item_artifacts": item["item_artifacts"],
         "identity_evidence": item["identity_evidence"],
@@ -162,10 +175,13 @@ def build_link_bundle_results(
     )
     production_before = _production_artifact_snapshot()
     source_audits: List[Dict[str, Any]] = []
-    audits: List[Dict[str, Any]] = []
-    overlays: List[Dict[str, Any]] = []
+    eligible_audits: List[Dict[str, Any]] = []
+    eligible_overlays: List[Dict[str, Any]] = []
+    technical_audits: List[Dict[str, Any]] = []
+    technical_overlays: List[Dict[str, Any]] = []
     link_enumeration: List[Dict[str, Any]] = []
-    parsed_items: List[Dict[str, Any]] = []
+    eligible_items: List[Dict[str, Any]] = []
+    technical_items: List[Dict[str, Any]] = []
     statuses = Counter()
     deterministic = True
     for mail in selected:
@@ -189,21 +205,29 @@ def build_link_bundle_results(
             }
             for row in result.link_enumeration
         )
-        if result.status != "PARSED":
-            continue
         for item in result.items:
-            audits.append(_audit_item(mail, adapter, result, item))
-            overlays.append(build_canonical_overlay(mail, item))
-            parsed_items.append(item)
+            eligible_audits.append(
+                _audit_item(mail, adapter, result, item, "CANONICAL_ELIGIBLE")
+            )
+            eligible_overlays.append(build_canonical_overlay(mail, item))
+            eligible_items.append(item)
+        for item in result.technical_projection_items:
+            technical_audits.append(
+                _audit_item(mail, adapter, result, item, "TECHNICAL_PROJECTION")
+            )
+            technical_overlays.append(build_canonical_overlay(mail, item))
+            technical_items.append(item)
 
-    overlays.sort(key=lambda row: row["message_id"])
-    audits.sort(key=lambda row: row["derived_item_id"])
-    cleanup_records, classification_records = _run_01_4_02_1(overlays)
+    eligible_overlays.sort(key=lambda row: row["message_id"])
+    eligible_audits.sort(key=lambda row: row["derived_item_id"])
+    technical_overlays.sort(key=lambda row: row["message_id"])
+    technical_audits.sort(key=lambda row: row["derived_item_id"])
+    cleanup_records, classification_records = _run_01_4_02_1(technical_overlays)
     classification_by_id = {
         row["message_id"]: row["mail_type"] for row in classification_records
     }
     section_by_id = {
-        item["derived_item_id"]: item["section_type"] for item in parsed_items
+        item["derived_item_id"]: item["section_type"] for item in technical_items
     }
     distribution = Counter(row["mail_type"] for row in classification_records)
     resource_correct = sum(
@@ -223,6 +247,18 @@ def build_link_bundle_results(
         if row["role"] in {"RESOURCE_ITEM", "PROJECT_ITEM"}
     ]
     production_after = _production_artifact_snapshot()
+    acquisition_states = {
+        audit["source"].get("source_acquisition_status") for audit in source_audits
+    }
+    container_states = {
+        audit["source"].get("container_enumeration_status") for audit in source_audits
+    }
+    role_states = {
+        audit["source"].get("role_classification_status") for audit in source_audits
+    }
+    atomic_states = {
+        audit["source"].get("source_atomic_status") for audit in source_audits
+    }
     summary = {
         "input_sources": len(selected),
         "parsed_sources": statuses["PARSED"],
@@ -250,18 +286,42 @@ def build_link_bundle_results(
         ),
         "unknown_links": role_counts["UNKNOWN"],
         "duplicate_item_locators": len(item_hrefs) - len(set(item_hrefs)),
-        "canonical_resources": sum(
-            item["section_type"] == "resource" for item in parsed_items
+        "actual_acquisition_status": (
+            next(iter(acquisition_states)) if len(acquisition_states) == 1 else "MIXED"
         ),
-        "canonical_projects": sum(
-            item["section_type"] == "project" for item in parsed_items
+        "actual_container_enumeration_status": (
+            next(iter(container_states)) if len(container_states) == 1 else "MIXED"
         ),
-        "canonical_total": len(parsed_items),
+        "actual_role_classification_status": (
+            next(iter(role_states)) if len(role_states) == 1 else "MIXED"
+        ),
+        "actual_source_atomic_status": (
+            next(iter(atomic_states)) if len(atomic_states) == 1 else "MIXED"
+        ),
+        "actual_auto_union_eligible": any(
+            audit["source"].get("auto_union_eligible") is True
+            for audit in source_audits
+        ),
+        "observed_canonical_candidates": len(technical_items),
+        "technical_projection_resources": sum(
+            item["section_type"] == "resource" for item in technical_items
+        ),
+        "technical_projection_projects": sum(
+            item["section_type"] == "project" for item in technical_items
+        ),
+        "technical_projection_total": len(technical_items),
+        "canonical_eligible_resources": sum(
+            item["section_type"] == "resource" for item in eligible_items
+        ),
+        "canonical_eligible_projects": sum(
+            item["section_type"] == "project" for item in eligible_items
+        ),
+        "canonical_eligible_total": len(eligible_items),
         "cross_item_contamination": _canonical_contamination_count(
-            parsed_items, adapter
+            technical_items, adapter
         ),
-        "logical_distinct": len({item["logical_item_id"] for item in parsed_items}),
-        "derived_distinct": len({item["derived_item_id"] for item in parsed_items}),
+        "logical_distinct": len({item["logical_item_id"] for item in technical_items}),
+        "derived_distinct": len({item["derived_item_id"] for item in technical_items}),
         "derived_id_deterministic": deterministic,
         "cleanup_output": len(cleanup_records),
         "cleanup_nonempty": sum(bool(row["body_text"]) for row in cleanup_records),
@@ -278,13 +338,18 @@ def build_link_bundle_results(
     return {
         "source_audit": source_audits,
         "link_enumeration": link_enumeration,
-        "audit_items": audits,
-        "derived_mail_master": overlays,
-        "derived_input_ids": [
-            {"message_id": record["message_id"]} for record in overlays
+        "canonical_eligible_audit_items": eligible_audits,
+        "canonical_eligible_mail_master": eligible_overlays,
+        "canonical_eligible_input_ids": [
+            {"message_id": record["message_id"]} for record in eligible_overlays
         ],
-        "cleanup": cleanup_records,
-        "classification": classification_records,
+        "technical_projection_audit_items": technical_audits,
+        "technical_projection_mail_master": technical_overlays,
+        "technical_projection_input_ids": [
+            {"message_id": record["message_id"]} for record in technical_overlays
+        ],
+        "technical_cleanup": cleanup_records,
+        "technical_classification": classification_records,
         "summary": summary,
     }
 
@@ -296,13 +361,33 @@ def write_link_bundle_results(results: Dict[str, Any]) -> None:
     for filename, key in (
         ("source_audit.jsonl", "source_audit"),
         ("link_enumeration.jsonl", "link_enumeration"),
-        ("audit_items.jsonl", "audit_items"),
-        ("derived_mail_master.jsonl", "derived_mail_master"),
-        ("derived_input_ids.jsonl", "derived_input_ids"),
-        ("01-4_cleanup.jsonl", "cleanup"),
-        ("02-1_classification.jsonl", "classification"),
+        ("canonical_eligible_audit_items.jsonl", "canonical_eligible_audit_items"),
+        ("canonical_eligible_mail_master.jsonl", "canonical_eligible_mail_master"),
+        ("canonical_eligible_input_ids.jsonl", "canonical_eligible_input_ids"),
+        (
+            "technical_projection_audit_items.jsonl",
+            "technical_projection_audit_items",
+        ),
+        (
+            "technical_projection_mail_master.jsonl",
+            "technical_projection_mail_master",
+        ),
+        (
+            "technical_projection_input_ids.jsonl",
+            "technical_projection_input_ids",
+        ),
+        ("technical_01-4_cleanup.jsonl", "technical_cleanup"),
+        ("technical_02-1_classification.jsonl", "technical_classification"),
     ):
         write_jsonl(str(result_dir / filename), results[key])
+    for legacy_canonical_filename in (
+        "audit_items.jsonl",
+        "derived_mail_master.jsonl",
+        "derived_input_ids.jsonl",
+        "01-4_cleanup.jsonl",
+        "02-1_classification.jsonl",
+    ):
+        write_jsonl(str(result_dir / legacy_canonical_filename), [])
     write_jsonl(str(result_dir / "replay_summary.jsonl"), [results["summary"]])
 
 
@@ -311,7 +396,8 @@ def main() -> None:
     summary = results["summary"]
     required = {
         "input_sources": 1,
-        "parsed_sources": 1,
+        "parsed_sources": 0,
+        "partial_sources": 1,
         "actual_links": 104,
         "links_classified": 104,
         "resource_headers": 1,
@@ -321,9 +407,13 @@ def main() -> None:
         "non_item_links": 4,
         "unknown_links": 0,
         "duplicate_item_locators": 0,
-        "canonical_resources": 50,
-        "canonical_projects": 50,
-        "canonical_total": 100,
+        "observed_canonical_candidates": 100,
+        "technical_projection_resources": 50,
+        "technical_projection_projects": 50,
+        "technical_projection_total": 100,
+        "canonical_eligible_resources": 0,
+        "canonical_eligible_projects": 0,
+        "canonical_eligible_total": 0,
         "cross_item_contamination": 0,
         "logical_distinct": 100,
         "derived_distinct": 100,
@@ -342,12 +432,25 @@ def main() -> None:
     ]
     if not summary.get("derived_id_deterministic"):
         failures.append("derived_id_determinism_failed")
+    expected_states = {
+        "actual_acquisition_status": "UNVERIFIED",
+        "actual_container_enumeration_status": "COMPLETE",
+        "actual_role_classification_status": "PASS",
+        "actual_source_atomic_status": "PARTIAL",
+        "actual_auto_union_eligible": False,
+    }
+    failures.extend(
+        f"{key}:{summary.get(key)}:expected:{expected}"
+        for key, expected in expected_states.items()
+        if summary.get(key) != expected
+    )
     if failures:
         raise ValueError("LINK_BUNDLE actual replay failed: " + ";".join(failures))
     write_link_bundle_results(results)
     logger.ok(
-        "LINK_BUNDLE actual replay OK: links=104 classified=104 "
-        "resource=50 project=50 canonical=100 01-4=100 02-1=50+50"
+        "LINK_BUNDLE actual replay OK: acquisition=UNVERIFIED container=COMPLETE "
+        "links=104 classified=104 observed_candidates=100 auto_union=NO "
+        "technical_01-4=100 technical_02-1=50+50"
     )
 
 

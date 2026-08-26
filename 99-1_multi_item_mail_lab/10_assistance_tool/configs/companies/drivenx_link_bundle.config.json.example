@@ -1,6 +1,6 @@
 {
   "config_id": "drivenx_link_bundle",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "source_company": "DrivenX",
   "delivery_semantics": "SNAPSHOT",
   "selectors": {
@@ -10,8 +10,7 @@
   "cardinality": {
     "primary": "CONTAINER_ENUMERATION",
     "cross_checks": [
-      "STRUCTURAL_COMPLETE",
-      "SNAPSHOT_SET"
+      "STRUCTURAL_COMPLETE"
     ]
   },
   "link_grammar": {
