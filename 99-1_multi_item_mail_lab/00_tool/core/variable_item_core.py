@@ -114,6 +114,8 @@ class Source:
     acquisition_status: str
     cardinality_evidence: List[CardinalityEvidence]
     container_references: List[str]
+    configured_primary_authority: str
+    configured_cross_check_authorities: List[str]
     artifact_relations_resolved: bool = True
     artifact_relation_reasons: List[str] = field(default_factory=list)
     completeness_result: Optional[CompletenessResult] = None
@@ -123,6 +125,17 @@ class Source:
             raise ValueError(f"unsupported delivery semantics: {self.delivery_semantics}")
         if self.acquisition_status not in {"COMPLETE", "INCOMPLETE"}:
             raise ValueError(f"unsupported acquisition status: {self.acquisition_status}")
+        valid_authorities = {value.value for value in CardinalityAuthority}
+        if self.configured_primary_authority not in valid_authorities:
+            raise ValueError(
+                "unsupported configured primary authority: "
+                + self.configured_primary_authority
+            )
+        if any(
+            authority not in valid_authorities
+            for authority in self.configured_cross_check_authorities
+        ):
+            raise ValueError("unsupported configured cross-check authority")
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -147,16 +160,6 @@ class ItemCandidate:
     artifact_relation_resolved: bool = True
     identity_evidence: Dict[str, Any] = field(default_factory=dict)
     logical_item_id: str = ""
-
-
-def _resolved_counts(evidence: Sequence[CardinalityEvidence]) -> List[int]:
-    return [
-        row.count
-        for row in evidence
-        if row.authority != CardinalityAuthority.UNKNOWN.value
-        and row.complete
-        and row.count is not None
-    ]
 
 
 def evaluate_completeness(
@@ -195,17 +198,114 @@ def evaluate_completeness(
     if not checks["container_enumeration_complete"]:
         reasons.append("container_enumeration_incomplete")
 
-    resolved_counts = _resolved_counts(source.cardinality_evidence)
-    distinct_counts = set(resolved_counts)
-    checks["cardinality_known"] = bool(resolved_counts)
-    checks["cardinality_evidence_consistent"] = len(distinct_counts) <= 1
-    expected_count = resolved_counts[0] if len(distinct_counts) == 1 else None
-    if not checks["cardinality_known"]:
-        reasons.append("cardinality_unknown")
-    if not checks["cardinality_evidence_consistent"]:
-        reasons.append(
-            "cardinality_evidence_conflict:" + ",".join(str(value) for value in sorted(distinct_counts))
+    primary_rows = [
+        evidence for evidence in source.cardinality_evidence if evidence.is_primary
+    ]
+    checks["primary_evidence_exactly_one"] = len(primary_rows) == 1
+    if not checks["primary_evidence_exactly_one"]:
+        reasons.append(f"primary_evidence_count:{len(primary_rows)}:expected:1")
+    primary = primary_rows[0] if len(primary_rows) == 1 else None
+    checks["primary_authority_matches"] = (
+        primary is not None
+        and primary.authority == source.configured_primary_authority
+    )
+    if not checks["primary_authority_matches"]:
+        reasons.append("primary_authority_missing_or_mismatch")
+    checks["primary_count_known"] = (
+        primary is not None
+        and primary.authority != CardinalityAuthority.UNKNOWN.value
+        and primary.count is not None
+    )
+    if not checks["primary_count_known"]:
+        reasons.append("primary_cardinality_unknown")
+    checks["primary_complete"] = primary is not None and primary.complete
+    if not checks["primary_complete"]:
+        reasons.append("primary_cardinality_incomplete")
+    checks["primary_unambiguous"] = primary is not None and not primary.reasons
+    if not checks["primary_unambiguous"]:
+        reasons.append("primary_cardinality_ambiguous")
+
+    primary_valid = all(
+        checks[name]
+        for name in (
+            "primary_evidence_exactly_one",
+            "primary_authority_matches",
+            "primary_count_known",
+            "primary_complete",
+            "primary_unambiguous",
         )
+    )
+    expected_count = primary.count if primary_valid and primary is not None else None
+
+    cross_checks = [
+        evidence for evidence in source.cardinality_evidence if not evidence.is_primary
+    ]
+    actual_cross_check_authorities = sorted(
+        evidence.authority for evidence in cross_checks
+    )
+    configured_cross_check_authorities = sorted(
+        source.configured_cross_check_authorities
+    )
+    checks["cross_checks_present"] = (
+        actual_cross_check_authorities == configured_cross_check_authorities
+    )
+    if not checks["cross_checks_present"]:
+        reasons.append(
+            "cross_check_evidence_mismatch:configured:"
+            + ",".join(configured_cross_check_authorities)
+            + ":actual:"
+            + ",".join(actual_cross_check_authorities)
+        )
+    checks["cross_checks_known"] = checks["cross_checks_present"] and all(
+        evidence.authority != CardinalityAuthority.UNKNOWN.value
+        and evidence.count is not None
+        for evidence in cross_checks
+    )
+    if not checks["cross_checks_known"]:
+        reasons.append("cross_check_cardinality_unknown")
+    checks["cross_checks_complete"] = checks["cross_checks_present"] and all(
+        evidence.complete for evidence in cross_checks
+    )
+    if not checks["cross_checks_complete"]:
+        reasons.append("cross_check_cardinality_incomplete")
+    checks["cross_checks_unambiguous"] = checks["cross_checks_present"] and all(
+        not evidence.reasons for evidence in cross_checks
+    )
+    if not checks["cross_checks_unambiguous"]:
+        reasons.append("cross_check_cardinality_ambiguous")
+    checks["cross_checks_match_primary"] = (
+        primary_valid
+        and checks["cross_checks_known"]
+        and all(evidence.count == expected_count for evidence in cross_checks)
+    )
+    if not checks["cross_checks_match_primary"]:
+        cross_check_counts = sorted(
+            {
+                evidence.count
+                for evidence in cross_checks
+                if evidence.count is not None
+            }
+        )
+        if expected_count is not None and cross_check_counts:
+            reasons.append(
+                "cardinality_evidence_conflict:"
+                + ",".join(
+                    str(value)
+                    for value in sorted(set(cross_check_counts) | {expected_count})
+                )
+            )
+
+    checks["cardinality_known"] = primary_valid
+    checks["cardinality_evidence_consistent"] = primary_valid and all(
+        checks[name]
+        for name in (
+            "cross_checks_present",
+            "cross_checks_known",
+            "cross_checks_complete",
+            "cross_checks_unambiguous",
+            "cross_checks_match_primary",
+        )
+    )
 
     checks["candidate_count_matches"] = (
         expected_count is not None and expected_count == len(candidates)

@@ -162,6 +162,43 @@ class VariableCardinalityAdapterTest(unittest.TestCase):
         self.assertEqual([], result.items)
         self.assertIn("cardinality_evidence_conflict:2,4", result.reasons)
 
+    def test_ichi_r_missing_primary_declaration_fails_closed(self) -> None:
+        mail = _ichi_r_mail(2)
+        mail["subject"] = (
+            "サーバエンジニアのご紹介です！/【弊社フリーランス】"
+        )
+        result = self.p2.parse(mail)
+        self.assertEqual("PARTIAL", result.status)
+        self.assertEqual([], result.items)
+        self.assertFalse(
+            result.source["completeness_result"]["checks"]["primary_count_known"]
+        )
+
+    def test_ichi_r_multiple_primary_declarations_fail_closed(self) -> None:
+        mail = _ichi_r_mail(2)
+        mail["subject"] = (
+            "サーバエンジニアのご紹介です！"
+            "（2名で1人月希望）（4名で1人月希望）/【弊社フリーランス】"
+        )
+        result = self.p2.parse(mail)
+        self.assertEqual("PARTIAL", result.status)
+        self.assertEqual([], result.items)
+        self.assertFalse(
+            result.source["completeness_result"]["checks"]["primary_unambiguous"]
+        )
+
+    def test_ichi_r_incomplete_cross_check_fails_closed(self) -> None:
+        mail = _ichi_r_mail(2)
+        mail["body_text"] = mail["body_text"].replace(
+            "【営業中エンジニア一覧スプレッドシート】", "【共有情報】"
+        )
+        result = self.p2.parse(mail)
+        self.assertEqual("PARTIAL", result.status)
+        self.assertEqual([], result.items)
+        self.assertFalse(
+            result.source["completeness_result"]["checks"]["cross_checks_complete"]
+        )
+
     def test_unknown_authority_emits_nothing(self) -> None:
         config = copy.deepcopy(self.p1_config)
         config["cardinality"]["primary"]["authority"] = "UNKNOWN"
@@ -235,6 +272,169 @@ class VariableCardinalityAdapterTest(unittest.TestCase):
         )
 
 
+class PrimaryCardinalityGateTest(unittest.TestCase):
+    @staticmethod
+    def _evidence(
+        authority,
+        count,
+        complete=True,
+        is_primary=False,
+        reasons=None,
+    ):
+        return CardinalityEvidence(
+            authority=authority,
+            source="Subject" if is_primary else "INLINE_BODY",
+            count=count,
+            complete=complete,
+            is_primary=is_primary,
+            reasons=reasons or [],
+        )
+
+    @classmethod
+    def _gate(cls, evidence, candidate_count=2):
+        source = Source(
+            source_id="cardinality-source",
+            source_type="EMAIL",
+            source_company="Synthetic",
+            source_fingerprint="sha256:" + "0" * 64,
+            delivery_semantics="UNKNOWN",
+            acquisition_status="COMPLETE",
+            cardinality_evidence=evidence,
+            container_references=["body"],
+            configured_primary_authority="DECLARED_COUNT",
+            configured_cross_check_authorities=["STRUCTURAL_COMPLETE"],
+        )
+        container = Container(
+            container_id="body",
+            parent_container_id="",
+            kind=ContainerKind.INLINE_BODY.value,
+            locator="body_text",
+            content_fingerprint="sha256:" + "1" * 64,
+            enumeration_status=EnumerationStatus.COMPLETE.value,
+            completeness=True,
+            candidate_count=candidate_count,
+            required=True,
+        )
+        candidates = [
+            ItemCandidate(
+                candidate_index=index,
+                identifier=f"ID-{index}",
+                source_container_id="body",
+                body_text=f"item {index}",
+                parse_success=True,
+                logical_item_id=f"li_{index}",
+            )
+            for index in range(1, candidate_count + 1)
+        ]
+        return evaluate_completeness(source, [container], candidates)
+
+    def test_primary_and_cross_check_complete_equal_pass(self) -> None:
+        result = self._gate(
+            [
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence("STRUCTURAL_COMPLETE", 2),
+            ]
+        )
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(2, result.expected_count)
+
+    def test_primary_incomplete_fails_closed(self) -> None:
+        result = self._gate(
+            [
+                self._evidence(
+                    "DECLARED_COUNT",
+                    2,
+                    complete=False,
+                    is_primary=True,
+                    reasons=["primary_incomplete"],
+                ),
+                self._evidence("STRUCTURAL_COMPLETE", 2),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertIsNone(result.expected_count)
+
+    def test_primary_missing_fails_closed(self) -> None:
+        result = self._gate([self._evidence("STRUCTURAL_COMPLETE", 2)])
+        self.assertNotEqual("PARSED", result.status)
+        self.assertIsNone(result.expected_count)
+
+    def test_primary_ambiguous_fails_closed(self) -> None:
+        result = self._gate(
+            [
+                self._evidence(
+                    "DECLARED_COUNT",
+                    None,
+                    complete=False,
+                    is_primary=True,
+                    reasons=["declared_count_candidates:2"],
+                ),
+                self._evidence("STRUCTURAL_COMPLETE", 2),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertIsNone(result.expected_count)
+
+    def test_multiple_primary_evidence_fails_closed(self) -> None:
+        result = self._gate(
+            [
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence("STRUCTURAL_COMPLETE", 2),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertFalse(result.checks["primary_evidence_exactly_one"])
+
+    def test_cross_check_missing_fails_closed(self) -> None:
+        result = self._gate(
+            [self._evidence("DECLARED_COUNT", 2, is_primary=True)]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertFalse(result.checks["cross_checks_present"])
+
+    def test_cross_check_incomplete_fails_closed(self) -> None:
+        result = self._gate(
+            [
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence(
+                    "STRUCTURAL_COMPLETE",
+                    2,
+                    complete=False,
+                    reasons=["footer_missing"],
+                ),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertFalse(result.checks["cross_checks_complete"])
+
+    def test_cross_check_unknown_fails_closed(self) -> None:
+        result = self._gate(
+            [
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence(
+                    "STRUCTURAL_COMPLETE",
+                    None,
+                    complete=False,
+                    reasons=["structural_count_unknown"],
+                ),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertFalse(result.checks["cross_checks_known"])
+
+    def test_cross_check_mismatch_fails_closed_with_primary_expected_count(self) -> None:
+        result = self._gate(
+            [
+                self._evidence("DECLARED_COUNT", 2, is_primary=True),
+                self._evidence("STRUCTURAL_COMPLETE", 4),
+            ]
+        )
+        self.assertNotEqual("PARSED", result.status)
+        self.assertEqual(2, result.expected_count)
+        self.assertFalse(result.checks["cross_checks_match_primary"])
+
+
 class ArtifactRelationCoreTest(unittest.TestCase):
     @staticmethod
     def _gate(relations_by_item):
@@ -255,6 +455,8 @@ class ArtifactRelationCoreTest(unittest.TestCase):
             acquisition_status="COMPLETE",
             cardinality_evidence=[evidence],
             container_references=["body"],
+            configured_primary_authority="STRUCTURAL_COMPLETE",
+            configured_cross_check_authorities=[],
         )
         container = Container(
             container_id="body",

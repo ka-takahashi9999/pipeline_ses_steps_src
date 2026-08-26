@@ -133,6 +133,11 @@ class InlineSummaryAdapter:
             acquisition_status="COMPLETE" if acquisition_complete else "INCOMPLETE",
             cardinality_evidence=[],
             container_references=[],
+            configured_primary_authority=self._primary_authority,
+            configured_cross_check_authorities=[
+                row["authority"]
+                for row in self._cardinality_config.get("cross_checks", [])
+            ],
         )
 
     def _enumerate_blocks(
@@ -542,6 +547,11 @@ class InlineSummaryAdapter:
                 "acquisition_status": "INCOMPLETE",
                 "cardinality_evidence": [],
                 "container_references": [],
+                "configured_primary_authority": self._primary_authority,
+                "configured_cross_check_authorities": [
+                    row["authority"]
+                    for row in self._cardinality_config.get("cross_checks", [])
+                ],
                 "artifact_relations_resolved": False,
                 "artifact_relation_reasons": ["system_failure"],
                 "completeness_result": {
