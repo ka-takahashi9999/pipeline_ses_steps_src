@@ -1,0 +1,61 @@
+{
+  "config_id": "drivenx_link_bundle",
+  "version": "1.0.0",
+  "source_company": "DrivenX",
+  "delivery_semantics": "SNAPSHOT",
+  "selectors": {
+    "sender_domain": "driven-x.com",
+    "subject_regex": "新着案件・人材"
+  },
+  "cardinality": {
+    "primary": "CONTAINER_ENUMERATION",
+    "cross_checks": [
+      "STRUCTURAL_COMPLETE",
+      "SNAPSHOT_SET"
+    ]
+  },
+  "link_grammar": {
+    "resource_header": {
+      "text": "ブーストの人材一覧",
+      "href": "https://cho-tatsu.com/boost/talents"
+    },
+    "project_header": {
+      "text": "ブーストの案件一覧",
+      "href": "https://cho-tatsu.com/boost/projects"
+    },
+    "resource_item_href_regex": "https://cho-tatsu\\.com/boost/talents/(?P<locator>[A-Za-z0-9_-]+)",
+    "project_item_href_regex": "https://cho-tatsu\\.com/boost/projects/(?P<locator>[A-Za-z0-9_-]+)",
+    "action_links": [
+      {
+        "text": "案件を掲載する",
+        "href": "https://cho-tatsu.com/projects"
+      },
+      {
+        "text": "人材を掲載する",
+        "href": "https://cho-tatsu.com/talents"
+      }
+    ],
+    "shared_links": [],
+    "non_item_links": []
+  },
+  "section_context": {
+    "resource": {
+      "body_context": "チョータツブーストの新着人材情報\nブーストの人材一覧",
+      "subject_template": "【チョータツブースト】新着人材情報: {title} [MI:{logical_short}/{version_short}]",
+      "context_evidence": {
+        "source_body_text": "チョータツブーストの新着案件・人材情報",
+        "section_header_text": "ブーストの人材一覧",
+        "projection": "resource section"
+      }
+    },
+    "project": {
+      "body_context": "チョータツブーストの新着案件情報\nブーストの案件一覧",
+      "subject_template": "【チョータツブースト】新着案件情報: {title} [MI:{logical_short}/{version_short}]",
+      "context_evidence": {
+        "source_body_text": "チョータツブーストの新着案件・人材情報",
+        "section_header_text": "ブーストの案件一覧",
+        "projection": "project section"
+      }
+    }
+  }
+}
