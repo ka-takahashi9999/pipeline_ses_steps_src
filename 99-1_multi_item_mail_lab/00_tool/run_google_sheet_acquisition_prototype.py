@@ -84,6 +84,29 @@ GOOGLE_SHEET_PATH = re.compile(r"\A/spreadsheets/d/([A-Za-z0-9_-]+)(?:/|\Z)")
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SELECTOR_SENDER_DOMAIN = "tanapism.co.jp"
 SELECTOR_LINK_TEXT = "その他人材情報一覧"
+DIGEST_SCHEMA_NEGATIVE_CASE_IDS = (
+    "nfc_key_collision",
+    "duplicate_json_key",
+    "lone_surrogate",
+    "bool_as_integer",
+    "float",
+    "exponent",
+    "nan",
+    "leading_plus",
+    "leading_zero",
+    "int64_max_plus_one",
+    "int64_min_minus_one",
+    "datetime_offset",
+    "datetime_fraction_missing",
+    "manifest_unknown_field",
+    "snapshot_unknown_field",
+    "nested_unknown_field",
+    "http_status_null",
+    "http_status_missing_for_http",
+    "entry_raw_digest_mismatch",
+    "manifest_digest_mismatch",
+    "ordered_set_digest_mismatch",
+)
 
 
 class AcquisitionStop(Exception):
@@ -606,6 +629,60 @@ def _negative_proof_pass_count(cases: List[Dict[str, Any]]) -> int:
     )
 
 
+def _strict_implementation_pass(
+    validation: Dict[str, Any], conformance: List[Dict[str, Any]],
+    original_negative_passed: int, original_negative_total: int,
+    focused: Dict[str, Any],
+) -> bool:
+    individual_cases = focused.get("digest_schema_negative_cases", [])
+    if not isinstance(individual_cases, list):
+        individual_cases = []
+    individual_passed = sum(
+        case.get("passed") is True for case in individual_cases
+        if isinstance(case, dict)
+    )
+    individual_ids = [
+        case.get("case_id") for case in individual_cases
+        if isinstance(case, dict)
+    ]
+    individual_evidence_pass = (
+        len(individual_cases) == len(DIGEST_SCHEMA_NEGATIVE_CASE_IDS)
+        and individual_passed == len(individual_cases)
+        and set(individual_ids) == set(DIGEST_SCHEMA_NEGATIVE_CASE_IDS)
+        and len(individual_ids) == len(set(individual_ids))
+        and focused.get("digest_schema_negative_passed") == individual_passed
+        and focused.get("digest_schema_negative_total") == len(individual_cases)
+    )
+    conformance_by_name = {
+        check.get("name"): check.get("passed") is True
+        for check in conformance if isinstance(check, dict)
+    }
+    golden_pass = all(conformance_by_name.get(name) is True for name in (
+        "golden_canonical_bytes", "golden_ordered_set_digest",
+    ))
+    all_conformance = bool(conformance) and all(
+        check.get("passed") is True for check in conformance
+        if isinstance(check, dict)
+    )
+    return bool(
+        validation.get("valid") is True
+        and validation.get("exact_manifest_schema") is True
+        and validation.get("exact_snapshot_entry_schema") is True
+        and validation.get("digest_conformance") is True
+        and all_conformance
+        and golden_pass
+        and original_negative_passed == 9
+        and original_negative_total == 9
+        and focused.get("focused_status") == "PASS"
+        and focused.get("focused_passed") == 14
+        and focused.get("focused_total") == 14
+        and individual_evidence_pass
+        and focused.get("false_pass_prevention") == "PASS"
+        and validation.get("eligible") == 0
+        and validation.get("candidate_emission") == 0
+    )
+
+
 def _write_outputs(
     registry: Dict[str, Any], plan: Dict[str, Any], manifest: Dict[str, Any],
     observation: Dict[str, Any], validation: Dict[str, Any],
@@ -627,12 +704,13 @@ def _write_outputs(
     ])
     negative_pass = _negative_proof_pass_count(negative_cases)
     all_conformance = all(check["passed"] for check in conformance)
-    strict_pass = (
-        validation["valid"] and validation["exact_manifest_schema"]
-        and validation["exact_snapshot_entry_schema"] and validation["digest_conformance"]
-        and all_conformance and negative_pass == 9 and validation["eligible"] == 0
-        and validation["candidate_emission"] == 0
+    focused_path = RESULT_DIR / "focused_test_result.jsonl"
+    focused_rows = read_jsonl_as_list(str(focused_path)) if focused_path.exists() else []
+    focused = focused_rows[0] if len(focused_rows) == 1 else {}
+    strict_pass = _strict_implementation_pass(
+        validation, conformance, negative_pass, len(negative_cases), focused
     )
+    conformance_by_name = {check["name"]: check["passed"] for check in conformance}
     summary = {
         "implementation": "PASS" if strict_pass else "FAIL",
         "prototype_pass_condition": "STRICT",
@@ -650,11 +728,24 @@ def _write_outputs(
         "manifest_validation": "PASS" if validation["valid"] else "FAIL",
         "digest_conformance": "PASS" if validation["digest_conformance"] else "FAIL",
         "canonical_conformance": "PASS" if all_conformance else "FAIL",
+        "golden": "PASS" if all(conformance_by_name.get(name) is True for name in (
+            "golden_canonical_bytes", "golden_ordered_set_digest",
+        )) else "FAIL",
         "original_negative_proofs": {"passed": negative_pass, "total": 9},
+        "digest_schema_negative": {
+            "passed": focused.get("digest_schema_negative_passed", 0),
+            "total": focused.get("digest_schema_negative_total", 0),
+        },
+        "focused": {
+            "passed": focused.get("focused_passed", 0),
+            "total": focused.get("focused_total", 0),
+        },
+        "false_pass_prevention": focused.get("false_pass_prevention", "FAIL"),
         "acquisition_status": validation["acquisition_status"],
         "review_status": validation["review_status"],
         "attempt_state": "COMMITTED",
-        "eligible": 0, "auto_union": False, "candidate_emission": 0,
+        "eligible": validation["eligible"], "auto_union": False,
+        "candidate_emission": validation["candidate_emission"],
         "actual_fixed_oracle": 0, "production_write": 0, "P8": "NONE",
         "validation_reasons": validation["reasons"],
     }

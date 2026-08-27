@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Confirm exact digest/schema artifacts and saved test evidence."""
 
+import copy
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -25,7 +26,11 @@ from google_sheet_acquisition_contract import (
     validate_manifest,
     validate_profile_registry,
 )
-from run_google_sheet_acquisition_prototype import RESULT_DIR
+from run_google_sheet_acquisition_prototype import (
+    DIGEST_SCHEMA_NEGATIVE_CASE_IDS,
+    RESULT_DIR,
+    _strict_implementation_pass,
+)
 
 
 logger = get_logger("confirm_99-1_google_sheet_acquisition_prototype")
@@ -118,24 +123,98 @@ def main() -> None:
         if case["name"] == "presentation_unresolved":
             passed = passed and case["result"]["review_status"] == "HUMAN_REVIEW"
         negative_pass += int(passed)
+    _check(len(negative_cases) == 9, "original negative case count mismatch", failures)
+    _check(
+        {case["name"] for case in negative_cases} == set(expected),
+        "original negative case IDs mismatch",
+        failures,
+    )
     _check(negative_pass == 9, "original negative proof count mismatch", failures)
 
     conformance_pass = sum(row.get("passed") is True for row in conformance_rows)
     _check(conformance_rows and conformance_pass == len(conformance_rows), "saved conformance proof failed", failures)
     _check(focused.get("focused_status") == "PASS", "focused test evidence failed", failures)
     _check(
-        focused.get("focused_passed") == focused.get("focused_total"),
+        focused.get("focused_passed") == 14 and focused.get("focused_total") == 14,
         "focused test count mismatch",
         failures,
     )
+    individual_cases = focused.get("digest_schema_negative_cases", [])
+    if not isinstance(individual_cases, list):
+        individual_cases = []
+    individual_passed = sum(
+        case.get("passed") is True for case in individual_cases
+        if isinstance(case, dict)
+    )
+    individual_case_ids = [
+        case.get("case_id") for case in individual_cases
+        if isinstance(case, dict)
+    ]
     _check(
-        focused.get("digest_schema_negative_passed") == focused.get("digest_schema_negative_total"),
-        "digest/schema negative evidence failed",
+        len(individual_cases) == 21,
+        "digest/schema individual negative case count mismatch",
+        failures,
+    )
+    _check(
+        individual_passed == len(individual_cases),
+        "digest/schema individual negative case failed",
+        failures,
+    )
+    _check(
+        set(individual_case_ids) == set(DIGEST_SCHEMA_NEGATIVE_CASE_IDS)
+        and len(individual_case_ids) == len(set(individual_case_ids)),
+        "digest/schema individual negative case IDs mismatch",
+        failures,
+    )
+    _check(
+        all(
+            isinstance(case, dict)
+            and "expected" in case
+            and "actual" in case
+            and "passed" in case
+            for case in individual_cases
+        ),
+        "digest/schema individual evidence fields missing",
+        failures,
+    )
+    _check(
+        focused.get("digest_schema_negative_passed") == individual_passed
+        and focused.get("digest_schema_negative_total") == len(individual_cases)
+        and individual_passed == 21,
+        "digest/schema negative aggregate is not derived from individual evidence",
+        failures,
+    )
+    _check(
+        focused.get("false_pass_prevention") == "PASS",
+        "false PASS prevention evidence failed",
+        failures,
+    )
+    false_pass_check = focused.get("false_pass_check", {})
+    _check(
+        false_pass_check.get("mutated_case_passed") is False
+        and false_pass_check.get("strict_pass") is False
+        and false_pass_check.get("passed") is True,
+        "false PASS in-memory check details failed",
+        failures,
+    )
+    strict_positive = _strict_implementation_pass(
+        validation, conformance_rows, negative_pass, len(negative_cases), focused
+    )
+    failed_focused = copy.deepcopy(focused)
+    if failed_focused.get("digest_schema_negative_cases"):
+        failed_focused["digest_schema_negative_cases"][0]["passed"] = False
+    strict_after_failed_case = _strict_implementation_pass(
+        validation, conformance_rows, negative_pass, len(negative_cases), failed_focused
+    )
+    _check(strict_positive is True, "strict PASS positive control failed", failures)
+    _check(
+        strict_after_failed_case is False,
+        "strict PASS accepted one failed digest/schema case",
         failures,
     )
     _check(baseline.get("baseline_status") == "PASS", "baseline evidence failed", failures)
     _check(
-        baseline.get("baseline_passed") == baseline.get("baseline_total"),
+        baseline.get("baseline_passed") == 195 and baseline.get("baseline_total") == 195,
         "baseline count mismatch",
         failures,
     )
@@ -145,7 +224,32 @@ def main() -> None:
     _check(summary.get("prototype_pass_condition") == "STRICT", "old Prototype PASS condition remains", failures)
     _check(summary.get("google_live_access") == 0, "unexpected Google live access", failures)
     _check(summary.get("attempt_state") == "COMMITTED", "Attempt must remain COMMITTED", failures)
+    _check(summary.get("eligible") == 0, "summary eligible must be zero", failures)
     _check(summary.get("candidate_emission") == 0, "candidate emission must be zero", failures)
+    _check(summary.get("manifest_validation") == "PASS", "summary Manifest validation failed", failures)
+    _check(summary.get("canonical_conformance") == "PASS", "summary canonical conformance failed", failures)
+    _check(summary.get("digest_conformance") == "PASS", "summary digest conformance failed", failures)
+    _check(summary.get("golden") == "PASS", "summary golden evidence failed", failures)
+    _check(
+        summary.get("original_negative_proofs") == {"passed": 9, "total": 9},
+        "summary original negative gate failed",
+        failures,
+    )
+    _check(
+        summary.get("digest_schema_negative") == {"passed": 21, "total": 21},
+        "summary digest/schema negative gate failed",
+        failures,
+    )
+    _check(
+        summary.get("focused") == {"passed": 14, "total": 14},
+        "summary focused gate failed",
+        failures,
+    )
+    _check(
+        summary.get("false_pass_prevention") == "PASS",
+        "summary false PASS prevention gate failed",
+        failures,
+    )
     _check(summary.get("production_write") == 0, "production write must be zero", failures)
     _check(summary.get("P8") == "NONE", "P8 must remain NONE", failures)
 
@@ -159,6 +263,14 @@ def main() -> None:
         "original_negative_total": 9,
         "digest_schema_negative_passed": focused.get("digest_schema_negative_passed", 0),
         "digest_schema_negative_total": focused.get("digest_schema_negative_total", 0),
+        "digest_schema_individual_case_count": len(individual_cases),
+        "digest_schema_all_cases_passed": (
+            bool(individual_cases) and individual_passed == len(individual_cases)
+        ),
+        "false_pass_prevention": focused.get("false_pass_prevention", "FAIL"),
+        "false_pass_check": false_pass_check,
+        "strict_positive_control": strict_positive,
+        "strict_after_failed_case": strict_after_failed_case,
         "focused_passed": focused.get("focused_passed", 0),
         "focused_total": focused.get("focused_total", 0),
         "baseline_passed": baseline.get("baseline_passed", 0),
@@ -183,6 +295,8 @@ def main() -> None:
         + " negative=9/9 digest_schema="
         + str(report["digest_schema_negative_passed"]) + "/"
         + str(report["digest_schema_negative_total"])
+        + " individual=" + str(report["digest_schema_individual_case_count"])
+        + " all_cases_passed=" + str(report["digest_schema_all_cases_passed"]).lower()
         + " baseline=" + str(report["baseline_passed"]) + "/"
         + str(report["baseline_total"])
         + " live=0 eligible=0 production_write=0"

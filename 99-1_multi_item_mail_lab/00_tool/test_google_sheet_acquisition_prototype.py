@@ -54,10 +54,12 @@ from google_sheet_acquisition_contract import (
     validate_snapshot_entry,
 )
 from run_google_sheet_acquisition_prototype import (
+    DIGEST_SCHEMA_NEGATIVE_CASE_IDS,
     GOLDEN_PATH,
     RESULT_DIR,
     _build_snapshot_and_manifest,
     _load_profile_registry,
+    _strict_implementation_pass,
     _unknown_source_version,
     build_attempt_plan,
     observe_workbook,
@@ -66,29 +68,6 @@ from run_google_sheet_acquisition_prototype import (
 
 
 EXACT_TIME = "2026-08-27T12:34:56.000000Z"
-DIGEST_SCHEMA_NEGATIVE_NAMES = (
-    "nfc_key_collision",
-    "duplicate_json_key",
-    "lone_surrogate",
-    "bool_as_integer",
-    "float",
-    "exponent",
-    "nan",
-    "leading_plus",
-    "leading_zero",
-    "int64_max_plus_one",
-    "int64_min_minus_one",
-    "datetime_offset",
-    "datetime_fraction_missing",
-    "manifest_unknown_field",
-    "snapshot_unknown_field",
-    "nested_unknown_field",
-    "http_status_null",
-    "http_status_missing_for_http",
-    "entry_raw_digest_mismatch",
-    "manifest_digest_mismatch",
-    "ordered_set_digest_mismatch",
-)
 
 
 def _direct_digest(domain, payload):
@@ -97,6 +76,151 @@ def _direct_digest(domain, payload):
 
 def _projection(value, fields):
     return {field: copy.deepcopy(value[field]) for field in fields}
+
+
+def _exception_negative_case(case_id, operation):
+    expected = {"exception": "ContractError"}
+    try:
+        operation()
+        actual = {"exception": "NONE"}
+    except Exception as error:  # Evidence records an unexpected exception type too.
+        actual = {
+            "exception": type(error).__name__,
+            "reason": getattr(error, "reason", str(error)),
+        }
+    return {
+        "case_id": case_id,
+        "expected": expected,
+        "actual": actual,
+        "passed": actual["exception"] == expected["exception"],
+    }
+
+
+def _snapshot_negative_case(case_id, entry, expected_reason):
+    reasons = validate_snapshot_entry(entry, True)
+    expected = {"rejected": True, "reason_contains": expected_reason}
+    actual = {"rejected": bool(reasons), "reasons": reasons}
+    return {
+        "case_id": case_id,
+        "expected": expected,
+        "actual": actual,
+        "passed": actual["rejected"] is True and any(
+            expected_reason in reason for reason in reasons
+        ),
+    }
+
+
+def _manifest_negative_case(
+    case_id, manifest, registry, plan, raw_entries, expected_reason,
+):
+    result = validate_manifest(manifest, registry, plan, raw_entries)
+    expected = {
+        "valid": False,
+        "acquisition_status": "INCOMPLETE",
+        "eligible": 0,
+        "reason_contains": expected_reason,
+    }
+    actual = {
+        "valid": result["valid"],
+        "acquisition_status": result["acquisition_status"],
+        "eligible": result["eligible"],
+        "reasons": result["reasons"],
+    }
+    return {
+        "case_id": case_id,
+        "expected": expected,
+        "actual": actual,
+        "passed": (
+            actual["valid"] is False
+            and actual["acquisition_status"] == "INCOMPLETE"
+            and actual["eligible"] == 0
+            and any(expected_reason in reason for reason in actual["reasons"])
+        ),
+    }
+
+
+def digest_schema_negative_cases(manifest, registry, plan, raw_entries):
+    entry = manifest["snapshot_entries"][0]
+    cases = [
+        _exception_negative_case(
+            "nfc_key_collision",
+            lambda: canonical_json_bytes({"e\u0301": 1, "é": 2}),
+        ),
+        _exception_negative_case(
+            "duplicate_json_key", lambda: parse_canonical_json(b'{"a":1,"a":2}'),
+        ),
+        _exception_negative_case(
+            "lone_surrogate", lambda: canonical_json_bytes("\ud800"),
+        ),
+    ]
+    bool_entry = copy.deepcopy(entry)
+    bool_entry["sequence"] = True
+    cases.append(_snapshot_negative_case("bool_as_integer", bool_entry, "not_int64"))
+    cases.extend([
+        _exception_negative_case("float", lambda: canonical_json_bytes(1.0)),
+        _exception_negative_case("exponent", lambda: parse_canonical_json(b"1e2")),
+        _exception_negative_case("nan", lambda: parse_canonical_json(b"NaN")),
+        _exception_negative_case("leading_plus", lambda: parse_canonical_json(b"+1")),
+        _exception_negative_case("leading_zero", lambda: parse_canonical_json(b"01")),
+        _exception_negative_case(
+            "int64_max_plus_one", lambda: canonical_json_bytes(INT64_MAX + 1),
+        ),
+        _exception_negative_case(
+            "int64_min_minus_one", lambda: canonical_json_bytes(INT64_MIN - 1),
+        ),
+    ])
+    for case_id, invalid_datetime in (
+        ("datetime_offset", "2026-08-27T12:34:56.000000+00:00"),
+        ("datetime_fraction_missing", "2026-08-27T12:34:56Z"),
+    ):
+        changed = copy.deepcopy(entry)
+        changed["retrieved_at"] = invalid_datetime
+        cases.append(_snapshot_negative_case(case_id, changed, "datetime"))
+    unknown_manifest = copy.deepcopy(manifest)
+    unknown_manifest["unknown"] = "reject"
+    cases.append(_manifest_negative_case(
+        "manifest_unknown_field", unknown_manifest, registry, plan, raw_entries,
+        "unknown_field",
+    ))
+    unknown_snapshot = copy.deepcopy(entry)
+    unknown_snapshot["unknown"] = "reject"
+    cases.append(_snapshot_negative_case(
+        "snapshot_unknown_field", unknown_snapshot, "unknown_field",
+    ))
+    unknown_nested = copy.deepcopy(entry)
+    unknown_nested["page_or_tab_id"]["unknown"] = "reject"
+    cases.append(_snapshot_negative_case(
+        "nested_unknown_field", unknown_nested, "unknown_field",
+    ))
+    null_status = copy.deepcopy(entry)
+    null_status["http_status"] = None
+    cases.append(_snapshot_negative_case(
+        "http_status_null", null_status, "not_int64",
+    ))
+    missing_status = copy.deepcopy(entry)
+    del missing_status["http_status"]
+    cases.append(_snapshot_negative_case(
+        "http_status_missing_for_http", missing_status, "missing_field:http_status",
+    ))
+    changed_raw_entries = dict(raw_entries)
+    changed_raw_entries[entry["entry_id"]] = raw_entries[entry["entry_id"]] + b"-mutated"
+    cases.append(_manifest_negative_case(
+        "entry_raw_digest_mismatch", manifest, registry, plan, changed_raw_entries,
+        "snapshot_entry_digest_mismatch",
+    ))
+    manifest_digest_mismatch = copy.deepcopy(manifest)
+    manifest_digest_mismatch["manifest_digest"] = "sha256:" + "f" * 64
+    cases.append(_manifest_negative_case(
+        "manifest_digest_mismatch", manifest_digest_mismatch, registry, plan,
+        raw_entries, "manifest_digest_mismatch",
+    ))
+    ordered_set_digest_mismatch = copy.deepcopy(manifest)
+    ordered_set_digest_mismatch["ordered_snapshot_set_digest"] = "sha256:" + "f" * 64
+    cases.append(_manifest_negative_case(
+        "ordered_set_digest_mismatch", ordered_set_digest_mismatch, registry, plan,
+        raw_entries, "ordered_snapshot_set_digest_mismatch",
+    ))
+    return cases
 
 
 class GoogleSheetDigestConformanceTest(unittest.TestCase):
@@ -288,6 +412,42 @@ class GoogleSheetDigestConformanceTest(unittest.TestCase):
         result = validate_manifest(changed, self.registry, self.plan, self.raw_entries)
         self.assertFalse(result["valid"])
         self.assertEqual("INCOMPLETE", result["acquisition_status"])
+        individual_cases = digest_schema_negative_cases(
+            self.manifest, self.registry, self.plan, self.raw_entries
+        )
+        self.assertEqual(
+            list(DIGEST_SCHEMA_NEGATIVE_CASE_IDS),
+            [case["case_id"] for case in individual_cases],
+        )
+        for case in individual_cases:
+            with self.subTest(digest_schema_negative=case["case_id"]):
+                self.assertTrue(case["passed"], case)
+        focused = {
+            "focused_status": "PASS",
+            "focused_passed": 14,
+            "focused_total": 14,
+            "digest_schema_negative_passed": sum(
+                case["passed"] is True for case in individual_cases
+            ),
+            "digest_schema_negative_total": len(individual_cases),
+            "digest_schema_negative_cases": individual_cases,
+            "false_pass_prevention": "PASS",
+        }
+        conformance = [
+            {"name": "golden_canonical_bytes", "passed": True},
+            {"name": "golden_ordered_set_digest", "passed": True},
+        ]
+        valid_result = validate_manifest(
+            self.manifest, self.registry, self.plan, self.raw_entries
+        )
+        self.assertTrue(_strict_implementation_pass(
+            valid_result, conformance, 9, 9, focused
+        ))
+        failed_focused = copy.deepcopy(focused)
+        failed_focused["digest_schema_negative_cases"][0]["passed"] = False
+        self.assertFalse(_strict_implementation_pass(
+            valid_result, conformance, 9, 9, failed_focused
+        ))
 
     def test_12_original_nine_negative_proofs(self):
         cases = offline_negative_proofs(self.manifest, self.registry, self.plan, self.raw_entries)
@@ -356,20 +516,55 @@ def main():
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(GoogleSheetDigestConformanceTest)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     failures = len(result.failures) + len(result.errors)
+    evidence_fixture = GoogleSheetDigestConformanceTest(methodName="test_01_fixed_golden_canonical_bytes_and_digest")
+    evidence_fixture.setUp()
+    individual_cases = digest_schema_negative_cases(
+        evidence_fixture.manifest,
+        evidence_fixture.registry,
+        evidence_fixture.plan,
+        evidence_fixture.raw_entries,
+    )
+    individual_passed = sum(case["passed"] is True for case in individual_cases)
     evidence = {
         "evidence_schema_version": "GoogleSheetDigestFocusedTestEvidence.v1",
         "focused_passed": result.testsRun - failures,
         "focused_total": result.testsRun,
         "focused_status": "PASS" if result.wasSuccessful() else "FAIL",
-        "digest_schema_negative_passed": len(DIGEST_SCHEMA_NEGATIVE_NAMES) if result.wasSuccessful() else 0,
-        "digest_schema_negative_total": len(DIGEST_SCHEMA_NEGATIVE_NAMES),
-        "digest_schema_negative_names": list(DIGEST_SCHEMA_NEGATIVE_NAMES),
+        "digest_schema_negative_passed": individual_passed,
+        "digest_schema_negative_total": len(individual_cases),
+        "digest_schema_negative_cases": individual_cases,
         "google_live_access": 0,
         "production_write": 0,
         "pipeline_04_05_runs": 0,
     }
+    valid_result = validate_manifest(
+        evidence_fixture.manifest,
+        evidence_fixture.registry,
+        evidence_fixture.plan,
+        evidence_fixture.raw_entries,
+    )
+    conformance = [
+        {"name": "golden_canonical_bytes", "passed": True},
+        {"name": "golden_ordered_set_digest", "passed": True},
+    ]
+    evidence["false_pass_prevention"] = "PASS"
+    positive_pass = _strict_implementation_pass(valid_result, conformance, 9, 9, evidence)
+    failed_evidence = copy.deepcopy(evidence)
+    failed_evidence["digest_schema_negative_cases"][0]["passed"] = False
+    false_pass_rejected = not _strict_implementation_pass(
+        valid_result, conformance, 9, 9, failed_evidence
+    )
+    evidence["false_pass_prevention"] = (
+        "PASS" if positive_pass and false_pass_rejected else "FAIL"
+    )
+    evidence["false_pass_check"] = {
+        "mutated_case_id": failed_evidence["digest_schema_negative_cases"][0]["case_id"],
+        "mutated_case_passed": False,
+        "strict_pass": not false_pass_rejected,
+        "passed": positive_pass and false_pass_rejected,
+    }
     write_jsonl(str(RESULT_DIR / "focused_test_result.jsonl"), [evidence])
-    if not result.wasSuccessful():
+    if not result.wasSuccessful() or evidence["false_pass_prevention"] != "PASS":
         raise SystemExit(1)
 
 
