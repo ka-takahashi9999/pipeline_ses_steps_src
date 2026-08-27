@@ -1,0 +1,104 @@
+{
+  "config_id": "sakya_multi_record_spreadsheet",
+  "config_version": "1.0.0",
+  "source_company": "SAKYA",
+  "item_type": "project",
+  "delivery_semantics": "SNAPSHOT",
+  "selectors": {
+    "sender_domain": "sakya.jp",
+    "subject_regex": "営業中案件一覧",
+    "attachment_filename_regex": "^サクヤ営業中_案件[0-9]+\\.xlsx$"
+  },
+  "supported_format": "XLSX",
+  "cardinality": {
+    "primary": "CONTAINER_ENUMERATION",
+    "cross_checks": ["STRUCTURAL_COMPLETE"]
+  },
+  "limits": {
+    "max_package_bytes": 33554432,
+    "max_member_count": 512,
+    "max_single_member_expanded_bytes": 16777216,
+    "max_total_expanded_bytes": 67108864,
+    "max_expansion_ratio": 100.0,
+    "max_xml_bytes": 16777216,
+    "max_sheets": 256,
+    "max_rows_per_sheet": 4096,
+    "max_columns_per_sheet": 2048
+  },
+  "sheet_roles": {
+    "AUTHORITATIVE": {
+      "exact_names": [
+        "案件一覧",
+        "案件一覧2",
+        "PM・PdM・PMO・上流",
+        "Java",
+        "クラウド・インフラ",
+        "Python",
+        "C#・VB",
+        "NW・セキュリティ",
+        "パッケージ・SaaS",
+        "AI・ML",
+        "TypeScript・JS",
+        "PHP",
+        "データ基盤",
+        "組み込み・C・C++",
+        "DB・DBA",
+        "Go",
+        "モバイル",
+        "AS400",
+        "QA",
+        "フルスタック",
+        "アーキテクト",
+        "運用保守",
+        "社内SE・情シス",
+        "Web・クリエイティブ",
+        "ゲーム",
+        "異業種・異職種"
+      ],
+      "allowed_visibility": ["visible"]
+    },
+    "DERIVED_VIEW": {
+      "exact_names": ["新規・更新", "新着案件"],
+      "allowed_visibility": ["visible"]
+    },
+    "SUPPORTING": {
+      "exact_names": ["連絡先"],
+      "allowed_visibility": ["visible"]
+    }
+  },
+  "record_layout": {
+    "orientation": "ROW_FIELD_COLUMN_RECORD",
+    "field_label_column": "A",
+    "record_start_column": "B",
+    "field_rows": {
+      "メインスキル": 1,
+      "単金": 2,
+      "作業場所": 3,
+      "面談回数": 4,
+      "担当者": 5,
+      "新規": 6,
+      "案件概要": 7
+    },
+    "required_fields": ["メインスキル", "単金", "作業場所", "案件概要"],
+    "identity_fields": ["案件概要", "作業場所", "単金", "メインスキル"],
+    "ambiguity_anchor_fields": ["案件概要"],
+    "explicit_id_field": "案件ID",
+    "stable_key_fields": [],
+    "formula_policy": "REJECT_IDENTITY_OR_REQUIRED",
+    "blank_column_policy": "CONTIGUOUS_BOUNDARY_REQUIRED"
+  },
+  "identity": {
+    "schema_version": "sakya_project_fingerprint.v1",
+    "status": "PROVISIONAL",
+    "normalization": "NFKC_CASEFOLD_WHITESPACE",
+    "resolution_order": [
+      "SOURCE_OWNED_EXPLICIT_ID",
+      "SOURCE_CONFIGURED_STABLE_KEY",
+      "SOURCE_CONFIGURED_CANONICAL_FIELD_FINGERPRINT"
+    ]
+  },
+  "canonical_context": {
+    "body_prefix": "サクヤ営業中案件情報",
+    "subject_template": "【サクヤ営業中案件】{title} [MI:{logical_short}/{version_short}]"
+  }
+}
