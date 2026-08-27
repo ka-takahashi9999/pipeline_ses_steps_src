@@ -56,15 +56,71 @@ PARSER_VERSION = "1.0.0"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 CELL_REFERENCE = re.compile(r"\A([A-Z]+)([1-9][0-9]*)\Z")
 SHA256_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 SUPPORTED_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 REQUIRED_PACKAGE_PARTS = {
     "[Content_Types].xml",
     "_rels/.rels",
-    "xl/workbook.xml",
-    "xl/_rels/workbook.xml.rels",
 }
+OFFICE_REL_BASE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/"
+)
+STANDARD_XLSX_WORKBOOK_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+REL_OFFICE_DOCUMENT = OFFICE_REL_BASE + "officeDocument"
+REL_WORKSHEET = OFFICE_REL_BASE + "worksheet"
+REL_SHARED_STRINGS = OFFICE_REL_BASE + "sharedStrings"
+REL_STYLES = OFFICE_REL_BASE + "styles"
+REL_THEME = OFFICE_REL_BASE + "theme"
+REL_CALC_CHAIN = OFFICE_REL_BASE + "calcChain"
+REL_CORE_PROPERTIES = (
+    "http://schemas.openxmlformats.org/package/2006/relationships/metadata/"
+    "core-properties"
+)
+REL_EXTENDED_PROPERTIES = OFFICE_REL_BASE + "extended-properties"
+REL_CUSTOM_PROPERTIES = OFFICE_REL_BASE + "custom-properties"
+RELATIONSHIP_CONTENT_TYPES = {
+    REL_OFFICE_DOCUMENT: {STANDARD_XLSX_WORKBOOK_CONTENT_TYPE},
+    REL_WORKSHEET: {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+    },
+    REL_SHARED_STRINGS: {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+    },
+    REL_STYLES: {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"
+    },
+    REL_THEME: {"application/vnd.openxmlformats-officedocument.theme+xml"},
+    REL_CALC_CHAIN: {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"
+    },
+    REL_CORE_PROPERTIES: {
+        "application/vnd.openxmlformats-package.core-properties+xml"
+    },
+    REL_EXTENDED_PROPERTIES: {
+        "application/vnd.openxmlformats-officedocument.extended-properties+xml"
+    },
+    REL_CUSTOM_PROPERTIES: {
+        "application/vnd.openxmlformats-officedocument.custom-properties+xml"
+    },
+}
+ROOT_RELATIONSHIP_TYPES = {
+    REL_OFFICE_DOCUMENT,
+    REL_CORE_PROPERTIES,
+    REL_EXTENDED_PROPERTIES,
+    REL_CUSTOM_PROPERTIES,
+}
+WORKBOOK_RELATIONSHIP_TYPES = {
+    REL_WORKSHEET,
+    REL_SHARED_STRINGS,
+    REL_STYLES,
+    REL_THEME,
+    REL_CALC_CHAIN,
+}
+SAFE_PART_CONTENT_TYPES = set().union(*RELATIONSHIP_CONTENT_TYPES.values())
 
 
 class SpreadsheetInputError(Exception):
@@ -175,6 +231,11 @@ def _rels_source_part(name: str) -> str:
     return posixpath.join(parent, basename[: -len(".rels")])
 
 
+def _relationship_part_name(source_part: str) -> str:
+    directory, basename = posixpath.split(source_part)
+    return posixpath.join(directory, "_rels", basename + ".rels")
+
+
 def _resolve_relationship_target(source_part: str, target: str) -> str:
     normalized = unicodedata.normalize("NFKC", target).replace("\\", "/")
     if not normalized or normalized.startswith("//") or re.match(r"\A[A-Za-z]+:", normalized):
@@ -206,6 +267,76 @@ def _relationship_cycle(graph: Dict[str, Set[str]]) -> bool:
         return False
 
     return any(visit(node) for node in list(graph))
+
+
+def _package_content_types(
+    parts: Dict[str, bytes], max_xml_bytes: int
+) -> Dict[str, str]:
+    part_name = "[Content_Types].xml"
+    root = _safe_xml(parts[part_name], part_name, max_xml_bytes)
+    if root.tag != "{%s}Types" % CONTENT_TYPES_NS:
+        raise SpreadsheetInputError("content_types_root_invalid", "UNSUPPORTED")
+    defaults: Dict[str, str] = {}
+    overrides: Dict[str, str] = {}
+    for child in list(root):
+        if child.tag == "{%s}Default" % CONTENT_TYPES_NS:
+            extension = child.get("Extension", "")
+            content_type = child.get("ContentType", "")
+            key = extension.casefold()
+            if (
+                not extension
+                or extension.startswith(".")
+                or re.fullmatch(r"[A-Za-z0-9]+", extension) is None
+                or not content_type
+                or content_type != content_type.strip()
+                or key in defaults
+            ):
+                raise SpreadsheetInputError(
+                    "content_type_default_invalid_or_duplicate", "UNSUPPORTED"
+                )
+            defaults[key] = content_type
+        elif child.tag == "{%s}Override" % CONTENT_TYPES_NS:
+            declared_name = child.get("PartName", "")
+            content_type = child.get("ContentType", "")
+            if (
+                not declared_name.startswith("/")
+                or "?" in declared_name
+                or "#" in declared_name
+                or not content_type
+                or content_type != content_type.strip()
+            ):
+                raise SpreadsheetInputError("content_type_override_invalid", "UNSUPPORTED")
+            resolved = declared_name[1:]
+            key, reasons = _normalized_package_path(resolved)
+            if reasons or key in overrides:
+                raise SpreadsheetInputError(
+                    "content_type_override_invalid_or_duplicate", "UNSUPPORTED"
+                )
+            if resolved not in parts:
+                raise SpreadsheetInputError(
+                    "content_type_override_target_missing:" + resolved,
+                    "UNSUPPORTED",
+                )
+            overrides[key] = content_type
+        else:
+            raise SpreadsheetInputError("content_types_child_invalid", "UNSUPPORTED")
+
+    resolved_types: Dict[str, str] = {}
+    for name in parts:
+        if name == part_name:
+            continue
+        key, _ = _normalized_package_path(name)
+        content_type = overrides.get(key)
+        if content_type is None:
+            extension = posixpath.basename(name).rsplit(".", 1)
+            if len(extension) == 2:
+                content_type = defaults.get(extension[1].casefold())
+        if content_type is None:
+            raise SpreadsheetInputError(
+                "package_part_content_type_missing:" + name, "UNSUPPORTED"
+            )
+        resolved_types[name] = content_type
+    return resolved_types
 
 
 def _cell_value(
@@ -445,7 +576,12 @@ class SpreadsheetParser:
 
     def _read_package(
         self, payload: bytes
-    ) -> Tuple[Dict[str, bytes], List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    ) -> Tuple[
+        Dict[str, bytes],
+        List[Dict[str, Any]],
+        Dict[str, List[Dict[str, Any]]],
+        str,
+    ]:
         limits = self.config["limits"]
         if len(payload) > limits["max_package_bytes"]:
             raise SpreadsheetInputError("package_size_limit_exceeded", "UNSUPPORTED")
@@ -499,16 +635,6 @@ class SpreadsheetParser:
         missing = sorted(REQUIRED_PACKAGE_PARTS - names)
         if missing:
             raise SpreadsheetInputError("required_package_part_missing:" + missing[0])
-        forbidden = [
-            name
-            for name in names
-            if name.casefold().startswith(
-                ("xl/externalLinks/".casefold(), "xl/embeddings/", "xl/oleobjects/")
-            )
-            or name.casefold().endswith("vbaproject.bin")
-        ]
-        if forbidden:
-            raise SpreadsheetInputError("executable_or_external_part_unsupported:" + forbidden[0], "UNSUPPORTED")
         try:
             bad_member = package.testzip()
             if bad_member is not None:
@@ -521,21 +647,58 @@ class SpreadsheetParser:
         for name, part_payload in parts.items():
             if name.casefold().endswith(".xml"):
                 _safe_xml(part_payload, name, limits["max_xml_bytes"])
+        content_types = _package_content_types(parts, limits["max_xml_bytes"])
+        for name, content_type in content_types.items():
+            if (
+                name.endswith(".rels")
+                and content_type
+                != "application/vnd.openxmlformats-package.relationships+xml"
+            ):
+                raise SpreadsheetInputError(
+                    "relationship_part_content_type_invalid:" + name,
+                    "UNSUPPORTED",
+                )
+            if content_type in SAFE_PART_CONTENT_TYPES:
+                _safe_xml(parts[name], name, limits["max_xml_bytes"])
         relationship_rows: Dict[str, List[Dict[str, Any]]] = {}
         graph: Dict[str, Set[str]] = defaultdict(set)
         for name in sorted(part for part in parts if part.endswith(".rels")):
             source_part = _rels_source_part(name)
+            if source_part and source_part not in parts:
+                raise SpreadsheetInputError(
+                    "relationship_source_part_missing:" + source_part,
+                    "UNSUPPORTED",
+                )
             root = _safe_xml(parts[name], name, limits["max_xml_bytes"])
+            if root.tag != "{%s}Relationships" % PACKAGE_REL_NS:
+                raise SpreadsheetInputError(
+                    "relationship_root_invalid:" + name, "UNSUPPORTED"
+                )
             ids: Set[str] = set()
             rows: List[Dict[str, Any]] = []
-            for relation in root.findall("{%s}Relationship" % PACKAGE_REL_NS):
+            for relation in list(root):
+                if relation.tag != "{%s}Relationship" % PACKAGE_REL_NS:
+                    raise SpreadsheetInputError(
+                        "relationship_child_invalid:" + name, "UNSUPPORTED"
+                    )
                 relationship_id = relation.get("Id", "")
+                relationship_type = relation.get("Type", "")
                 target = relation.get("Target", "")
                 if not relationship_id or relationship_id in ids:
                     raise SpreadsheetInputError("relationship_id_invalid_or_duplicate")
                 ids.add(relationship_id)
-                if relation.get("TargetMode", "").casefold() == "external":
+                if relationship_type not in RELATIONSHIP_CONTENT_TYPES:
+                    raise SpreadsheetInputError(
+                        "relationship_type_unsupported:" + relationship_type,
+                        "UNSUPPORTED",
+                    )
+                target_mode = relation.get("TargetMode", "")
+                if target_mode.casefold() == "external":
                     raise SpreadsheetInputError("external_relationship_unsupported", "UNSUPPORTED")
+                if target_mode and target_mode.casefold() != "internal":
+                    raise SpreadsheetInputError(
+                        "relationship_target_mode_unsupported", "UNSUPPORTED"
+                    )
                 resolved = _resolve_relationship_target(source_part, target)
                 if resolved not in parts:
                     raise SpreadsheetInputError("relationship_target_missing:" + resolved)
@@ -543,7 +706,7 @@ class SpreadsheetParser:
                 rows.append(
                     {
                         "id": relationship_id,
-                        "type": relation.get("Type", ""),
+                        "type": relationship_type,
                         "target": resolved,
                     }
                 )
@@ -553,18 +716,120 @@ class SpreadsheetParser:
         root_office = [
             row
             for row in relationship_rows.get("", [])
-            if row["type"].endswith("/officeDocument")
+            if row["type"] == REL_OFFICE_DOCUMENT
         ]
-        if len(root_office) != 1 or root_office[0]["target"] != "xl/workbook.xml":
+        if len(root_office) != 1:
             raise SpreadsheetInputError("root_workbook_relationship_invalid")
-        return parts, member_rows, relationship_rows
+        workbook_part = root_office[0]["target"]
+        workbook_content_type = content_types.get(workbook_part)
+        main_parts = sorted(
+            name
+            for name, content_type in content_types.items()
+            if content_type == STANDARD_XLSX_WORKBOOK_CONTENT_TYPE
+        )
+        if (
+            workbook_content_type != STANDARD_XLSX_WORKBOOK_CONTENT_TYPE
+            or main_parts != [workbook_part]
+        ):
+            raise SpreadsheetInputError(
+                "xlsx_workbook_main_content_type_invalid", "UNSUPPORTED"
+            )
+        workbook_rels = _relationship_part_name(workbook_part)
+        if workbook_rels not in parts:
+            raise SpreadsheetInputError(
+                "workbook_relationship_part_missing:" + workbook_rels,
+                "UNSUPPORTED",
+            )
 
-    def _shared_strings(self, parts: Dict[str, bytes]) -> List[str]:
-        if "xl/sharedStrings.xml" not in parts:
+        for source_part, rows in relationship_rows.items():
+            allowed_types = (
+                ROOT_RELATIONSHIP_TYPES
+                if source_part == ""
+                else (
+                    WORKBOOK_RELATIONSHIP_TYPES
+                    if source_part == workbook_part
+                    else set()
+                )
+            )
+            singleton_counts: Counter = Counter()
+            for row in rows:
+                if row["type"] not in allowed_types:
+                    raise SpreadsheetInputError(
+                        "relationship_type_invalid_for_source:"
+                        + source_part
+                        + ":"
+                        + row["type"],
+                        "UNSUPPORTED",
+                    )
+                target_content_type = content_types.get(row["target"])
+                if target_content_type not in RELATIONSHIP_CONTENT_TYPES[row["type"]]:
+                    raise SpreadsheetInputError(
+                        "relationship_target_content_type_invalid:"
+                        + row["target"],
+                        "UNSUPPORTED",
+                    )
+                if row["type"] != REL_WORKSHEET:
+                    singleton_counts[row["type"]] += 1
+            if any(count > 1 for count in singleton_counts.values()):
+                raise SpreadsheetInputError(
+                    "relationship_type_ambiguous:" + source_part,
+                    "UNSUPPORTED",
+                )
+
+        unsupported_content_parts = sorted(
+            name
+            for name, content_type in content_types.items()
+            if not name.endswith(".rels")
+            and content_type not in SAFE_PART_CONTENT_TYPES
+        )
+        if unsupported_content_parts:
+            name = unsupported_content_parts[0]
+            raise SpreadsheetInputError(
+                "package_part_content_type_unsupported:"
+                + name
+                + ":"
+                + content_types[name],
+                "UNSUPPORTED",
+            )
+
+        reachable: Set[str] = set()
+        pending = list(graph.get("", set()))
+        while pending:
+            part = pending.pop()
+            if part in reachable:
+                continue
+            reachable.add(part)
+            pending.extend(graph.get(part, set()))
+        unreferenced = sorted(
+            name
+            for name in parts
+            if name != "[Content_Types].xml"
+            and not name.endswith(".rels")
+            and name not in reachable
+        )
+        if unreferenced:
+            raise SpreadsheetInputError(
+                "unreferenced_package_part:" + unreferenced[0], "UNSUPPORTED"
+            )
+        return parts, member_rows, relationship_rows, workbook_part
+
+    def _shared_strings(
+        self,
+        parts: Dict[str, bytes],
+        relationships: Dict[str, List[Dict[str, Any]]],
+        workbook_part: str,
+    ) -> List[str]:
+        targets = [
+            row["target"]
+            for row in relationships.get(workbook_part, [])
+            if row["type"] == REL_SHARED_STRINGS
+        ]
+        if not targets:
             return []
+        shared_strings_part = targets[0]
         root = _safe_xml(
-            parts["xl/sharedStrings.xml"],
-            "xl/sharedStrings.xml",
+            parts[shared_strings_part],
+            shared_strings_part,
             self.config["limits"]["max_xml_bytes"],
         )
         return [
@@ -576,17 +841,19 @@ class SpreadsheetParser:
         self,
         parts: Dict[str, bytes],
         relationships: Dict[str, List[Dict[str, Any]]],
+        workbook_part: str,
     ) -> List[Dict[str, Any]]:
         root = _safe_xml(
-            parts["xl/workbook.xml"],
-            "xl/workbook.xml",
+            parts[workbook_part],
+            workbook_part,
             self.config["limits"]["max_xml_bytes"],
         )
         relation_by_id = {
-            row["id"]: row for row in relationships.get("xl/workbook.xml", [])
+            row["id"]: row for row in relationships.get(workbook_part, [])
         }
         sheets: List[Dict[str, Any]] = []
         names: Set[str] = set()
+        used_relationship_ids: Set[str] = set()
         for position, sheet in enumerate(root.findall(".//{%s}sheet" % MAIN_NS)):
             name = sheet.get("name", "")
             state = sheet.get("state", "visible")
@@ -595,8 +862,9 @@ class SpreadsheetParser:
             if not name or name in names:
                 raise SpreadsheetInputError("workbook_sheet_name_invalid_or_duplicate")
             names.add(name)
-            if relation is None or not relation["type"].endswith("/worksheet"):
+            if relation is None or relation["type"] != REL_WORKSHEET:
                 raise SpreadsheetInputError("worksheet_relationship_missing:" + name)
+            used_relationship_ids.add(relationship_id)
             role = self._role_names.get(name, "UNKNOWN")
             role_config = self.config["sheet_roles"].get(role, {})
             if role != "UNKNOWN" and state not in role_config.get(
@@ -615,6 +883,15 @@ class SpreadsheetParser:
             )
         if len(sheets) > self.config["limits"]["max_sheets"]:
             raise SpreadsheetInputError("sheet_count_limit_exceeded", "UNSUPPORTED")
+        declared_worksheet_ids = {
+            row["id"]
+            for row in relationships.get(workbook_part, [])
+            if row["type"] == REL_WORKSHEET
+        }
+        if used_relationship_ids != declared_worksheet_ids:
+            raise SpreadsheetInputError(
+                "worksheet_relationship_set_mismatch", "UNSUPPORTED"
+            )
         return sheets
 
     def _worksheet_cells(
@@ -671,9 +948,13 @@ class SpreadsheetParser:
         return _digest_json(payload)
 
     def _enumerate_records(
-        self, parts: Dict[str, bytes], sheets: List[Dict[str, Any]]
+        self,
+        parts: Dict[str, bytes],
+        sheets: List[Dict[str, Any]],
+        relationships: Dict[str, List[Dict[str, Any]]],
+        workbook_part: str,
     ) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
-        shared_strings = self._shared_strings(parts)
+        shared_strings = self._shared_strings(parts, relationships, workbook_part)
         layout = self.config["record_layout"]
         field_rows = layout["field_rows"]
         required_fields = layout["required_fields"]
@@ -1052,10 +1333,10 @@ class SpreadsheetParser:
             raise SpreadsheetInputError("xlsx_attachment_size_mismatch")
         workbook_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
         acquisition = self._source_acquisition(mail, attachment_position)
-        parts, member_rows, relationships = self._read_package(payload)
-        sheets = self._ordered_sheets(parts, relationships)
+        parts, member_rows, relationships, workbook_part = self._read_package(payload)
+        sheets = self._ordered_sheets(parts, relationships, workbook_part)
         occurrences, enumeration_reasons, unsupported_reasons = (
-            self._enumerate_records(parts, sheets)
+            self._enumerate_records(parts, sheets, relationships, workbook_part)
         )
         proof = self._structure_proof(
             mail, workbook_digest, sheets, occurrences

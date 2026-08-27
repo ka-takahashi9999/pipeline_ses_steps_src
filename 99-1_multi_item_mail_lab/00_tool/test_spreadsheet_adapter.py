@@ -38,7 +38,12 @@ from spreadsheet_fixture_source import (
     rewrite_package_member,
     workbook_payload,
 )
-from spreadsheet_parser import MAIN_NS, PACKAGE_REL_NS, SpreadsheetParser
+from spreadsheet_parser import (
+    CONTENT_TYPES_NS,
+    MAIN_NS,
+    PACKAGE_REL_NS,
+    SpreadsheetParser,
+)
 
 
 CONFIG_PATH = (
@@ -78,6 +83,75 @@ def _rebuild_package(payload, replacements=None, remove=(), additions=()):
             info.compress_type = zipfile.ZIP_DEFLATED
             package.writestr(info, value)
     return output.getvalue()
+
+
+def _xml_bytes(root):
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _rewrite_part_content_type(payload, part_name, content_type):
+    root = ET.fromstring(dict(_package_parts(payload))["[Content_Types].xml"])
+    matches = [
+        child
+        for child in root.findall("{%s}Override" % CONTENT_TYPES_NS)
+        if child.get("PartName") == "/" + part_name
+    ]
+    if len(matches) != 1:
+        raise AssertionError("content type override count mismatch:" + part_name)
+    matches[0].set("ContentType", content_type)
+    return rewrite_package_member(payload, "[Content_Types].xml", _xml_bytes(root))
+
+
+def _append_relationship(payload, rel_name, relationship_id, relationship_type, target):
+    root = ET.fromstring(dict(_package_parts(payload))[rel_name])
+    ET.SubElement(
+        root,
+        "{%s}Relationship" % PACKAGE_REL_NS,
+        {
+            "Id": relationship_id,
+            "Type": relationship_type,
+            "Target": target,
+        },
+    )
+    return rewrite_package_member(payload, rel_name, _xml_bytes(root))
+
+
+def _append_relationship_part(
+    payload,
+    rel_name,
+    relationship_id,
+    relationship_type,
+    target,
+    part_name,
+    content_type,
+    part_payload,
+):
+    content_root = ET.fromstring(
+        dict(_package_parts(payload))["[Content_Types].xml"]
+    )
+    ET.SubElement(
+        content_root,
+        "{%s}Override" % CONTENT_TYPES_NS,
+        {"PartName": "/" + part_name, "ContentType": content_type},
+    )
+    rel_root = ET.fromstring(dict(_package_parts(payload))[rel_name])
+    ET.SubElement(
+        rel_root,
+        "{%s}Relationship" % PACKAGE_REL_NS,
+        {
+            "Id": relationship_id,
+            "Type": relationship_type,
+            "Target": target,
+        },
+    )
+    return _rebuild_package(
+        payload,
+        replacements={
+            "[Content_Types].xml": _xml_bytes(content_root),
+            rel_name: _xml_bytes(rel_root),
+        },
+        additions=[(part_name, part_payload)],
+    )
 
 
 class SpreadsheetAdapterTest(unittest.TestCase):
@@ -259,6 +333,23 @@ class SpreadsheetAdapterTest(unittest.TestCase):
                 result = self.parser.parse(replace_workbook_payload(fixture, mutated))
                 self.assertFailClosed(result)
 
+        package_xml_cases = {
+            "content_types_dtd": rewrite_package_member(
+                payload,
+                "[Content_Types].xml",
+                b'<!DOCTYPE Types [<!ENTITY e SYSTEM "file:///etc/passwd">]><Types>&e;</Types>',
+            ),
+            "relationships_malformed": rewrite_package_member(
+                payload, "_rels/.rels", b"<Relationships"
+            ),
+        }
+        for name, mutated in package_xml_cases.items():
+            with self.subTest(name=name):
+                result = self.parser.parse(
+                    replace_workbook_payload(fixture, mutated)
+                )
+                self.assertFailClosed(result)
+
     def test_10_path_traversal_duplicate_members_and_limits_are_rejected(self):
         fixture = copy.deepcopy(self.by_count[1])
         payload = workbook_payload(fixture)
@@ -292,7 +383,7 @@ class SpreadsheetAdapterTest(unittest.TestCase):
             "{%s}Relationship" % PACKAGE_REL_NS,
             {
                 "Id": "rIdExternal",
-                "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink",
+                "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
                 "Target": "https://example.invalid/book.xlsx",
                 "TargetMode": "External",
             },
@@ -431,6 +522,262 @@ class SpreadsheetAdapterTest(unittest.TestCase):
             malformed = build_spreadsheet_results(input_path=malformed_path)["summary"]
         self.assertEqual("OBSERVATION_UNAVAILABLE", missing["actual_availability"])
         self.assertEqual("OBSERVATION_UNAVAILABLE", malformed["actual_availability"])
+
+    def test_17_renamed_macro_enabled_xlsx_main_type_fails_closed(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = _rewrite_part_content_type(
+            workbook_payload(fixture),
+            "xl/workbook.xml",
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        )
+        mutated = replace_workbook_payload(fixture, payload)
+        mutated["attachments"][0]["filename"] = "sample.xlsx"
+        config = copy.deepcopy(self.config)
+        config["selectors"]["attachment_filename_regex"] = r"^sample\.xlsx$"
+        result = SpreadsheetParser(config).parse(mutated)
+        self.assertEqual("UNSUPPORTED", result.status)
+        self.assertIn("xlsx_workbook_main_content_type_invalid", result.reasons)
+        self.assertEqual("FAIL", result.workbook["package_integrity_status"])
+        self.assertFailClosed(result)
+
+    def test_18_workbook_main_relationship_and_content_type_inconsistencies_fail_closed(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = workbook_payload(fixture)
+
+        root_rels = ET.fromstring(dict(_package_parts(payload))["_rels/.rels"])
+        root_rels.find("{%s}Relationship" % PACKAGE_REL_NS).set(
+            "Target", "xl/missing-workbook.xml"
+        )
+        invalid_target = rewrite_package_member(
+            payload, "_rels/.rels", _xml_bytes(root_rels)
+        )
+
+        content_root = ET.fromstring(
+            dict(_package_parts(payload))["[Content_Types].xml"]
+        )
+        for child in list(content_root):
+            if (
+                child.get("PartName") == "/xl/workbook.xml"
+                or child.get("Extension") == "xml"
+            ):
+                content_root.remove(child)
+        missing_content_type = rewrite_package_member(
+            payload, "[Content_Types].xml", _xml_bytes(content_root)
+        )
+
+        duplicate_root = ET.fromstring(dict(_package_parts(payload))["_rels/.rels"])
+        ET.SubElement(
+            duplicate_root,
+            "{%s}Relationship" % PACKAGE_REL_NS,
+            {
+                "Id": "rIdDuplicateMain",
+                "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+                "Target": "xl/worksheets/sheet1.xml",
+            },
+        )
+        ambiguous_relationship = rewrite_package_member(
+            payload, "_rels/.rels", _xml_bytes(duplicate_root)
+        )
+
+        duplicate_content_root = ET.fromstring(
+            dict(_package_parts(payload))["[Content_Types].xml"]
+        )
+        ET.SubElement(
+            duplicate_content_root,
+            "{%s}Override" % CONTENT_TYPES_NS,
+            {
+                "PartName": "/custom/workbook-copy.xml",
+                "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            },
+        )
+        ambiguous_content_type = _rebuild_package(
+            payload,
+            replacements={
+                "[Content_Types].xml": _xml_bytes(duplicate_content_root)
+            },
+            additions=[
+                (
+                    "custom/workbook-copy.xml",
+                    dict(_package_parts(payload))["xl/workbook.xml"],
+                )
+            ],
+        )
+
+        cases = {
+            "relationship_target_invalid": invalid_target,
+            "workbook_content_type_missing": missing_content_type,
+            "ambiguous_workbook_relationship": ambiguous_relationship,
+            "ambiguous_workbook_content_type": ambiguous_content_type,
+        }
+        for name, mutated_payload in cases.items():
+            with self.subTest(name=name):
+                result = self.parser.parse(
+                    replace_workbook_payload(fixture, mutated_payload)
+                )
+                self.assertFailClosed(result)
+
+    def test_19_standard_and_nonstandard_embedded_ole_parts_fail_closed(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = workbook_payload(fixture)
+        relation_type = (
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject"
+        )
+        content_type = "application/vnd.openxmlformats-officedocument.oleObject"
+        cases = {
+            "standard": ("xl/embeddings/oleObject1.bin", "embeddings/oleObject1.bin"),
+            "nonstandard": ("xl/media/object.bin", "media/object.bin"),
+        }
+        for name, (part_name, target) in cases.items():
+            with self.subTest(name=name):
+                mutated_payload = _append_relationship_part(
+                    payload,
+                    "xl/_rels/workbook.xml.rels",
+                    "rIdEmbedded" + name,
+                    relation_type,
+                    target,
+                    part_name,
+                    content_type,
+                    b"embedded-object",
+                )
+                result = self.parser.parse(
+                    replace_workbook_payload(fixture, mutated_payload)
+                )
+                self.assertEqual("UNSUPPORTED", result.status)
+                self.assertTrue(
+                    result.reasons[0].startswith("relationship_type_unsupported:")
+                )
+                self.assertEqual("FAIL", result.workbook["package_integrity_status"])
+                self.assertFailClosed(result)
+
+    def test_20_unknown_relationship_type_fails_closed(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = _append_relationship(
+            workbook_payload(fixture),
+            "xl/_rels/workbook.xml.rels",
+            "rIdUnknown",
+            "urn:example:unknown-relationship",
+            "worksheets/sheet1.xml",
+        )
+        result = self.parser.parse(replace_workbook_payload(fixture, payload))
+        self.assertEqual("UNSUPPORTED", result.status)
+        self.assertIn(
+            "relationship_type_unsupported:urn:example:unknown-relationship",
+            result.reasons,
+        )
+        self.assertFailClosed(result)
+
+    def test_21_forbidden_part_content_type_fails_closed(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = _rewrite_part_content_type(
+            workbook_payload(fixture),
+            "xl/worksheets/sheet1.xml",
+            "application/vnd.openxmlformats-officedocument.oleObject",
+        )
+        result = self.parser.parse(replace_workbook_payload(fixture, payload))
+        self.assertEqual("UNSUPPORTED", result.status)
+        self.assertTrue(
+            result.reasons[0].startswith(
+                "relationship_target_content_type_invalid:xl/worksheets/sheet1.xml"
+            )
+        )
+        self.assertFailClosed(result)
+
+    def test_22_normal_xlsx_optional_relationships_and_parts_pass(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = workbook_payload(fixture)
+        additions = (
+            (
+                "xl/_rels/workbook.xml.rels",
+                "rIdSharedStrings",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+                "sharedStrings.xml",
+                "xl/sharedStrings.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+                _xml_bytes(ET.Element("{%s}sst" % MAIN_NS)),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                "rIdStyles",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+                "styles.xml",
+                "xl/styles.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+                _xml_bytes(ET.Element("{%s}styleSheet" % MAIN_NS)),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                "rIdTheme",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+                "theme/theme1.xml",
+                "xl/theme/theme1.xml",
+                "application/vnd.openxmlformats-officedocument.theme+xml",
+                b'<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>',
+            ),
+            (
+                "_rels/.rels",
+                "rIdCoreProperties",
+                "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+                "docProps/core.xml",
+                "docProps/core.xml",
+                "application/vnd.openxmlformats-package.core-properties+xml",
+                b'<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"/>',
+            ),
+            (
+                "_rels/.rels",
+                "rIdExtendedProperties",
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
+                "docProps/app.xml",
+                "docProps/app.xml",
+                "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+                b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"/>',
+            ),
+        )
+        for definition in additions:
+            payload = _append_relationship_part(payload, *definition)
+        result = self.parser.parse(replace_workbook_payload(fixture, payload))
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(1, result.eligible_item_candidate_count)
+        self.assertEqual("PASS", result.workbook["package_integrity_status"])
+
+    def test_23_main_workbook_part_is_resolved_from_package_relationship(self):
+        fixture = copy.deepcopy(self.by_count[1])
+        payload = workbook_payload(fixture)
+        parts = dict(_package_parts(payload))
+
+        root_rels = ET.fromstring(parts["_rels/.rels"])
+        root_rels.find("{%s}Relationship" % PACKAGE_REL_NS).set(
+            "Target", "pkg/main.xml"
+        )
+        workbook_rels = ET.fromstring(parts["xl/_rels/workbook.xml.rels"])
+        for relation in workbook_rels.findall(
+            "{%s}Relationship" % PACKAGE_REL_NS
+        ):
+            if relation.get("Type", "").endswith("/worksheet"):
+                relation.set("Target", "/xl/" + relation.get("Target", ""))
+        content_root = ET.fromstring(parts["[Content_Types].xml"])
+        workbook_override = next(
+            child
+            for child in content_root.findall("{%s}Override" % CONTENT_TYPES_NS)
+            if child.get("PartName") == "/xl/workbook.xml"
+        )
+        workbook_override.set("PartName", "/pkg/main.xml")
+
+        relocated = _rebuild_package(
+            payload,
+            replacements={
+                "_rels/.rels": _xml_bytes(root_rels),
+                "[Content_Types].xml": _xml_bytes(content_root),
+            },
+            remove={"xl/workbook.xml", "xl/_rels/workbook.xml.rels"},
+            additions=[
+                ("pkg/main.xml", parts["xl/workbook.xml"]),
+                ("pkg/_rels/main.xml.rels", _xml_bytes(workbook_rels)),
+            ],
+        )
+        result = self.parser.parse(replace_workbook_payload(fixture, relocated))
+        self.assertEqual("PARSED", result.status)
+        self.assertEqual(1, result.eligible_item_candidate_count)
+        self.assertEqual("PASS", result.workbook["package_integrity_status"])
 
 
 if __name__ == "__main__":
