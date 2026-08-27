@@ -5,7 +5,7 @@ import base64
 import copy
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 
 sys.dont_write_bytecode = True
@@ -22,7 +22,7 @@ for import_path in (
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from common.json_utils import read_jsonl, read_jsonl_as_list
+from common.json_utils import read_jsonl_as_list
 from common.logger import get_logger
 from inline_summary_adapter import InlineSummaryAdapter
 from run_offline_replay import DEFAULT_INPUT, process_records
@@ -54,6 +54,34 @@ def _check(condition: bool, message: str, failures: List[str]) -> None:
     if not condition:
         failures.append(message)
         logger.error(message)
+
+
+def _contract_status(failures: List[str]) -> str:
+    return "FAIL" if failures else "PASS"
+
+
+def _contract_tests_label(failures: List[str]) -> str:
+    return "CONTRACT TESTS: " + _contract_status(failures)
+
+
+def _read_actual_observation(
+    adapter: InlineSummaryAdapter,
+    input_path: Path = DEFAULT_INPUT,
+) -> Tuple[List[dict], str, List[str]]:
+    try:
+        records = read_jsonl_as_list(str(input_path))
+    except Exception as exc:
+        return (
+            [],
+            "OBSERVATION_UNAVAILABLE",
+            ["source_read_exception:" + type(exc).__name__],
+        )
+    selected = [record for record in records if adapter.matches(record)]
+    return (
+        selected,
+        "OBSERVATION" if selected else "DATA_UNAVAILABLE",
+        [],
+    )
 
 
 def main() -> None:
@@ -135,24 +163,9 @@ def main() -> None:
         failures,
     )
 
-    observation_findings = []
-    source_read_exception = None
-    try:
-        actual_records = (
-            [
-                record
-                for record in read_jsonl(str(DEFAULT_INPUT))
-                if adapter.matches(record)
-            ]
-            if DEFAULT_INPUT.exists()
-            else []
-        )
-    except Exception as exc:
-        actual_records = []
-        source_read_exception = type(exc).__name__
-        observation_findings.append(
-            "source_read_exception:" + source_read_exception
-        )
+    actual_records, actual_availability, observation_findings = (
+        _read_actual_observation(adapter)
+    )
     try:
         actual_artifacts, actual_stats = process_records(actual_records, adapter)
     except Exception as exc:  # rotating actual is observation-only
@@ -171,12 +184,6 @@ def main() -> None:
     ]
     if len(actual_overlay_ids) != len(set(actual_overlay_ids)):
         observation_findings.append("duplicate_derived_message_id")
-    actual_availability = (
-        "OBSERVATION_UNAVAILABLE"
-        if source_read_exception
-        else ("OBSERVATION" if actual_records else "DATA_UNAVAILABLE")
-    )
-
     production_after = _production_artifact_snapshot()
     _check(
         production_before == production_after,
@@ -185,7 +192,8 @@ def main() -> None:
     )
 
     logger.info(
-        "CONTRACT TESTS: PASS counts: input=1 expected=2 parsed=2 mapped=2 "
+        _contract_tests_label(failures)
+        + " counts: input=1 expected=2 parsed=2 mapped=2 "
         "logical=2 versions=2 html_links=0 subject_collision=0"
     )
     logger.info(

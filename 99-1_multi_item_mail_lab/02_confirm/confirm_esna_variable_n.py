@@ -40,6 +40,10 @@ def _check(condition: bool, message: str, failures: List[str]) -> None:
         logger.error(message)
 
 
+def _contract_status(failures: List[str]) -> str:
+    return "FAIL" if failures else "PASS"
+
+
 def _read(filename: str) -> List[Dict[str, Any]]:
     path = RESULT_DIR / filename
     if not path.exists():
@@ -129,8 +133,11 @@ def main() -> None:
         failures,
     )
 
+    contract_status = _contract_status(failures)
     logger.info(
-        "CONTRACT TESTS: PASS variable_N=2/4/10 parsed=2/4/10"
+        "CONTRACT TESTS: "
+        + contract_status
+        + " variable_N=2/4/10 parsed=2/4/10"
     )
     logger.info(
         "ACTUAL OBSERVATIONS: "

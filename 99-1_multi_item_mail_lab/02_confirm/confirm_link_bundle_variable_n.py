@@ -49,6 +49,10 @@ def _check(condition: bool, message: str, failures: List[str]) -> None:
         logger.error(message)
 
 
+def _contract_status(failures: List[str]) -> str:
+    return "FAIL" if failures else "PASS"
+
+
 def main() -> None:
     failures: List[str] = []
     contract = build_link_bundle_contract_results()
@@ -140,8 +144,11 @@ def main() -> None:
         failures,
     )
 
+    contract_status = _contract_status(failures)
     logger.info(
-        "CONTRACT TESTS: PASS role_distribution=0/0,1/1,2/1,1/2,10/4,4/10 "
+        "CONTRACT TESTS: "
+        + contract_status
+        + " role_distribution=0/0,1/1,2/1,1/2,10/4,4/10 "
         "middle_deletion=FAIL_CLOSED"
     )
     logger.info(

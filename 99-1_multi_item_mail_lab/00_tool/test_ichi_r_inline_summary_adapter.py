@@ -5,6 +5,7 @@ import base64
 import copy
 import hashlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,12 +20,18 @@ for import_path in (
     STEP_DIR / "00_tool" / "canonicalize",
     STEP_DIR / "00_tool" / "core",
     STEP_DIR / "00_tool" / "source_identity",
+    STEP_DIR / "02_confirm",
 ):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from common.json_utils import read_jsonl, read_jsonl_as_list
+from common.json_utils import read_jsonl_as_list, write_jsonl
 from canonical_overlay import build_canonical_overlay
+from confirm_ichi_r_inline_summary import (
+    _contract_status,
+    _contract_tests_label,
+    _read_actual_observation,
+)
 from inline_summary_adapter import InlineSummaryAdapter
 from run_offline_replay import DEFAULT_INPUT, process_records
 from run_selective_pipeline_test import (
@@ -68,20 +75,11 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
             attachment["size"] = len(payload)
 
         cls.production_before = _production_artifact_snapshot()
-        cls.actual_source_exception = None
-        try:
-            cls.actual_records = (
-                [
-                    record
-                    for record in read_jsonl(str(DEFAULT_INPUT))
-                    if cls.adapter.matches(record)
-                ]
-                if DEFAULT_INPUT.exists()
-                else []
-            )
-        except Exception as exc:
-            cls.actual_records = []
-            cls.actual_source_exception = type(exc).__name__
+        (
+            cls.actual_records,
+            cls.actual_availability,
+            cls.actual_source_findings,
+        ) = _read_actual_observation(cls.adapter)
         cls.actual_exception = None
         try:
             cls.actual_artifacts, cls.actual_stats = process_records(
@@ -102,8 +100,7 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
     @classmethod
     def _actual_observation(cls):
         findings = []
-        if cls.actual_source_exception:
-            findings.append("source_read_exception:" + cls.actual_source_exception)
+        findings.extend(cls.actual_source_findings)
         if cls.actual_exception:
             findings.append("parser_exception:" + cls.actual_exception)
         source_ids = [str(record.get("message_id", "")) for record in cls.actual_records]
@@ -119,9 +116,7 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
             findings.append("canonical_overlay_schema_mismatch")
         return {
             "availability": (
-                "OBSERVATION_UNAVAILABLE"
-                if cls.actual_source_exception
-                else ("OBSERVATION" if cls.actual_records else "DATA_UNAVAILABLE")
+                cls.actual_availability
             ),
             "observed_mail_count": len(cls.actual_records),
             "observed_item_count": cls.actual_stats["parsed_occurrences"],
@@ -372,14 +367,43 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
             observation["availability"],
             {"OBSERVATION", "DATA_UNAVAILABLE", "OBSERVATION_UNAVAILABLE"},
         )
-        if not self.actual_source_exception:
-            self.assertEqual(
-                bool(self.actual_records),
-                observation["availability"] == "OBSERVATION",
-            )
         self.assertEqual(len(self.actual_records), observation["observed_mail_count"])
         self.assertEqual(0, observation["fixed_count_oracle"])
         self.assertEqual(len(observation["findings"]), observation["finding_count"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "actual.jsonl"
+            write_jsonl(str(input_path), [copy.deepcopy(self.fixture)])
+            _, observed_status, _ = _read_actual_observation(
+                self.adapter, input_path
+            )
+
+            unselected = copy.deepcopy(self.fixture)
+            unselected["from"] = "redacted@example.invalid"
+            write_jsonl(str(input_path), [unselected])
+            _, empty_status, _ = _read_actual_observation(self.adapter, input_path)
+
+            missing_path = Path(temp_dir) / "missing.jsonl"
+            _, missing_status, missing_findings = _read_actual_observation(
+                self.adapter, missing_path
+            )
+
+            input_path.write_text("{invalid-jsonl}\n", encoding="utf-8")
+            _, read_error_status, read_error_findings = _read_actual_observation(
+                self.adapter, input_path
+            )
+
+        self.assertEqual("OBSERVATION", observed_status)
+        self.assertEqual("DATA_UNAVAILABLE", empty_status)
+        self.assertEqual("OBSERVATION_UNAVAILABLE", missing_status)
+        self.assertEqual("OBSERVATION_UNAVAILABLE", read_error_status)
+        self.assertTrue(missing_findings[0].startswith("source_read_exception:"))
+        self.assertTrue(read_error_findings[0].startswith("source_read_exception:"))
+        self.assertEqual("PASS", _contract_status([]))
+        self.assertEqual("FAIL", _contract_status(["forced_contract_failure"]))
+        self.assertEqual(
+            "CONTRACT TESTS: FAIL",
+            _contract_tests_label(["forced_contract_failure"]),
+        )
 
     def test_24_missing_footer_or_required_marker_is_partial(self) -> None:
         missing_footer = copy.deepcopy(self.fixture)

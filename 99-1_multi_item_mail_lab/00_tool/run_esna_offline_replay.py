@@ -172,22 +172,24 @@ def build_esna_contract_results() -> Dict[str, Any]:
 
 def build_esna_results(
     records: Iterable[Dict[str, Any]] = None,
+    input_path: Path = DEFAULT_INPUT,
 ) -> Dict[str, Any]:
     """Build fresh results from the current Core; never read prior 99-1 outputs."""
     adapter = InlineSummaryAdapter.from_file(CONFIG_PATH)
     observation_exceptions = []
     if records is not None:
         source_records = list(records)
-    elif DEFAULT_INPUT.exists():
+        input_observable = True
+    else:
         try:
-            source_records = read_jsonl_as_list(str(DEFAULT_INPUT))
+            source_records = read_jsonl_as_list(str(input_path))
+            input_observable = True
         except Exception as exc:
             source_records = []
+            input_observable = False
             observation_exceptions.append(
                 "source_read_exception:" + type(exc).__name__
             )
-    else:
-        source_records = []
     selected = [record for record in source_records if adapter.matches(record)]
     production_before = _production_artifact_snapshot()
     try:
@@ -261,10 +263,7 @@ def build_esna_results(
         {
             "actual_availability": (
                 "OBSERVATION_UNAVAILABLE"
-                if any(
-                    finding.startswith("source_read_exception:")
-                    for finding in observation_exceptions
-                )
+                if not input_observable
                 else ("OBSERVATION" if selected else "DATA_UNAVAILABLE")
             ),
             "actual_observation_count": len(selected),

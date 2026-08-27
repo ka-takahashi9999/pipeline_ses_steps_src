@@ -5,6 +5,7 @@ import base64
 import copy
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,7 +32,6 @@ from run_esna_offline_replay import (
     build_esna_contract_results,
     build_esna_results,
 )
-from run_offline_replay import DEFAULT_INPUT
 from run_selective_pipeline_test import _production_artifact_snapshot
 
 
@@ -104,23 +104,7 @@ class EsnaInlineSummaryAdapterTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.adapter = InlineSummaryAdapter.from_file(CONFIG_PATH)
         cls.production_before = _production_artifact_snapshot()
-        cls.actual_source_exception = None
-        try:
-            cls.actual_records = (
-                [
-                    record
-                    for record in read_jsonl_as_list(str(DEFAULT_INPUT))
-                    if cls.adapter.matches(record)
-                ]
-                if DEFAULT_INPUT.exists()
-                else []
-            )
-        except Exception as exc:
-            cls.actual_records = []
-            cls.actual_source_exception = type(exc).__name__
-        cls.actual_results = build_esna_results(
-            cls.actual_records if not cls.actual_source_exception else None
-        )
+        cls.actual_results = build_esna_results()
         cls.actual_summary = cls.actual_results["summary"]
         cls.contract_results = build_esna_contract_results()
         cls.contract_summary = cls.contract_results["summary"]
@@ -139,15 +123,11 @@ class EsnaInlineSummaryAdapterTest(unittest.TestCase):
         self.assertNotIn("expected_item_count", self.adapter.config)
 
     def test_02_actual_availability_and_counts_are_observation_only(self) -> None:
-        expected = (
-            "OBSERVATION_UNAVAILABLE"
-            if self.actual_source_exception
-            else ("OBSERVATION" if self.actual_records else "DATA_UNAVAILABLE")
+        self.assertIn(
+            self.actual_summary["actual_availability"],
+            {"OBSERVATION", "DATA_UNAVAILABLE", "OBSERVATION_UNAVAILABLE"},
         )
-        self.assertEqual(expected, self.actual_summary["actual_availability"])
-        self.assertEqual(
-            len(self.actual_records), self.actual_summary["actual_observation_count"]
-        )
+        self.assertIsInstance(self.actual_summary["actual_observation_count"], int)
         self.assertEqual(0, self.actual_summary["actual_runtime_fixed_oracle"])
         self.assertIsInstance(self.actual_summary["delivery_cardinalities"], list)
 
@@ -396,6 +376,31 @@ class EsnaInlineSummaryAdapterTest(unittest.TestCase):
         self.assertEqual(1, summary["actual_observation_count"])
         self.assertEqual(4, summary["parsed_occurrences"])
         self.assertEqual(0, summary["actual_runtime_fixed_oracle"])
+
+        unselected = _build_synthetic_mail(2)
+        unselected["from"] = "redacted@example.invalid"
+        self.assertEqual(
+            "DATA_UNAVAILABLE",
+            build_esna_results([unselected])["summary"]["actual_availability"],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_path = Path(temp_dir) / "missing.jsonl"
+            missing = build_esna_results(input_path=missing_path)["summary"]
+            malformed_path = Path(temp_dir) / "malformed.jsonl"
+            malformed_path.write_text("{invalid-jsonl}\n", encoding="utf-8")
+            malformed = build_esna_results(input_path=malformed_path)["summary"]
+        self.assertEqual("OBSERVATION_UNAVAILABLE", missing["actual_availability"])
+        self.assertEqual("OBSERVATION_UNAVAILABLE", malformed["actual_availability"])
+        self.assertTrue(
+            missing["actual_observation_findings"][0].startswith(
+                "source_read_exception:"
+            )
+        )
+        self.assertTrue(
+            malformed["actual_observation_findings"][0].startswith(
+                "source_read_exception:"
+            )
+        )
 
 
 if __name__ == "__main__":
