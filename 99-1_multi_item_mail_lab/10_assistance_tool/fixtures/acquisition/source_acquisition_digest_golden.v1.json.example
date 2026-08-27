@@ -1,0 +1,45 @@
+{
+  "fixture_id": "ordered-snapshot-set-golden-v1",
+  "logical_object": [
+    {
+      "byte_length": 3,
+      "content_type": "application/json",
+      "entry_id": "row\n1",
+      "entry_raw_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "locator_binding_id": "locator:sheet-a",
+      "next_locator_metadata": {
+        "next_locator_binding_id": "",
+        "state": "ABSENT"
+      },
+      "page_or_tab_id": {
+        "state": "VALUE",
+        "value": "シートA"
+      },
+      "planned_container_id": "container:sheet",
+      "requested_range": {
+        "state": "VALUE",
+        "value": "A1:C10"
+      },
+      "returned_range": {
+        "state": "VALUE",
+        "value": "A1:C10"
+      },
+      "sequence": 0,
+      "source_version": {
+        "observed_at": "2026-08-27T12:34:56.000000Z",
+        "provider_authority_ref": "provider:google-sheets",
+        "version_binding_id": "revision:example",
+        "version_kind": "PROVIDER_VERSION",
+        "version_scope": "WORKBOOK_WIDE",
+        "version_strength": "STRONG"
+      },
+      "terminal": "TERMINAL",
+      "terminal_evidence": {
+        "evidence_binding_id": "evidence:end:1",
+        "evidence_kind": "NO_NEXT_LOCATOR"
+      }
+    }
+  ],
+  "expected_canonical_json": "[{\"byte_length\":3,\"content_type\":\"application/json\",\"entry_id\":\"row\\u000a1\",\"entry_raw_digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"locator_binding_id\":\"locator:sheet-a\",\"next_locator_metadata\":{\"next_locator_binding_id\":\"\",\"state\":\"ABSENT\"},\"page_or_tab_id\":{\"state\":\"VALUE\",\"value\":\"シートA\"},\"planned_container_id\":\"container:sheet\",\"requested_range\":{\"state\":\"VALUE\",\"value\":\"A1:C10\"},\"returned_range\":{\"state\":\"VALUE\",\"value\":\"A1:C10\"},\"sequence\":0,\"source_version\":{\"observed_at\":\"2026-08-27T12:34:56.000000Z\",\"provider_authority_ref\":\"provider:google-sheets\",\"version_binding_id\":\"revision:example\",\"version_kind\":\"PROVIDER_VERSION\",\"version_scope\":\"WORKBOOK_WIDE\",\"version_strength\":\"STRONG\"},\"terminal\":\"TERMINAL\",\"terminal_evidence\":{\"evidence_binding_id\":\"evidence:end:1\",\"evidence_kind\":\"NO_NEXT_LOCATOR\"}}]",
+  "expected_ordered_snapshot_set_digest": "sha256:8434afd8683e87ecda503124b0dc6a3c8ae2b3d38986ae9eb2e719fe0b40d443"
+}

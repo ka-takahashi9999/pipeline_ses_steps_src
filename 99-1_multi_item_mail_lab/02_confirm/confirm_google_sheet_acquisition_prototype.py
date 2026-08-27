@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Confirm the one-provider Google Sheet acquisition prototype artifacts."""
+"""Confirm exact digest/schema artifacts and saved test evidence."""
 
 import sys
 from pathlib import Path
@@ -17,7 +17,9 @@ for import_path in (PROJECT_ROOT, ACQUISITION_DIR, STEP_DIR / "00_tool"):
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from google_sheet_acquisition_contract import (
-    digest_bytes,
+    MANIFEST_FIELDS,
+    SNAPSHOT_ENTRY_FIELDS,
+    calculate_entry_raw_digest,
     offline_negative_proofs,
     validate_attempt_plan,
     validate_manifest,
@@ -49,59 +51,51 @@ def main() -> None:
     plan = _one("attempt_plan.jsonl")
     manifest = _one("acquisition_manifest.jsonl")
     summary = _one("prototype_summary.jsonl")
+    focused = _one("focused_test_result.jsonl")
+    baseline = _one("baseline_test_result.jsonl")
     snapshot_rows = read_jsonl_as_list(str(RESULT_DIR / "snapshot_entries.jsonl"))
-    _check(len(registry.get("profiles", [])) == 1, "Profile count mismatch", failures)
-    _check(plan.get("attempt_ordinal") == 1, "Attempt count mismatch", failures)
-    _check(len(plan.get("planned_containers", [])) == 1, "planned Container count mismatch", failures)
-    _check(len(snapshot_rows) in {0, 1}, "Snapshot count exceeds prototype cap", failures)
-    _check(summary.get("candidate_emission") == 0, "candidate emission must be zero", failures)
-    _check(summary.get("eligible") == 0, "eligible must be zero", failures)
-    _check(summary.get("auto_union") is False, "auto-union must be false", failures)
-    _check(summary.get("actual_fixed_oracle") == 0, "actual fixed oracle must be zero", failures)
-    _check(summary.get("production_write") == 0, "production write must be zero", failures)
-    _check(summary.get("P8") == "NONE", "P8 must remain NONE", failures)
+    conformance_rows = read_jsonl_as_list(str(RESULT_DIR / "digest_schema_conformance.jsonl"))
+
     _check(not validate_profile_registry(registry), "Profile validation failed", failures)
     _check(not validate_attempt_plan(plan), "Attempt Plan validation failed", failures)
+    _check(len(registry.get("profiles", [])) == 1, "Profile count mismatch", failures)
+    _check(plan.get("attempt_ordinal") == 1, "Attempt count mismatch", failures)
+    planned = plan.get("planned_container_set", {}).get("planned_container_entries", [])
+    _check(len(planned) == 1, "planned Container count mismatch", failures)
+    _check(len(manifest) == 15 and set(manifest) == set(MANIFEST_FIELDS), "Manifest exact 15-field schema mismatch", failures)
+    _check(len(snapshot_rows) == 1, "Snapshot count must equal one", failures)
+    if snapshot_rows:
+        _check(
+            len(snapshot_rows[0]) == 18 and set(snapshot_rows[0]) == set(SNAPSHOT_ENTRY_FIELDS),
+            "SnapshotEntry exact 18-field schema mismatch",
+            failures,
+        )
+    _check(manifest.get("snapshot_count") == len(snapshot_rows), "snapshot_count mismatch", failures)
 
     raw_entries: Dict[str, bytes] = {}
     for entry in snapshot_rows:
-        path = RESULT_DIR / entry["relative_path"]
+        path = RESULT_DIR / entry["raw_artifact_ref"]
         _check(path.exists(), "Snapshot file missing", failures)
         if path.exists():
             payload = path.read_bytes()
-            raw_entries[entry["snapshot_entry_id"]] = payload
+            raw_entries[entry["entry_id"]] = payload
             _check(
-                digest_bytes(payload) == entry.get("entry_raw_digest"),
-                "Snapshot ENTRY_RAW_DIGEST mismatch",
+                calculate_entry_raw_digest(payload) == entry.get("entry_raw_digest"),
+                "ENTRY_RAW_DIGEST mismatch",
                 failures,
             )
-            _check(len(payload) == entry.get("byte_count"), "Snapshot byte count mismatch", failures)
+            _check(len(payload) == entry.get("byte_length"), "Snapshot byte_length mismatch", failures)
 
     validation = validate_manifest(manifest, registry, plan, raw_entries)
-    _check(validation.get("valid") is True, "Manifest integrity validation failed", failures)
-    _check(validation.get("eligible") == 0, "Manifest eligible must be zero", failures)
-    _check(
-        validation.get("acquisition_status") == manifest.get("acquisition_status"),
-        "Manifest completeness status mismatch",
-        failures,
-    )
-    access = manifest.get("access_status")
-    _check(access in {"SUCCESS", "AUTH_REQUIRED"}, "access must be SUCCESS or AUTH_REQUIRED", failures)
-    if access == "SUCCESS":
-        _check(len(snapshot_rows) == 1, "successful access requires one Snapshot", failures)
-        observation = manifest.get("observation", {})
-        _check(observation.get("workbook_tab_inventory") == "AVAILABLE", "tab inventory unavailable", failures)
-        _check(observation.get("range_bounds") == "AVAILABLE", "range/bounds unavailable", failures)
-        _check(
-            observation.get("presentation_metadata", {}).get("overall_availability")
-            in {"AVAILABLE", "PARTIAL"},
-            "presentation metadata unavailable",
-            failures,
-        )
+    _check(validation.get("valid") is True, "Manifest validation failed", failures)
+    _check(validation.get("exact_manifest_schema") is True, "Manifest exact schema failed", failures)
+    _check(validation.get("exact_snapshot_entry_schema") is True, "SnapshotEntry exact schema failed", failures)
+    _check(validation.get("digest_conformance") is True, "Digest conformance failed", failures)
+    _check(validation.get("acquisition_status") == "UNVERIFIED", "Acquisition must remain UNVERIFIED", failures)
+    _check(validation.get("review_status") == "HUMAN_REVIEW", "presentation review status mismatch", failures)
+    _check(validation.get("eligible") == 0, "eligible must be zero", failures)
 
-    negative_results = offline_negative_proofs(
-        manifest, registry, plan, raw_entries
-    )
+    negative_cases = offline_negative_proofs(manifest, registry, plan, raw_entries)
     expected = {
         "profile_digest_mismatch": ("UNVERIFIED", "profile_digest_mismatch"),
         "planned_scope_mismatch": ("PARTIAL", "planned_scope_mismatch"),
@@ -114,46 +108,84 @@ def main() -> None:
         "attempt_uncommitted": ("INCOMPLETE", "attempt_uncommitted"),
     }
     negative_pass = 0
-    for case in negative_results:
-        name = case["name"]
-        result = case["result"]
-        status, reason = expected[name]
+    for case in negative_cases:
+        status, reason = expected[case["name"]]
         passed = (
-            result.get("acquisition_status") == status
-            and reason in result.get("reasons", [])
-            and result.get("eligible") == 0
+            case["result"]["acquisition_status"] == status
+            and reason in case["result"]["reasons"]
+            and case["result"]["eligible"] == 0
         )
-        if name == "presentation_unresolved":
-            passed = passed and result.get("review_status") == "HUMAN_REVIEW"
-        if passed:
-            negative_pass += 1
-        else:
-            failures.append("negative proof failed:" + name)
-    _check(negative_pass == 9, "negative proof count mismatch", failures)
+        if case["name"] == "presentation_unresolved":
+            passed = passed and case["result"]["review_status"] == "HUMAN_REVIEW"
+        negative_pass += int(passed)
+    _check(negative_pass == 9, "original negative proof count mismatch", failures)
+
+    conformance_pass = sum(row.get("passed") is True for row in conformance_rows)
+    _check(conformance_rows and conformance_pass == len(conformance_rows), "saved conformance proof failed", failures)
+    _check(focused.get("focused_status") == "PASS", "focused test evidence failed", failures)
+    _check(
+        focused.get("focused_passed") == focused.get("focused_total"),
+        "focused test count mismatch",
+        failures,
+    )
+    _check(
+        focused.get("digest_schema_negative_passed") == focused.get("digest_schema_negative_total"),
+        "digest/schema negative evidence failed",
+        failures,
+    )
+    _check(baseline.get("baseline_status") == "PASS", "baseline evidence failed", failures)
+    _check(
+        baseline.get("baseline_passed") == baseline.get("baseline_total"),
+        "baseline count mismatch",
+        failures,
+    )
+    _check(baseline.get("existing_contract_regression") == 0, "existing contract regression detected", failures)
+    _check(baseline.get("pipeline_04_05_runs") == 0, "04/05 must not run", failures)
+    _check(summary.get("implementation") == "PASS", "strict Prototype implementation failed", failures)
+    _check(summary.get("prototype_pass_condition") == "STRICT", "old Prototype PASS condition remains", failures)
+    _check(summary.get("google_live_access") == 0, "unexpected Google live access", failures)
+    _check(summary.get("attempt_state") == "COMMITTED", "Attempt must remain COMMITTED", failures)
+    _check(summary.get("candidate_emission") == 0, "candidate emission must be zero", failures)
+    _check(summary.get("production_write") == 0, "production write must be zero", failures)
+    _check(summary.get("P8") == "NONE", "P8 must remain NONE", failures)
 
     report = {
         "confirm_status": "FAIL" if failures else "PASS",
-        "profile_count": len(registry.get("profiles", [])),
-        "attempt_count": 1,
-        "planned_container_count": len(plan.get("planned_containers", [])),
-        "snapshot_count": len(snapshot_rows),
-        "manifest_count": 1,
-        "negative_proofs_pass": negative_pass,
-        "negative_proofs_total": 9,
-        "acquisition_status": manifest.get("acquisition_status"),
+        "manifest_field_count": len(manifest),
+        "snapshot_entry_field_count": len(snapshot_rows[0]) if snapshot_rows else 0,
+        "canonical_schema_digest_conformance_passed": conformance_pass,
+        "canonical_schema_digest_conformance_total": len(conformance_rows),
+        "original_negative_passed": negative_pass,
+        "original_negative_total": 9,
+        "digest_schema_negative_passed": focused.get("digest_schema_negative_passed", 0),
+        "digest_schema_negative_total": focused.get("digest_schema_negative_total", 0),
+        "focused_passed": focused.get("focused_passed", 0),
+        "focused_total": focused.get("focused_total", 0),
+        "baseline_passed": baseline.get("baseline_passed", 0),
+        "baseline_total": baseline.get("baseline_total", 0),
+        "pipeline_04_05_runs": 0,
+        "google_live_access": 0,
+        "acquisition_status": validation.get("acquisition_status"),
+        "attempt_state": "COMMITTED",
         "eligible": 0,
         "candidate_emission": 0,
-        "auto_union": False,
         "production_write": 0,
         "failure_count": len(failures),
         "failures": failures,
     }
     write_jsonl(str(CONFIRM_DIR / "confirm_report.jsonl"), [report])
     if failures:
-        logger.error("Google Sheet acquisition prototype confirm NG")
+        logger.error("Google Sheet digest conformance confirm NG")
         raise SystemExit(1)
     logger.ok(
-        "Google Sheet acquisition prototype confirm OK: negative=9/9 eligible=0 candidate=0 production_write=0"
+        "Google Sheet digest conformance confirm OK: focused="
+        + str(report["focused_passed"]) + "/" + str(report["focused_total"])
+        + " negative=9/9 digest_schema="
+        + str(report["digest_schema_negative_passed"]) + "/"
+        + str(report["digest_schema_negative_total"])
+        + " baseline=" + str(report["baseline_passed"]) + "/"
+        + str(report["baseline_total"])
+        + " live=0 eligible=0 production_write=0"
     )
 
 

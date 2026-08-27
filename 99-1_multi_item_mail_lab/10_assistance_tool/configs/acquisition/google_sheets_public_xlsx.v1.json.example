@@ -3,34 +3,36 @@
   "registry_id": "99-1-google-sheet-acquisition-prototype",
   "profiles": [
     {
-      "profile_id": "google_sheets_public_xlsx",
-      "profile_version": "1.0.0",
-      "provider": "GOOGLE_SHEETS",
+      "profile_schema_version": "AcquisitionProfile.v1",
+      "acquisition_profile_id": "google_sheets_public_xlsx",
+      "acquisition_profile_version": "1.0.0",
+      "provider_id": "GOOGLE_SHEETS",
+      "source_class": "GOOGLE_SHEET",
       "acquisition_method": "PUBLIC_SHARED_URL_XLSX_EXPORT",
-      "locator_selector": {
-        "sender_domain": "tanapism.co.jp",
-        "link_text_contains": "その他人材情報一覧",
-        "locator_host": "docs.google.com",
-        "locator_path_kind": "SPREADSHEET"
-      },
-      "resolved_scope_template": {
-        "scope_kind": "WORKBOOK_EXPORT",
-        "requested_range": "WORKBOOK_ALL_TABS",
-        "tab_inventory": "ALL_EXPORTED_TABS",
-        "cell_bounds": "EACH_EXPORTED_TAB_USED_BOUNDS",
-        "presentation_metadata": "XLSX_PACKAGE_AVAILABLE_SUBSET"
-      },
       "planned_container_template": {
         "container_kind": "GOOGLE_SHEET",
-        "required": true,
         "logical_role": "SOURCE_WORKBOOK",
-        "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "media_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "required": true
+      },
+      "scope_template": {
+        "cell_bounds": "EACH_EXPORTED_TAB_USED_BOUNDS",
+        "presentation_metadata": "XLSX_PACKAGE_AVAILABLE_SUBSET",
+        "requested_range": "WORKBOOK_ALL_TABS",
+        "scope_kind": "WORKBOOK_EXPORT",
+        "tab_inventory": "ALL_EXPORTED_TABS"
+      },
+      "optional_absence_rules": {
+        "http_status": "REQUIRED_FOR_HTTP_METHOD"
+      },
+      "version_policy": {
+        "pre_post_check": "ONCE",
+        "required_scope": "WORKBOOK_WIDE",
+        "required_strength": "STRONG"
       },
       "presentation_policy": "UNRESOLVED",
-      "candidate_emission": 0,
-      "auto_union": false,
-      "production_integration": false,
-      "profile_digest": "sha256:a181c6093e546f07463b750be2bb42c347338315a6f3a3a13b80aca80d4c699b"
+      "business_state_mapping": "NOT_IMPLEMENTED",
+      "acquisition_profile_digest": "sha256:0b9c39cc54fbf408df062031c00c3852fff6e53dbf2c016f9eb619e65d3b71be"
     }
   ]
 }
