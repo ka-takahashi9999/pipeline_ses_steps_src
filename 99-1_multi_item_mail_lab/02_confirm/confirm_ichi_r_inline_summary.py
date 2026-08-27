@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Confirm the test-only Ichi-R P2 offline replay without writing results."""
+"""Confirm stable Ichi-R contract plus optional saved-actual observation."""
 
+import base64
+import copy
 import sys
 from pathlib import Path
 from typing import List
@@ -20,7 +22,7 @@ for import_path in (
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-from common.json_utils import read_jsonl
+from common.json_utils import read_jsonl, read_jsonl_as_list
 from common.logger import get_logger
 from inline_summary_adapter import InlineSummaryAdapter
 from run_offline_replay import DEFAULT_INPUT, process_records
@@ -38,6 +40,14 @@ CONFIG_PATH = (
     / "companies"
     / "ichi_r.config.json.example"
 )
+FIXTURE_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "fixtures"
+    / "redacted"
+    / "inline_summary"
+    / "ichi_r.fixture.jsonl.example"
+)
 
 
 def _check(condition: bool, message: str, failures: List[str]) -> None:
@@ -50,7 +60,20 @@ def main() -> None:
     failures: List[str] = []
     adapter = InlineSummaryAdapter.from_file(CONFIG_PATH)
     production_before = _production_artifact_snapshot()
-    artifacts, stats = process_records(read_jsonl(str(DEFAULT_INPUT)), adapter)
+    fixtures = read_jsonl_as_list(str(FIXTURE_PATH))
+    _check(len(fixtures) == 1, "stable fixture count must be one", failures)
+    if not fixtures:
+        raise SystemExit(1)
+    fixture = copy.deepcopy(fixtures[0])
+    payloads = {
+        "スキルシート(R.A)_20260825.xlsx": b"ichi-r-redacted-A-v1",
+        "RB【匿名駅】.xlsx": b"ichi-r-redacted-B-v1",
+    }
+    for attachment in fixture["attachments"]:
+        payload = payloads[attachment["filename"]]
+        attachment["data"] = base64.urlsafe_b64encode(payload).decode("ascii")
+        attachment["size"] = len(payload)
+    artifacts, stats = process_records([fixture], adapter)
     overlays = artifacts["derived_mail_master"]
 
     _check(stats["input_mails"] == 1, "input mail count must be 1", failures)
@@ -111,6 +134,49 @@ def main() -> None:
         "02-1 must classify resource 2/2",
         failures,
     )
+
+    observation_findings = []
+    source_read_exception = None
+    try:
+        actual_records = (
+            [
+                record
+                for record in read_jsonl(str(DEFAULT_INPUT))
+                if adapter.matches(record)
+            ]
+            if DEFAULT_INPUT.exists()
+            else []
+        )
+    except Exception as exc:
+        actual_records = []
+        source_read_exception = type(exc).__name__
+        observation_findings.append(
+            "source_read_exception:" + source_read_exception
+        )
+    try:
+        actual_artifacts, actual_stats = process_records(actual_records, adapter)
+    except Exception as exc:  # rotating actual is observation-only
+        observation_findings.append("parser_exception:" + type(exc).__name__)
+        actual_artifacts, actual_stats = process_records([], adapter)
+    source_ids = [str(record.get("message_id", "")) for record in actual_records]
+    if len(source_ids) != len(set(source_ids)):
+        observation_findings.append("duplicate_source_message_id")
+    if actual_stats["system_failure_mails"]:
+        observation_findings.append("parser_system_failure")
+    if not actual_stats["canonical_overlay_schema_ok"]:
+        observation_findings.append("canonical_overlay_schema_mismatch")
+    actual_overlay_ids = [
+        str(record.get("message_id", ""))
+        for record in actual_artifacts["derived_mail_master"]
+    ]
+    if len(actual_overlay_ids) != len(set(actual_overlay_ids)):
+        observation_findings.append("duplicate_derived_message_id")
+    actual_availability = (
+        "OBSERVATION_UNAVAILABLE"
+        if source_read_exception
+        else ("OBSERVATION" if actual_records else "DATA_UNAVAILABLE")
+    )
+
     production_after = _production_artifact_snapshot()
     _check(
         production_before == production_after,
@@ -119,8 +185,19 @@ def main() -> None:
     )
 
     logger.info(
-        "counts: input=1 expected=2 parsed=2 mapped=2 "
+        "CONTRACT TESTS: PASS counts: input=1 expected=2 parsed=2 mapped=2 "
         "logical=2 versions=2 html_links=0 subject_collision=0"
+    )
+    logger.info(
+        "ACTUAL OBSERVATIONS: "
+        + actual_availability
+        + " observed_mails="
+        + str(len(actual_records))
+        + " observed_items="
+        + str(actual_stats["parsed_occurrences"])
+    )
+    logger.info(
+        "ACTUAL OBSERVATION FINDINGS: " + str(len(observation_findings))
     )
     for index, overlay in enumerate(overlays[:2], 1):
         logger.info(
@@ -130,7 +207,13 @@ def main() -> None:
     if failures:
         logger.error(f"confirm NG: failures={len(failures)}")
         sys.exit(1)
-    logger.ok("confirm OK: 01-4=2/2 02-1_resource=2/2 LLM/API=0 external_url=0")
+    logger.ok(
+        "confirm OK: contract=PASS actual="
+        + actual_availability
+        + " findings="
+        + str(len(observation_findings))
+        + " fixed_actual_oracle=0 01-4=2/2 02-1_resource=2/2"
+    )
 
 
 if __name__ == "__main__":

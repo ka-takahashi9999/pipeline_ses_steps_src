@@ -68,18 +68,67 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
             attachment["size"] = len(payload)
 
         cls.production_before = _production_artifact_snapshot()
-        cls.production_records = [
-            record
-            for record in read_jsonl(str(DEFAULT_INPUT))
-            if cls.adapter.matches(record)
-        ]
-        cls.production_artifacts, cls.production_stats = process_records(
-            cls.production_records, cls.adapter
+        cls.actual_source_exception = None
+        try:
+            cls.actual_records = (
+                [
+                    record
+                    for record in read_jsonl(str(DEFAULT_INPUT))
+                    if cls.adapter.matches(record)
+                ]
+                if DEFAULT_INPUT.exists()
+                else []
+            )
+        except Exception as exc:
+            cls.actual_records = []
+            cls.actual_source_exception = type(exc).__name__
+        cls.actual_exception = None
+        try:
+            cls.actual_artifacts, cls.actual_stats = process_records(
+                cls.actual_records, cls.adapter
+            )
+        except Exception as exc:  # actual drift is reported, not a contract failure
+            cls.actual_exception = type(exc).__name__
+            cls.actual_artifacts, cls.actual_stats = process_records([], cls.adapter)
+        cls.actual_observation = cls._actual_observation()
+        cls.contract_artifacts, cls.contract_stats = process_records(
+            [copy.deepcopy(cls.fixture)], cls.adapter
         )
-        cls.selective = cls._run_01_4_and_02_1(
-            cls.production_artifacts["derived_mail_master"]
+        cls.contract_selective = cls._run_01_4_and_02_1(
+            cls.contract_artifacts["derived_mail_master"]
         )
         cls.production_after = _production_artifact_snapshot()
+
+    @classmethod
+    def _actual_observation(cls):
+        findings = []
+        if cls.actual_source_exception:
+            findings.append("source_read_exception:" + cls.actual_source_exception)
+        if cls.actual_exception:
+            findings.append("parser_exception:" + cls.actual_exception)
+        source_ids = [str(record.get("message_id", "")) for record in cls.actual_records]
+        if len(source_ids) != len(set(source_ids)):
+            findings.append("duplicate_source_message_id")
+        if cls.actual_stats["system_failure_mails"]:
+            findings.append("parser_system_failure")
+        overlays = cls.actual_artifacts["derived_mail_master"]
+        overlay_ids = [str(record.get("message_id", "")) for record in overlays]
+        if len(overlay_ids) != len(set(overlay_ids)):
+            findings.append("duplicate_derived_message_id")
+        if not cls.actual_stats["canonical_overlay_schema_ok"]:
+            findings.append("canonical_overlay_schema_mismatch")
+        return {
+            "availability": (
+                "OBSERVATION_UNAVAILABLE"
+                if cls.actual_source_exception
+                else ("OBSERVATION" if cls.actual_records else "DATA_UNAVAILABLE")
+            ),
+            "observed_mail_count": len(cls.actual_records),
+            "observed_item_count": cls.actual_stats["parsed_occurrences"],
+            "finding_count": len(findings),
+            "findings": findings,
+            "fixed_count_oracle": 0,
+        }
 
     @classmethod
     def _run_01_4_and_02_1(cls, overlays):
@@ -268,8 +317,8 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
             self.assertNotIn("resource", item["body_text"].casefold())
             self.assertNotIn(self.fixture["subject"], item["body_text"])
 
-    def test_18_offline_replay_matches_one_mail_and_two_items(self) -> None:
-        stats = self.production_stats
+    def test_18_stable_fixture_replay_matches_one_mail_and_two_items(self) -> None:
+        stats = self.contract_stats
         self.assertEqual(1, stats["input_mails"])
         self.assertEqual(2, stats["expected_item_occurrences"])
         self.assertEqual(1, stats["parsed_mails"])
@@ -282,37 +331,57 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
         self.assertEqual(0, stats["duplicate_derived_id_in_overlay"])
         self.assertTrue(stats["canonical_overlay_schema_ok"])
 
-    def test_19_offline_replay_is_order_deterministic(self) -> None:
-        forward = self.production_artifacts["derived_mail_master"]
+    def test_19_stable_fixture_replay_is_order_deterministic(self) -> None:
+        forward = self.contract_artifacts["derived_mail_master"]
         reverse_artifacts, reverse_stats = process_records(
-            reversed(self.production_records), self.adapter
+            [copy.deepcopy(self.fixture)], self.adapter
         )
         self.assertEqual(forward, reverse_artifacts["derived_mail_master"])
-        self.assertEqual(self.production_stats, reverse_stats)
+        self.assertEqual(self.contract_stats, reverse_stats)
 
-    def test_20_offline_replay_propagates_no_html_links(self) -> None:
-        overlays = self.production_artifacts["derived_mail_master"]
+    def test_20_stable_fixture_replay_propagates_no_html_links(self) -> None:
+        overlays = self.contract_artifacts["derived_mail_master"]
         self.assertEqual(2, len(overlays))
         self.assertTrue(all(record["html_links"] == [] for record in overlays))
 
-    def test_21_01_4_and_02_1_classify_both_as_resource_without_llm(self) -> None:
-        self.assertEqual(2, len(self.selective["cleanup"]))
-        self.assertTrue(all(record["body_text"] for record in self.selective["cleanup"]))
+    def test_21_stable_fixture_01_4_02_1_classifies_resource_without_llm(self) -> None:
+        self.assertEqual(2, len(self.contract_selective["cleanup"]))
+        self.assertTrue(
+            all(record["body_text"] for record in self.contract_selective["cleanup"])
+        )
         self.assertEqual(
             ["resource", "resource"],
-            [record["mail_type"] for record in self.selective["classification"]],
+            [
+                record["mail_type"]
+                for record in self.contract_selective["classification"]
+            ],
         )
-        self.assertEqual(0, self.selective["llm_api_calls"])
-        self.assertEqual(0, self.selective["external_url_calls"])
+        self.assertEqual(0, self.contract_selective["llm_api_calls"])
+        self.assertEqual(0, self.contract_selective["external_url_calls"])
 
     def test_22_production_artifacts_are_unchanged_and_unwritten(self) -> None:
         self.assertEqual(self.production_before, self.production_after)
-        source_before = self._file_sha256(DEFAULT_INPUT)
+        source_before = self._file_sha256(DEFAULT_INPUT) if DEFAULT_INPUT.exists() else None
         process_records([copy.deepcopy(self.fixture)], self.adapter)
-        source_after = self._file_sha256(DEFAULT_INPUT)
+        source_after = self._file_sha256(DEFAULT_INPUT) if DEFAULT_INPUT.exists() else None
         self.assertEqual(source_before, source_after)
 
-    def test_23_missing_footer_or_required_marker_is_partial(self) -> None:
+    def test_23_actual_is_explicit_observation_without_fixed_count_oracle(self) -> None:
+        observation = self.actual_observation
+        self.assertIn(
+            observation["availability"],
+            {"OBSERVATION", "DATA_UNAVAILABLE", "OBSERVATION_UNAVAILABLE"},
+        )
+        if not self.actual_source_exception:
+            self.assertEqual(
+                bool(self.actual_records),
+                observation["availability"] == "OBSERVATION",
+            )
+        self.assertEqual(len(self.actual_records), observation["observed_mail_count"])
+        self.assertEqual(0, observation["fixed_count_oracle"])
+        self.assertEqual(len(observation["findings"]), observation["finding_count"])
+
+    def test_24_missing_footer_or_required_marker_is_partial(self) -> None:
         missing_footer = copy.deepcopy(self.fixture)
         missing_footer["body_text"] = missing_footer["body_text"].replace(
             "【営業中エンジニア一覧スプレッドシート】", "【共有情報】"
@@ -324,7 +393,7 @@ class IchiRInlineSummaryAdapterTest(unittest.TestCase):
         )
         self.assertEqual("PARTIAL", self.adapter.parse(missing_marker).status)
 
-    def test_24_selector_requires_sender_domain_and_subject(self) -> None:
+    def test_25_selector_requires_sender_domain_and_subject(self) -> None:
         wrong_domain = copy.deepcopy(self.fixture)
         wrong_domain["from"] = "redacted@example.invalid"
         self.assertEqual("UNSUPPORTED", self.adapter.parse(wrong_domain).status)

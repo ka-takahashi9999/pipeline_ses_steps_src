@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Fresh test-only DrivenX LINK_BUNDLE replay through existing 01-4/02-1 logic."""
+"""Run the stable LINK_BUNDLE contract and optional DrivenX observation."""
 
+import copy
 import sys
 from collections import Counter
 from pathlib import Path
@@ -24,9 +25,10 @@ for import_path in (
 from common.file_utils import ensure_result_dirs
 from common.json_utils import read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
-from canonical_overlay import build_canonical_overlay
+from canonical_overlay import MAIL_MASTER_KEYS, build_canonical_overlay
 from identity import normalize_content
 from link_bundle_adapter import ADAPTER_ID, ADAPTER_VERSION, LinkBundleAdapter
+from link_bundle_fixture_source import build_source_owned_fixtures
 from run_offline_replay import DEFAULT_INPUT
 from run_selective_pipeline_test import (
     _load_existing_modules,
@@ -43,6 +45,14 @@ CONFIG_PATH = (
     / "drivenx_link_bundle.config.json.example"
 )
 RESULT_SUBDIR = "link_bundle_variable_n"
+FIXTURE_PATH = (
+    STEP_DIR
+    / "10_assistance_tool"
+    / "fixtures"
+    / "redacted"
+    / "link_bundle"
+    / "drivenx.variable_n.fixture.jsonl.example"
+)
 
 
 def _run_01_4_02_1(
@@ -78,6 +88,54 @@ def _run_01_4_02_1(
             {"message_id": overlay["message_id"], "mail_type": mail_type}
         )
     return cleanup_records, classification_records
+
+
+def build_link_bundle_contract_results() -> Dict[str, Any]:
+    """Build source-owned variable-N fixtures independently of Gmail actual."""
+    adapter = LinkBundleAdapter.from_file(CONFIG_PATH)
+    fixtures = build_source_owned_fixtures(read_jsonl_as_list(str(FIXTURE_PATH)))
+    results = [adapter.parse(copy.deepcopy(fixture)) for fixture in fixtures]
+    repeated = [adapter.parse(copy.deepcopy(fixture)) for fixture in fixtures]
+    observed_distribution = [
+        [
+            result.source.get("section_counts", {}).get("resource"),
+            result.source.get("section_counts", {}).get("project"),
+        ]
+        for result in results
+    ]
+    expected_distribution = [[0, 0], [1, 1], [2, 1], [1, 2], [10, 4], [4, 10]]
+    overlays = [
+        build_canonical_overlay(fixture, item)
+        for fixture, result in zip(fixtures, results)
+        for item in result.items
+    ]
+    cleanup, classification = _run_01_4_02_1(overlays)
+    findings = []
+    if observed_distribution != expected_distribution:
+        findings.append("variable_n_role_distribution_mismatch")
+    if any(result.status != "PARSED" for result in results):
+        findings.append("stable_fixture_parse_mismatch")
+    if results != repeated:
+        findings.append("stable_fixture_idempotency_mismatch")
+    deletion = copy.deepcopy(fixtures[2])
+    del deletion["html_links"][4]
+    deletion_result = adapter.parse(deletion)
+    if deletion_result.status == "PARSED" or deletion_result.items:
+        findings.append("middle_deletion_not_fail_closed")
+    if len(cleanup) != len(overlays) or len(classification) != len(overlays):
+        findings.append("stable_fixture_projection_count_mismatch")
+    return {
+        "summary": {
+            "contract_status": "PASS" if not findings else "FAIL",
+            "fixture_source_count": len(fixtures),
+            "expected_role_distribution": expected_distribution,
+            "observed_role_distribution": observed_distribution,
+            "projected_item_count": len(overlays),
+            "middle_deletion_fail_closed": not deletion_result.items,
+            "finding_count": len(findings),
+            "findings": findings,
+        }
+    }
 
 
 def _audit_item(
@@ -164,11 +222,19 @@ def build_link_bundle_results(
 ) -> Dict[str, Any]:
     """Build fresh P4 results only from saved html_links snapshots."""
     adapter = LinkBundleAdapter.from_file(CONFIG_PATH)
-    source_records = (
-        list(records)
-        if records is not None
-        else read_jsonl_as_list(str(DEFAULT_INPUT))
-    )
+    observation_exceptions: List[str] = []
+    if records is not None:
+        source_records = list(records)
+    elif DEFAULT_INPUT.exists():
+        try:
+            source_records = read_jsonl_as_list(str(DEFAULT_INPUT))
+        except Exception as exc:
+            source_records = []
+            observation_exceptions.append(
+                "source_read_exception:" + type(exc).__name__
+            )
+    else:
+        source_records = []
     selected = sorted(
         (record for record in source_records if adapter.matches(record)),
         key=lambda record: str(record.get("message_id", "")),
@@ -185,8 +251,22 @@ def build_link_bundle_results(
     statuses = Counter()
     deterministic = True
     for mail in selected:
-        result = adapter.parse(mail)
-        repeat = adapter.parse(mail)
+        try:
+            result = adapter.parse(mail)
+            repeat = adapter.parse(mail)
+        except Exception as exc:  # rotating actual is observation-only
+            statuses["SYSTEM_FAILURE"] += 1
+            observation_exceptions.append("parser_exception:" + type(exc).__name__)
+            source_audits.append(
+                {
+                    "original_message_id": str(mail.get("message_id", "")),
+                    "parse_status": "SYSTEM_FAILURE",
+                    "parse_reasons": ["observation_parser_exception"],
+                    "source": {},
+                    "container_contracts": [],
+                }
+            )
+            continue
         deterministic = deterministic and result == repeat
         statuses[result.status] += 1
         source_audits.append(
@@ -222,7 +302,14 @@ def build_link_bundle_results(
     eligible_audits.sort(key=lambda row: row["derived_item_id"])
     technical_overlays.sort(key=lambda row: row["message_id"])
     technical_audits.sort(key=lambda row: row["derived_item_id"])
-    cleanup_records, classification_records = _run_01_4_02_1(technical_overlays)
+    try:
+        cleanup_records, classification_records = _run_01_4_02_1(
+            technical_overlays
+        )
+    except Exception as exc:  # projection failure is an observation finding
+        observation_exceptions.append("projection_exception:" + type(exc).__name__)
+        cleanup_records = []
+        classification_records = []
     classification_by_id = {
         row["message_id"]: row["mail_type"] for row in classification_records
     }
@@ -260,6 +347,15 @@ def build_link_bundle_results(
         audit["source"].get("source_atomic_status") for audit in source_audits
     }
     summary = {
+        "actual_availability": (
+            "OBSERVATION_UNAVAILABLE"
+            if any(
+                finding.startswith("source_read_exception:")
+                for finding in observation_exceptions
+            )
+            else ("OBSERVATION" if selected else "DATA_UNAVAILABLE")
+        ),
+        "actual_observation_count": len(selected),
         "input_sources": len(selected),
         "parsed_sources": statuses["PARSED"],
         "partial_sources": statuses["PARTIAL"],
@@ -335,6 +431,47 @@ def build_link_bundle_results(
         "production_changes": 0,
         "production_write": int(production_before != production_after),
     }
+    actual_findings = list(observation_exceptions)
+    source_ids = [str(record.get("message_id", "")) for record in selected]
+    if len(source_ids) != len(set(source_ids)):
+        actual_findings.append("duplicate_source_message_id")
+    if summary["system_failure_sources"]:
+        actual_findings.append("parser_system_failure")
+    if summary["duplicate_item_locators"]:
+        actual_findings.append("duplicate_item_locator")
+    if summary["unknown_links"]:
+        actual_findings.append("unknown_link_role")
+    if summary["cross_item_contamination"]:
+        actual_findings.append("cross_item_contamination")
+    if not summary["derived_id_deterministic"]:
+        actual_findings.append("derived_id_nondeterministic")
+    technical_ids = [record.get("message_id") for record in technical_overlays]
+    if len(technical_ids) != len(set(technical_ids)):
+        actual_findings.append("duplicate_technical_message_id")
+    if any(set(record) != MAIL_MASTER_KEYS for record in technical_overlays):
+        actual_findings.append("technical_overlay_schema_mismatch")
+    indexes_by_source: Dict[str, List[int]] = {}
+    for row in link_enumeration:
+        indexes_by_source.setdefault(
+            str(row.get("original_message_id", "")), []
+        ).append(row.get("index"))
+    if any(
+        indexes != list(range(len(indexes)))
+        for indexes in indexes_by_source.values()
+    ):
+        actual_findings.append("ordered_enumeration_mismatch")
+    if any(
+        row.get("mail_type") not in {"resource", "project", "ambiguous", "unknown"}
+        for row in classification_records
+    ):
+        actual_findings.append("classification_status_out_of_schema")
+    summary.update(
+        {
+            "actual_observation_finding_count": len(actual_findings),
+            "actual_observation_findings": actual_findings,
+            "actual_runtime_fixed_oracle": 0,
+        }
+    )
     return {
         "source_audit": source_audits,
         "link_enumeration": link_enumeration,
@@ -392,65 +529,29 @@ def write_link_bundle_results(results: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    contract = build_link_bundle_contract_results()
     results = build_link_bundle_results()
     summary = results["summary"]
-    required = {
-        "input_sources": 1,
-        "parsed_sources": 0,
-        "partial_sources": 1,
-        "actual_links": 104,
-        "links_classified": 104,
-        "resource_headers": 1,
-        "project_headers": 1,
-        "resource_items": 50,
-        "project_items": 50,
-        "non_item_links": 4,
-        "unknown_links": 0,
-        "duplicate_item_locators": 0,
-        "observed_canonical_candidates": 100,
-        "technical_projection_resources": 50,
-        "technical_projection_projects": 50,
-        "technical_projection_total": 100,
-        "canonical_eligible_resources": 0,
-        "canonical_eligible_projects": 0,
-        "canonical_eligible_total": 0,
-        "cross_item_contamination": 0,
-        "logical_distinct": 100,
-        "derived_distinct": 100,
-        "cleanup_output": 100,
-        "cleanup_nonempty": 100,
-        "resource_classified_correct": 50,
-        "project_classified_correct": 50,
-        "ambiguous_output": 0,
-        "unknown_output": 0,
-        "production_write": 0,
-    }
-    failures = [
-        f"{key}:{summary.get(key)}:expected:{expected}"
-        for key, expected in required.items()
-        if summary.get(key) != expected
+    summary["contract_status"] = contract["summary"]["contract_status"]
+    summary["contract_role_distribution"] = contract["summary"][
+        "observed_role_distribution"
     ]
-    if not summary.get("derived_id_deterministic"):
-        failures.append("derived_id_determinism_failed")
-    expected_states = {
-        "actual_acquisition_status": "UNVERIFIED",
-        "actual_container_enumeration_status": "COMPLETE",
-        "actual_role_classification_status": "PASS",
-        "actual_source_atomic_status": "PARTIAL",
-        "actual_auto_union_eligible": False,
-    }
-    failures.extend(
-        f"{key}:{summary.get(key)}:expected:{expected}"
-        for key, expected in expected_states.items()
-        if summary.get(key) != expected
-    )
-    if failures:
-        raise ValueError("LINK_BUNDLE actual replay failed: " + ";".join(failures))
+    summary["contract_finding_count"] = contract["summary"]["finding_count"]
+    if contract["summary"]["findings"]:
+        raise ValueError(
+            "LINK_BUNDLE stable contract failed: "
+            + ";".join(contract["summary"]["findings"])
+        )
     write_link_bundle_results(results)
     logger.ok(
-        "LINK_BUNDLE actual replay OK: acquisition=UNVERIFIED container=COMPLETE "
-        "links=104 classified=104 observed_candidates=100 auto_union=NO "
-        "technical_01-4=100 technical_02-1=50+50"
+        "LINK_BUNDLE contract PASS: variable_N role distribution actual="
+        + str(summary["actual_availability"])
+        + " observed_sources="
+        + str(summary["actual_observation_count"])
+        + " observed_links="
+        + str(summary["actual_links"])
+        + " findings="
+        + str(summary["actual_observation_finding_count"])
     )
 
 

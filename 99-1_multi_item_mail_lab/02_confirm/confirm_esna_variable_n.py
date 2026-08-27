@@ -2,7 +2,6 @@
 """Confirm fresh ESNA variable-N replay and 01-4/02-1 compatibility."""
 
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -24,7 +23,11 @@ for import_path in (
 from common.json_utils import read_jsonl_as_list
 from common.logger import get_logger
 from canonical_overlay import MAIL_MASTER_KEYS
-from run_esna_offline_replay import RESULT_SUBDIR, build_esna_results
+from run_esna_offline_replay import (
+    RESULT_SUBDIR,
+    build_esna_contract_results,
+    build_esna_results,
+)
 
 
 logger = get_logger("confirm_99-1_esna_variable_n")
@@ -46,71 +49,20 @@ def _read(filename: str) -> List[Dict[str, Any]]:
 
 def main() -> None:
     failures: List[str] = []
-    fresh = build_esna_results()
-    saved = {
-        "audit_items": _read("audit_items.jsonl"),
-        "derived_mail_master": _read("derived_mail_master.jsonl"),
-        "derived_input_ids": _read("derived_input_ids.jsonl"),
-        "cleanup": _read("01-4_cleanup.jsonl"),
-        "classification": _read("02-1_classification.jsonl"),
-    }
-    summaries = _read("replay_summary.jsonl")
-    _check(len(summaries) == 1, "ESNA summary must contain one record", failures)
-    if not summaries:
-        raise SystemExit(1)
-    saved["summary"] = summaries[0]
-    _check(saved == fresh, "saved ESNA outputs are not fresh Core results", failures)
-
-    summary = fresh["summary"]
-    required = {
-        "input_mails": 2,
-        "parsed_mails": 2,
-        "partial_mails": 0,
-        "human_review_mails": 0,
-        "system_failure_mails": 0,
-        "actual_item_occurrences": 8,
-        "actual_attachment_count": 8,
-        "parsed_occurrences": 8,
-        "attachment_mapping_success": 8,
-        "logical_distinct": 8,
-        "derived_versions": 8,
-        "duplicate_derived_id_in_overlay": 0,
-        "cross_item_contamination": 0,
-        "shared_url_propagated": 0,
-        "cleanup_output": 8,
-        "classification_output": 8,
-        "resource_output": 8,
-        "project_output": 0,
-        "ambiguous_output": 0,
-        "unknown_output": 0,
-        "llm_api_calls": 0,
-        "external_url_calls": 0,
-        "production_changes": 0,
-        "production_write": 0,
-    }
-    for key, expected in required.items():
-        _check(
-            summary.get(key) == expected,
-            f"{key}:{summary.get(key)}:expected:{expected}",
-            failures,
-        )
+    contract = build_esna_contract_results()
+    contract_summary = contract["summary"]
+    _check(contract_summary.get("contract_status") == "PASS", "stable contract failed", failures)
+    _check(contract_summary.get("variable_n") == [2, 4, 10], "variable-N mismatch", failures)
     _check(
-        summary.get("delivery_cardinalities") == [3, 5],
-        "actual ESNA cardinalities must be 3 and 5",
+        contract_summary.get("observed_item_counts") == [2, 4, 10],
+        "stable parsed counts mismatch",
         failures,
     )
-    _check(summary.get("parsed_n3") == 3, "actual N=3 must parse 3", failures)
-    _check(summary.get("parsed_n5") == 5, "actual N=5 must parse 5", failures)
-    _check(summary.get("idempotency_ok") is True, "replay must be idempotent", failures)
+    _check(contract_summary.get("finding_count") == 0, "stable findings must be zero", failures)
 
-    audits = fresh["audit_items"]
-    overlays = fresh["derived_mail_master"]
-    status_distribution = Counter(record.get("parse_status") for record in audits)
-    _check(
-        status_distribution == {"PARSED": 8},
-        "all ESNA occurrences must be PARSED",
-        failures,
-    )
+    artifacts = contract["artifacts"]
+    audits = artifacts["audit_items"]
+    overlays = artifacts["derived_mail_master"]
     _check(
         all(
             [
@@ -148,14 +100,49 @@ def main() -> None:
         failures,
     )
     _check(
-        all(record.get("mail_type") == "resource" for record in fresh["classification"]),
-        "02-1 must classify ESNA resource 8/8",
+        all(
+            record.get("mail_type") == "resource"
+            for record in contract["classification"]
+        ),
+        "02-1 must classify stable ESNA resources",
+        failures,
+    )
+
+    actual = build_esna_results()
+    actual_summary = actual["summary"]
+    _check(
+        actual_summary.get("actual_availability")
+        in {"OBSERVATION", "DATA_UNAVAILABLE", "OBSERVATION_UNAVAILABLE"},
+        "actual availability status mismatch",
+        failures,
+    )
+    _check(
+        actual_summary.get("actual_runtime_fixed_oracle") == 0,
+        "actual fixed oracle must be zero",
+        failures,
+    )
+    _check(
+        isinstance(actual_summary.get("actual_observation_findings"), list)
+        and actual_summary.get("actual_observation_finding_count")
+        == len(actual_summary.get("actual_observation_findings")),
+        "actual finding report mismatch",
         failures,
     )
 
     logger.info(
-        "counts: input=2 declared=3+5 parsed=8 mapped=8 "
-        "01-4=8 02-1_resource=8"
+        "CONTRACT TESTS: PASS variable_N=2/4/10 parsed=2/4/10"
+    )
+    logger.info(
+        "ACTUAL OBSERVATIONS: "
+        + str(actual_summary.get("actual_availability"))
+        + " observed_mails="
+        + str(actual_summary.get("actual_observation_count"))
+        + " observed_items="
+        + str(actual_summary.get("parsed_occurrences"))
+    )
+    logger.info(
+        "ACTUAL OBSERVATION FINDINGS: "
+        + str(actual_summary.get("actual_observation_finding_count"))
     )
     for audit in audits[:3]:
         logger.info(
@@ -168,8 +155,11 @@ def main() -> None:
         logger.error(f"ESNA confirm NG: failures={len(failures)}")
         raise SystemExit(1)
     logger.ok(
-        "ESNA confirm OK: N=3 3/3 N=5 5/5 mapping=8/8 "
-        "01-4=8/8 02-1_resource=8/8"
+        "ESNA confirm OK: contract=PASS variable_N=2/4/10 actual="
+        + str(actual_summary.get("actual_availability"))
+        + " findings="
+        + str(actual_summary.get("actual_observation_finding_count"))
+        + " fixed_actual_oracle=0"
     )
 
 
