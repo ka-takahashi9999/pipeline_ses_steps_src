@@ -261,6 +261,9 @@ def phase_a(
             result = ENGINE.submit_run(
                 batch_run_id, batch_client, runtime_root=runtime_root
             )
+        except ENGINE.FileReadinessError:
+            persist_run(s3_client, bucket, prefix, run_dir)
+            raise
         except ENGINE.PendingReconciliation:
             state, _ = store.load()
             if state.get("state") != ENGINE.STATE_PENDING_RECONCILIATION:

@@ -67,10 +67,18 @@ class BatchClient:
         self.upload_calls = 0
         self.create_calls = 0
         self.create_error = None
+        self.file_value = {
+            "id": "file-input-issue2",
+            "purpose": "batch",
+            "status": "processed",
+        }
 
     def upload_input(self, _path):
         self.upload_calls += 1
         return "file-input-issue2"
+
+    def retrieve_file(self, _file_id):
+        return self.file_value
 
     def create_batch(self, _input_file_id, metadata):
         self.create_calls += 1
@@ -195,6 +203,19 @@ class AwsOrchestrationTest(unittest.TestCase):
         self.assertEqual(result["state"], "PENDING_RECONCILIATION")
         self.assertEqual(state["state"], "PENDING_RECONCILIATION")
         self.assertEqual(self.client.create_calls, 1)
+
+    def test_file_readiness_failure_is_persisted_without_batch_create(self):
+        self.client.file_value = {
+            "id": "file-input-issue2",
+            "purpose": "batch",
+            "status": "error",
+        }
+        with self.assertRaises(engine.FileReadinessError):
+            self.phase_a()
+        state = self.s3.json(self.bucket, self.prefix + "/state.json")
+        self.assertEqual("SAFE_STOPPED", state["state"])
+        self.assertEqual("file_status_error", state["file_readiness"]["readiness_result"])
+        self.assertEqual(0, self.client.create_calls)
 
     def _mark_remote_completed(self):
         state_key = self.prefix + "/state.json"

@@ -35,10 +35,18 @@ def load_batch_confirm():
 class FakeClient:
     def __init__(self):
         self.upload_calls = 0
+        self.file_retrieve_calls = 0
         self.create_calls = 0
         self.retrieve_calls = 0
         self.list_calls = 0
         self.upload_id = "file-input-1"
+        self.file_values = [{
+            "id": "file-input-1",
+            "purpose": "batch",
+            "status": "processed",
+        }]
+        self.file_lookup_error = None
+        self.events = []
         self.create_value = {
             "id": "batch-1",
             "status": "validating",
@@ -56,10 +64,23 @@ class FakeClient:
 
     def upload_input(self, _path):
         self.upload_calls += 1
+        self.events.append("upload")
         return self.upload_id
+
+    def retrieve_file(self, _file_id):
+        self.file_retrieve_calls += 1
+        if self.file_lookup_error:
+            self.events.append("file:lookup_failed")
+            raise self.file_lookup_error
+        value = self.file_values[0]
+        if len(self.file_values) > 1:
+            self.file_values.pop(0)
+        self.events.append(f"file:{value.get('status')}")
+        return value
 
     def create_batch(self, _input_file_id, _metadata):
         self.create_calls += 1
+        self.events.append("create")
         if self.create_error:
             raise self.create_error
         return self.create_value
@@ -313,6 +334,110 @@ class StateAndSubmissionTest(unittest.TestCase):
         self.assertTrue(second["resumed"])
         self.assertEqual(1, client.upload_calls)
         self.assertEqual(1, client.create_calls)
+
+    def test_readiness_already_processed_creates_immediately(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        audit = state["file_readiness"]
+        self.assertEqual(1, client.file_retrieve_calls)
+        self.assertEqual(1, client.create_calls)
+        self.assertEqual("batch", audit["purpose"])
+        self.assertEqual("processed", audit["initial_status"])
+        self.assertEqual("processed", audit["final_status"])
+        self.assertEqual(0, audit["poll_count"])
+        self.assertEqual("ready", audit["readiness_result"])
+
+    def test_readiness_uploaded_then_processed_polls_before_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "uploaded"},
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+        ]
+        with patch.object(batch.time, "sleep", return_value=None):
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        audit = state["file_readiness"]
+        self.assertEqual(2, client.file_retrieve_calls)
+        self.assertEqual(1, audit["poll_count"])
+        self.assertEqual("uploaded", audit["initial_status"])
+        self.assertEqual("processed", audit["final_status"])
+        self.assertEqual(1, client.create_calls)
+
+    def test_readiness_error_status_stops_without_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [{
+            "id": client.upload_id, "purpose": "batch", "status": "error"
+        }]
+        with self.assertRaises(batch.FileReadinessError):
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual("input_file_file_status_error", state["safe_stop_reason"])
+
+    def test_readiness_timeout_stops_without_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [{
+            "id": client.upload_id, "purpose": "batch", "status": "uploaded"
+        }]
+        with patch.object(batch.time, "sleep", return_value=None), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 60.0]
+        ):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(2, client.file_retrieve_calls)
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual("readiness_timeout", state["file_readiness"]["readiness_result"])
+        self.assertEqual(1, state["file_readiness"]["poll_count"])
+
+    def test_readiness_wrong_purpose_stops_without_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [{
+            "id": client.upload_id, "purpose": "fine-tune", "status": "processed"
+        }]
+        with self.assertRaises(batch.FileReadinessError):
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual("purpose_not_batch", state["file_readiness"]["readiness_result"])
+
+    def test_readiness_lookup_failure_stops_without_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_lookup_error = batch.BatchEngineError("fixture lookup failure")
+        with self.assertRaises(batch.FileReadinessError):
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual("file_lookup_failed", state["file_readiness"]["readiness_result"])
+
+    def test_batch_create_event_occurs_only_after_processed(self):
+        self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "uploaded"},
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+        ]
+        with patch.object(batch.time, "sleep", return_value=None):
+            batch.submit_run("run1", client, self.root)
+        self.assertEqual(["upload", "file:uploaded", "file:processed", "create"], client.events)
+
+    def test_readiness_unexpected_metadata_stops_without_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [{"id": client.upload_id, "status": "processed"}]
+        with self.assertRaises(batch.FileReadinessError):
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual("unexpected_metadata", state["file_readiness"]["readiness_result"])
 
     def test_create_timeout_stays_pending_and_never_resubmits(self):
         run_dir = self.prepare()

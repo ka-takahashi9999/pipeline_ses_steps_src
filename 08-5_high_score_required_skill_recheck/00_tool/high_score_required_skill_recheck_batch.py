@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -42,6 +43,8 @@ RESULT_DIR = STEP_DIR / "01_result"
 COMMIT_MARKER = RESULT_DIR / "production_commit.json"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
 API_BASE_URL = "https://api.openai.com/v1"
+FILE_READINESS_POLL_INTERVAL_SECONDS = 2.0
+FILE_READINESS_TIMEOUT_SECONDS = 60.0
 
 STATE_PREPARED = "PREPARED"
 STATE_CLAIMED = "CLAIMED"
@@ -73,6 +76,13 @@ class CASConflict(BatchEngineError):
 
 class SubmissionBlocked(BatchEngineError):
     pass
+
+
+class FileReadinessError(SubmissionBlocked):
+    def __init__(self, reason: str, audit: Dict[str, Any]):
+        super().__init__(f"OpenAI input file readiness確認失敗: {reason}")
+        self.reason = reason
+        self.audit = audit
 
 
 class PendingReconciliation(BatchEngineError):
@@ -450,6 +460,7 @@ def prepare_run(
         "manifest_count": len(manifest),
         "request_count": len(requests_to_send),
         "input_file_id": None,
+        "file_readiness": None,
         "batch_id": None,
         "batch_status": None,
         "request_counts": None,
@@ -517,6 +528,18 @@ class OpenAIHttpBatchClient:
         )
         return self._json(response, "batch create")
 
+    def retrieve_file(self, file_id: str) -> Dict[str, Any]:
+        response = requests.get(
+            API_BASE_URL + f"/files/{file_id}",
+            headers=self._headers(),
+            timeout=60,
+        )
+        metadata = dict(self._json(response, "file retrieve"))
+        request_id = response.headers.get("x-request-id")
+        if request_id:
+            metadata["_openai_request_id"] = request_id
+        return metadata
+
     def retrieve_batch(self, batch_id: str) -> Dict[str, Any]:
         response = requests.get(
             API_BASE_URL + f"/batches/{batch_id}",
@@ -565,6 +588,85 @@ def _batch_metadata(state: Dict[str, Any]) -> Dict[str, str]:
         "submission_nonce": str(state["submission_nonce"]),
         "manifest_sha256": str(state["manifest_sha256"]),
     }
+
+
+def _wait_for_input_file_ready(
+    client: Any,
+    file_id: str,
+    poll_interval_seconds: float = FILE_READINESS_POLL_INTERVAL_SECONDS,
+    timeout_seconds: float = FILE_READINESS_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Poll read-only file metadata and fail closed until Batch input is ready."""
+    started = time.monotonic()
+    audit: Dict[str, Any] = {
+        "file_id": file_id,
+        "purpose": None,
+        "initial_status": None,
+        "final_status": None,
+        "poll_count": 0,
+        "wait_duration_seconds": 0.0,
+        "readiness_result": "checking",
+        "openai_request_ids": [],
+    }
+
+    def fail(reason: str, elapsed: float) -> None:
+        audit["wait_duration_seconds"] = round(max(0.0, elapsed), 3)
+        audit["readiness_result"] = reason
+        raise FileReadinessError(reason, dict(audit))
+
+    while True:
+        try:
+            metadata = client.retrieve_file(file_id)
+        except Exception as error:
+            elapsed = time.monotonic() - started
+            try:
+                fail("file_lookup_failed", elapsed)
+            except FileReadinessError as readiness_error:
+                raise readiness_error from error
+
+        elapsed = time.monotonic() - started
+        if not isinstance(metadata, dict):
+            fail("unexpected_metadata", elapsed)
+        metadata_file_id = metadata.get("id")
+        purpose = metadata.get("purpose")
+        status = metadata.get("status")
+        if (
+            not isinstance(metadata_file_id, str)
+            or metadata_file_id != file_id
+            or not isinstance(purpose, str)
+            or not purpose
+            or not isinstance(status, str)
+            or not status
+        ):
+            fail("unexpected_metadata", elapsed)
+
+        audit["purpose"] = purpose
+        audit["final_status"] = status
+        if audit["initial_status"] is None:
+            audit["initial_status"] = status
+        request_id = metadata.get("_openai_request_id")
+        if (
+            isinstance(request_id, str)
+            and request_id
+            and request_id not in audit["openai_request_ids"]
+        ):
+            audit["openai_request_ids"].append(request_id)
+
+        if purpose != "batch":
+            fail("purpose_not_batch", elapsed)
+        if status == "processed":
+            audit["wait_duration_seconds"] = round(max(0.0, elapsed), 3)
+            audit["readiness_result"] = "ready"
+            return audit
+        if status == "error":
+            fail("file_status_error", elapsed)
+        if status != "uploaded":
+            fail("unexpected_metadata", elapsed)
+        if elapsed >= timeout_seconds:
+            fail("readiness_timeout", elapsed)
+
+        time.sleep(min(poll_interval_seconds, max(0.0, timeout_seconds - elapsed)))
+        audit["poll_count"] = int(audit["poll_count"]) + 1
 
 
 def _update_observed_batch(state: Dict[str, Any], batch: Dict[str, Any]) -> None:
@@ -668,6 +770,30 @@ def submit_run(
         raise CASConflict("upload後のstateがCLAIMEDではありません")
     state["input_file_id"] = str(input_file_id)
     state["file_uploaded_at"] = utc_now()
+    etag = store.cas(etag, state)
+
+    try:
+        readiness = _wait_for_input_file_ready(client, str(input_file_id))
+    except FileReadinessError as error:
+        state, etag = store.load()
+        if (
+            state.get("state") != STATE_CLAIMED
+            or str(state.get("input_file_id") or "") != str(input_file_id)
+        ):
+            raise CASConflict("readiness失敗後のstate/input_file_idが一致しません") from error
+        state["file_readiness"] = error.audit
+        state["state"] = STATE_SAFE_STOPPED
+        state["safe_stop_reason"] = f"input_file_{error.reason}"
+        store.cas(etag, state)
+        raise
+
+    state, etag = store.load()
+    if (
+        state.get("state") != STATE_CLAIMED
+        or str(state.get("input_file_id") or "") != str(input_file_id)
+    ):
+        raise CASConflict("readiness成功後のstate/input_file_idが一致しません")
+    state["file_readiness"] = readiness
     state["state"] = STATE_PENDING_RECONCILIATION
     state["batch_create_started_at"] = utc_now()
     etag = store.cas(etag, state)
