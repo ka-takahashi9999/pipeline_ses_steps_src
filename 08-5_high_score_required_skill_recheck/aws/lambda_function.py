@@ -153,6 +153,43 @@ def _metadata_matches(batch: Dict[str, Any], state: Dict[str, Any]) -> bool:
     return not input_file_id or str(batch.get("input_file_id") or "") == input_file_id
 
 
+def _sanitize_batch_terminal_errors(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    errors = batch.get("errors")
+    data = errors.get("data") if isinstance(errors, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    def safe_text(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        sanitized = re.sub(
+            r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", value
+        )
+        sanitized = re.sub(
+            r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", sanitized
+        )
+        return sanitized[:2000]
+
+    sanitized_errors: List[Dict[str, Any]] = []
+    for item in data[:100]:
+        if not isinstance(item, dict):
+            continue
+        line = item.get("line")
+        sanitized_errors.append(
+            {
+                "code": safe_text(item.get("code")),
+                "message": safe_text(item.get("message")),
+                "param": safe_text(item.get("param")),
+                "line": (
+                    line
+                    if isinstance(line, int) and not isinstance(line, bool)
+                    else None
+                ),
+            }
+        )
+    return sanitized_errors
+
+
 def _reconcile_pending(state: Dict[str, Any], api_key: str) -> Optional[Dict[str, Any]]:
     if not state.get("input_file_id"):
         raise StatusError("PENDING_RECONCILIATION input_file_id欠落")
@@ -193,6 +230,8 @@ def _observe(state: Dict[str, Any], batch: Dict[str, Any]) -> str:
     for field in ("request_counts", "output_file_id", "error_file_id"):
         if field in batch:
             state[field] = batch[field]
+    if status == "completed" or status in FAILURE_STATUSES:
+        state["batch_errors"] = _sanitize_batch_terminal_errors(batch)
     timestamps: Dict[str, Any] = {}
     for field in TIMESTAMP_FIELDS:
         if field in batch:

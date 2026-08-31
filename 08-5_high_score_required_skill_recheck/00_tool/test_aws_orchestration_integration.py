@@ -160,8 +160,13 @@ class AwsOrchestrationTest(unittest.TestCase):
             "pipeline_ses_steps/batch-state/08-5/20260823/sfn-issue2-fixture"
         )
         self.client = BatchClient()
+        self.zero_stabilization = mock.patch.object(
+            engine, "FILE_STABILIZATION_WINDOW_SECONDS", 0.0
+        )
+        self.zero_stabilization.start()
 
     def tearDown(self):
+        self.zero_stabilization.stop()
         self.temporary.cleanup()
 
     def phase_a(self):
@@ -430,6 +435,41 @@ class StatusLambdaTest(unittest.TestCase):
                 pipeline = self.s3.json("technoverse", self.pipeline_key)
                 self.assertEqual(pipeline["status"], "FAILED")
                 self.assertEqual(pipeline["current_step"], "08-5_BATCH_WAIT")
+
+    def test_lambda_terminal_errors_are_sanitized_into_state(self):
+        observed = {
+            "id": "batch-1",
+            "status": "failed",
+            "request_counts": {"total": 0, "completed": 0, "failed": 0},
+            "errors": {
+                "data": [
+                    {
+                        "code": "invalid_request",
+                        "message": "Cannot find file; Bearer sk-secret123456789",
+                        "param": "file_id",
+                        "line": 1,
+                        "api_key": "must-not-persist",
+                    }
+                ]
+            },
+        }
+        with mock.patch.object(status_lambda, "_openai_get", return_value=observed):
+            status_lambda.check_status(
+                {"run_id": self.run_id, "run_date": self.run_date},
+                s3=self.s3,
+                api_key="fixture",
+            )
+        state = self.s3.json("technoverse", self.state_key)
+        self.assertEqual(
+            {
+                "code": "invalid_request",
+                "message": "Cannot find file; Bearer [REDACTED]",
+                "param": "file_id",
+                "line": 1,
+            },
+            state["batch_errors"][0],
+        )
+        self.assertNotIn("api_key", state["batch_errors"][0])
 
     def test_lambda_bounded_reconciliation_never_resubmits(self):
         pending = dict(self.state)

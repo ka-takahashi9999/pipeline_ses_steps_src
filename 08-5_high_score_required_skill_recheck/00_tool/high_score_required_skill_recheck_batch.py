@@ -45,6 +45,8 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,23}$")
 API_BASE_URL = "https://api.openai.com/v1"
 FILE_READINESS_POLL_INTERVAL_SECONDS = 2.0
 FILE_READINESS_TIMEOUT_SECONDS = 60.0
+FILE_STABILIZATION_WINDOW_SECONDS = 30.0
+FILE_STABILIZATION_POLL_INTERVAL_SECONDS = 5.0
 
 STATE_PREPARED = "PREPARED"
 STATE_CLAIMED = "CLAIMED"
@@ -463,6 +465,7 @@ def prepare_run(
         "file_readiness": None,
         "batch_id": None,
         "batch_status": None,
+        "batch_errors": [],
         "request_counts": None,
         "output_file_id": None,
         "error_file_id": None,
@@ -593,17 +596,41 @@ def _batch_metadata(state: Dict[str, Any]) -> Dict[str, str]:
 def _wait_for_input_file_ready(
     client: Any,
     file_id: str,
-    poll_interval_seconds: float = FILE_READINESS_POLL_INTERVAL_SECONDS,
-    timeout_seconds: float = FILE_READINESS_TIMEOUT_SECONDS,
+    poll_interval_seconds: Optional[float] = None,
+    timeout_seconds: Optional[float] = None,
+    stabilization_window_seconds: Optional[float] = None,
+    stabilization_poll_interval_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Poll read-only file metadata and fail closed until Batch input is ready."""
+    """Poll file metadata and require a bounded stable processed window."""
+    if poll_interval_seconds is None:
+        poll_interval_seconds = FILE_READINESS_POLL_INTERVAL_SECONDS
+    if timeout_seconds is None:
+        timeout_seconds = FILE_READINESS_TIMEOUT_SECONDS
+    if stabilization_window_seconds is None:
+        stabilization_window_seconds = FILE_STABILIZATION_WINDOW_SECONDS
+    if stabilization_poll_interval_seconds is None:
+        stabilization_poll_interval_seconds = FILE_STABILIZATION_POLL_INTERVAL_SECONDS
+    if (
+        poll_interval_seconds <= 0
+        or timeout_seconds < 0
+        or stabilization_window_seconds < 0
+        or stabilization_poll_interval_seconds <= 0
+    ):
+        raise ValueError("file readiness timing設定が不正です")
+
     started = time.monotonic()
+    first_processed_monotonic: Optional[float] = None
     audit: Dict[str, Any] = {
         "file_id": file_id,
         "purpose": None,
         "initial_status": None,
         "final_status": None,
+        "first_processed_at": None,
+        "stabilization_started_at": None,
+        "stabilization_completed_at": None,
+        "stabilization_seconds": 0.0,
         "poll_count": 0,
+        "observed_statuses": [],
         "wait_duration_seconds": 0.0,
         "readiness_result": "checking",
         "openai_request_ids": [],
@@ -611,6 +638,11 @@ def _wait_for_input_file_ready(
 
     def fail(reason: str, elapsed: float) -> None:
         audit["wait_duration_seconds"] = round(max(0.0, elapsed), 3)
+        if first_processed_monotonic is not None:
+            stabilization_elapsed = elapsed - (first_processed_monotonic - started)
+            audit["stabilization_seconds"] = round(
+                max(0.0, stabilization_elapsed), 3
+            )
         audit["readiness_result"] = reason
         raise FileReadinessError(reason, dict(audit))
 
@@ -642,6 +674,7 @@ def _wait_for_input_file_ready(
 
         audit["purpose"] = purpose
         audit["final_status"] = status
+        audit["observed_statuses"].append(status)
         if audit["initial_status"] is None:
             audit["initial_status"] = status
         request_id = metadata.get("_openai_request_id")
@@ -655,9 +688,30 @@ def _wait_for_input_file_ready(
         if purpose != "batch":
             fail("purpose_not_batch", elapsed)
         if status == "processed":
-            audit["wait_duration_seconds"] = round(max(0.0, elapsed), 3)
-            audit["readiness_result"] = "ready"
-            return audit
+            if first_processed_monotonic is None:
+                first_processed_monotonic = started + elapsed
+                processed_at = utc_now()
+                audit["first_processed_at"] = processed_at
+                audit["stabilization_started_at"] = processed_at
+            stabilization_elapsed = elapsed - (first_processed_monotonic - started)
+            audit["stabilization_seconds"] = round(
+                max(0.0, stabilization_elapsed), 3
+            )
+            if stabilization_elapsed >= stabilization_window_seconds:
+                audit["stabilization_completed_at"] = utc_now()
+                audit["wait_duration_seconds"] = round(max(0.0, elapsed), 3)
+                audit["readiness_result"] = "ready"
+                return audit
+            time.sleep(
+                min(
+                    stabilization_poll_interval_seconds,
+                    max(0.0, stabilization_window_seconds - stabilization_elapsed),
+                )
+            )
+            audit["poll_count"] = int(audit["poll_count"]) + 1
+            continue
+        if first_processed_monotonic is not None:
+            fail("stabilization_status_changed", elapsed)
         if status == "error":
             fail("file_status_error", elapsed)
         if status != "uploaded":
@@ -667,6 +721,43 @@ def _wait_for_input_file_ready(
 
         time.sleep(min(poll_interval_seconds, max(0.0, timeout_seconds - elapsed)))
         audit["poll_count"] = int(audit["poll_count"]) + 1
+
+
+def _sanitize_batch_terminal_errors(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    errors = batch.get("errors")
+    data = errors.get("data") if isinstance(errors, dict) else None
+    if not isinstance(data, list):
+        return []
+
+    def safe_text(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        sanitized = re.sub(
+            r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", value
+        )
+        sanitized = re.sub(
+            r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", sanitized
+        )
+        return sanitized[:2000]
+
+    sanitized_errors: List[Dict[str, Any]] = []
+    for item in data[:100]:
+        if not isinstance(item, dict):
+            continue
+        line = item.get("line")
+        sanitized_errors.append(
+            {
+                "code": safe_text(item.get("code")),
+                "message": safe_text(item.get("message")),
+                "param": safe_text(item.get("param")),
+                "line": (
+                    line
+                    if isinstance(line, int) and not isinstance(line, bool)
+                    else None
+                ),
+            }
+        )
+    return sanitized_errors
 
 
 def _update_observed_batch(state: Dict[str, Any], batch: Dict[str, Any]) -> None:
@@ -679,6 +770,8 @@ def _update_observed_batch(state: Dict[str, Any], batch: Dict[str, Any]) -> None
     for field in ("output_file_id", "error_file_id", "request_counts"):
         if batch.get(field) is not None:
             state[field] = batch[field]
+    if status in TERMINAL_BATCH_STATUSES:
+        state["batch_errors"] = _sanitize_batch_terminal_errors(batch)
     if status == "completed" and state.get("state") not in {
         STATE_COLLECTED,
         STATE_COMMITTED,

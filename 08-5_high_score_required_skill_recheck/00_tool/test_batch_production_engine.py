@@ -75,6 +75,9 @@ class FakeClient:
         value = self.file_values[0]
         if len(self.file_values) > 1:
             self.file_values.pop(0)
+        if isinstance(value, Exception):
+            self.events.append("file:lookup_failed")
+            raise value
         self.events.append(f"file:{value.get('status')}")
         return value
 
@@ -294,8 +297,13 @@ class StateAndSubmissionTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.zero_stabilization = patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 0.0
+        )
+        self.zero_stabilization.start()
 
     def tearDown(self):
+        self.zero_stabilization.stop()
         self.temp.cleanup()
 
     def prepare(self, run_id="run1"):
@@ -335,7 +343,7 @@ class StateAndSubmissionTest(unittest.TestCase):
         self.assertEqual(1, client.upload_calls)
         self.assertEqual(1, client.create_calls)
 
-    def test_readiness_already_processed_creates_immediately(self):
+    def test_readiness_already_processed_completes_zero_window_fixture(self):
         run_dir = self.prepare()
         client = FakeClient()
         batch.submit_run("run1", client, self.root)
@@ -348,6 +356,156 @@ class StateAndSubmissionTest(unittest.TestCase):
         self.assertEqual("processed", audit["final_status"])
         self.assertEqual(0, audit["poll_count"])
         self.assertEqual("ready", audit["readiness_result"])
+
+    def test_processed_does_not_create_before_stabilization_complete(self):
+        self.prepare()
+        client = FakeClient()
+
+        def interrupt_during_window(_seconds):
+            self.assertEqual(0, client.create_calls)
+            raise RuntimeError("fixture interrupts stabilization")
+
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0]
+        ), patch.object(
+            batch.time, "sleep", side_effect=interrupt_during_window
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupts stabilization"):
+                batch.submit_run("run1", client, self.root)
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(["upload", "file:processed"], client.events)
+
+    def test_processed_stable_window_completes_before_single_create(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        clock = [0.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=clock
+        ), patch.object(batch.time, "sleep", return_value=None) as sleep:
+            batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        audit = state["file_readiness"]
+        self.assertEqual(7, client.file_retrieve_calls)
+        self.assertEqual(6, sleep.call_count)
+        self.assertEqual(6, audit["poll_count"])
+        self.assertEqual(["processed"] * 7, audit["observed_statuses"])
+        self.assertEqual(30.0, audit["stabilization_seconds"])
+        self.assertIsNotNone(audit["first_processed_at"])
+        self.assertIsNotNone(audit["stabilization_started_at"])
+        self.assertIsNotNone(audit["stabilization_completed_at"])
+        self.assertEqual("ready", audit["readiness_result"])
+        self.assertEqual(1, client.create_calls)
+        self.assertEqual("create", client.events[-1])
+
+    def test_stabilization_status_change_fails_closed(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+            {"id": client.upload_id, "purpose": "batch", "status": "uploaded"},
+        ]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 5.0]
+        ), patch.object(batch.time, "sleep", return_value=None):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(
+            "stabilization_status_changed",
+            state["file_readiness"]["readiness_result"],
+        )
+
+    def test_stabilization_lookup_failure_fails_closed(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+            batch.BatchEngineError("fixture lookup failure"),
+        ]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 5.0]
+        ), patch.object(batch.time, "sleep", return_value=None):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(
+            "file_lookup_failed", state["file_readiness"]["readiness_result"]
+        )
+
+    def test_stabilization_purpose_change_fails_closed(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+            {"id": client.upload_id, "purpose": "fine-tune", "status": "processed"},
+        ]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 5.0]
+        ), patch.object(batch.time, "sleep", return_value=None):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(
+            "purpose_not_batch", state["file_readiness"]["readiness_result"]
+        )
+
+    def test_stabilization_invalid_metadata_fails_closed(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+            {"id": client.upload_id, "status": "processed"},
+        ]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 5.0]
+        ), patch.object(batch.time, "sleep", return_value=None):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(
+            "unexpected_metadata", state["file_readiness"]["readiness_result"]
+        )
+
+    def test_stabilization_file_id_change_fails_closed(self):
+        run_dir = self.prepare()
+        client = FakeClient()
+        client.file_values = [
+            {"id": client.upload_id, "purpose": "batch", "status": "processed"},
+            {"id": "file-other", "purpose": "batch", "status": "processed"},
+        ]
+        with patch.object(
+            batch, "FILE_STABILIZATION_WINDOW_SECONDS", 30.0
+        ), patch.object(
+            batch.time, "monotonic", side_effect=[0.0, 0.0, 5.0]
+        ), patch.object(batch.time, "sleep", return_value=None):
+            with self.assertRaises(batch.FileReadinessError):
+                batch.submit_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(batch.STATE_SAFE_STOPPED, state["state"])
+        self.assertEqual(0, client.create_calls)
+        self.assertEqual(
+            "unexpected_metadata", state["file_readiness"]["readiness_result"]
+        )
 
     def test_readiness_uploaded_then_processed_polls_before_create(self):
         run_dir = self.prepare()
@@ -450,6 +608,43 @@ class StateAndSubmissionTest(unittest.TestCase):
         with self.assertRaises(batch.PendingReconciliation):
             batch.submit_run("run1", client, self.root)
         self.assertEqual(1, client.create_calls)
+
+    def test_terminal_batch_errors_are_sanitized_into_state(self):
+        run_dir = self.prepare()
+        set_state(
+            run_dir,
+            batch_id="batch-1",
+            batch_status="validating",
+            state=batch.STATE_SUBMITTED,
+        )
+        client = FakeClient()
+        client.retrieve_value = {
+            "id": "batch-1",
+            "status": "failed",
+            "errors": {
+                "data": [
+                    {
+                        "code": "invalid_request",
+                        "message": "Cannot use Bearer sk-proj-secret123456789",
+                        "param": "file_id",
+                        "line": 7,
+                        "api_key": "must-not-persist",
+                    }
+                ]
+            },
+        }
+        batch.resume_run("run1", client, self.root)
+        state, _ = batch.FileStateStore(run_dir).load()
+        self.assertEqual(
+            {
+                "code": "invalid_request",
+                "message": "Cannot use Bearer [REDACTED]",
+                "param": "file_id",
+                "line": 7,
+            },
+            state["batch_errors"][0],
+        )
+        self.assertNotIn("api_key", state["batch_errors"][0])
 
     def _pending(self):
         run_dir = self.prepare()
