@@ -10,6 +10,8 @@
 ⑥ rotation時previous CURRENT snapshot / bk1 の file count 一致
 ⑦ rotation時previous CURRENT snapshot / bk1 の total bytes 一致
 ⑧ previous CURRENT snapshotのprovenance / destination / verifiedが記録されている
+⑨ 新contract summaryのcurrent execution immutable history guardが完全
+⑩ pre-publication recovery時はauthority / 全intervening run / CURRENT / BK1監査が完全
 
 AWS APIと最新80-9 summaryは読み直さず、80-75 summaryに固定保存された
 rotation時previous CURRENT snapshotを正本とする。
@@ -32,6 +34,14 @@ CONFIRM_RESULT = Path(__file__).resolve().parent / "confirm_result_portal_s3_bac
 
 EXPECTED_SOURCE_URI = "s3://technoverse/pipeline_ses_steps/pipeline_ses_steps/"
 EXPECTED_DESTINATION_URI = "s3://technoverse/pipeline_ses_steps/pipeline_ses_steps_bk1/"
+EXPECTED_STATE_MACHINE_ARN = (
+    "arn:aws:states:ap-northeast-1:166714029268:stateMachine:"
+    "auto-match-llm-classifier-pipeline-orchestration"
+)
+EXPECTED_EXECUTION_ARN_PREFIX = EXPECTED_STATE_MACHINE_ARN.replace(
+    ":stateMachine:", ":execution:"
+) + ":"
+IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION = 1
 
 RUN_DATE_RE = re.compile(r"^\d{8}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -187,6 +197,133 @@ def main() -> None:
         errors.append("status key")
     else:
         lines.append(f"[OK] previous CURRENT snapshot provenance ({run_date}/{run_id})")
+
+    # ⑨: markerありの新summaryはimmutable execution evidenceを必須監査する。
+    # markerなしのhistorical summaryだけをlegacyとして互換読取りする。
+    execution_guard = summary.get("current_execution_guard")
+    contract_key = "immutable_execution_guard_contract_version"
+    contract_present = contract_key in summary
+    contract_version = summary.get(contract_key)
+    if not contract_present and execution_guard is None:
+        lines.append("[INFO] immutable execution guard未記録（legacy summary）")
+    elif contract_present and contract_version != IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION:
+        lines.append(
+            "[NG] immutable execution guard contract versionが不正: "
+            f"{contract_version!r}"
+        )
+        errors.append("immutable execution guard contract version")
+    elif contract_present:
+        immutable_ok = (
+            isinstance(execution_guard, dict)
+            and execution_guard.get("validation_result") == "PASS"
+            and execution_guard.get("immutable_execution_guard_result") == "PASS"
+            and execution_guard.get("evidence_source") == "stepfunctions_execution_history"
+            and execution_guard.get("state_machine_arn") == EXPECTED_STATE_MACHINE_ARN
+            and isinstance(execution_guard.get("current_execution_arn"), str)
+            and execution_guard.get("current_execution_arn", "").startswith(
+                EXPECTED_EXECUTION_ARN_PREFIX
+            )
+            and execution_guard.get("execution_status") == "RUNNING"
+            and isinstance(execution_guard.get("run_date"), str)
+            and RUN_DATE_RE.fullmatch(execution_guard.get("run_date", "")) is not None
+            and isinstance(execution_guard.get("run_id"), str)
+            and RUN_ID_RE.fullmatch(execution_guard.get("run_id", "")) is not None
+            and execution_guard.get("run_identity_match") is True
+            and execution_guard.get("prepare_run_context_matches") == 1
+            and _is_count(execution_guard.get("redrive_count"))
+            and execution_guard.get("redrive_count") == 0
+            and execution_guard.get("redrive_date_present") is False
+            and execution_guard.get("execution_redriven_event_present") is False
+            and execution_guard.get("prior_terminal_event_present") is False
+            and execution_guard.get("execution_redriven_event_count") == 0
+            and execution_guard.get("prior_terminal_event_count") == 0
+            and _is_count(execution_guard.get("list_pages_checked"))
+            and execution_guard.get("list_pages_checked", 0) > 0
+            and _is_count(execution_guard.get("history_pages_checked"))
+            and execution_guard.get("history_pages_checked", 0) > 0
+            and _is_count(execution_guard.get("history_event_count"))
+            and execution_guard.get("history_event_count", 0) > 0
+        )
+        if immutable_ok:
+            lines.append(
+                "[OK] immutable execution history guard "
+                f"({execution_guard.get('run_date')}/{execution_guard.get('run_id')})"
+            )
+        else:
+            lines.append("[NG] immutable execution history guard監査が不完全")
+            errors.append("immutable execution guard")
+    else:
+        # pre-contract summaryでguardが記録済みの場合は、従来の監査条件を維持する。
+        legacy_immutable_ok = (
+            isinstance(execution_guard, dict)
+            and execution_guard.get("validation_result") == "PASS"
+            and execution_guard.get("evidence_source") == "stepfunctions_execution_history"
+            and execution_guard.get("state_machine_arn") == EXPECTED_STATE_MACHINE_ARN
+            and isinstance(execution_guard.get("execution_arn"), str)
+            and execution_guard.get("execution_arn", "").startswith(EXPECTED_EXECUTION_ARN_PREFIX)
+            and isinstance(execution_guard.get("run_date"), str)
+            and RUN_DATE_RE.fullmatch(execution_guard.get("run_date", "")) is not None
+            and isinstance(execution_guard.get("run_id"), str)
+            and RUN_ID_RE.fullmatch(execution_guard.get("run_id", "")) is not None
+            and execution_guard.get("prepare_run_context_matches") == 1
+            and _is_count(execution_guard.get("redrive_count"))
+            and execution_guard.get("redrive_count") == 0
+            and execution_guard.get("redrive_date_present") is False
+            and execution_guard.get("execution_redriven_event_count") == 0
+            and execution_guard.get("prior_terminal_event_count") == 0
+            and _is_count(execution_guard.get("list_pages_checked"))
+            and execution_guard.get("list_pages_checked", 0) > 0
+            and _is_count(execution_guard.get("history_pages_checked"))
+            and execution_guard.get("history_pages_checked", 0) > 0
+            and _is_count(execution_guard.get("history_event_count"))
+            and execution_guard.get("history_event_count", 0) > 0
+        )
+        if legacy_immutable_ok:
+            lines.append("[OK] immutable execution history guard（legacy contract）")
+        else:
+            lines.append("[NG] legacy immutable execution history guard監査が不完全")
+            errors.append("legacy immutable execution guard")
+
+    # ⑩: recoveryが記録された場合だけ追加監査する。
+    recovery = summary.get("recovery")
+    if recovery is not None and recovery.get("recovery_mode") == "pre_publication_08_5_failure":
+        intervening = recovery.get("intervening_runs")
+        current_unchanged = recovery.get("current_unchanged") or {}
+        bk1_unchanged = recovery.get("bk1_unchanged") or {}
+        contract = recovery.get("failure_contract") or {}
+        recovery_ok = (
+            recovery.get("enabled") is True
+            and recovery.get("eligible") is True
+            and recovery.get("rotation_authority_run_date") == run_date
+            and recovery.get("rotation_authority_run_id") == run_id
+            and recovery.get("all_intervening_runs_checked") is True
+            and isinstance(intervening, list)
+            and len(intervening) > 0
+            and all(item.get("validation_result") == "PASS" for item in intervening)
+            and contract.get("status") == "FAILED"
+            and contract.get("current_step") == "08-5_BATCH_WAIT"
+            and contract.get("exit_code") == 86
+            and contract.get("finished_at_source") == "batch_status_lambda"
+            and contract.get("exit_code_source") == "batch_status_lambda"
+            and contract.get("publication_boundary_reached") is False
+            and current_unchanged.get("verified") is True
+            and current_unchanged.get("manifest_inventory_match") is True
+            and current_unchanged.get("unchanged_since_rotation_authority") is True
+            and bk1_unchanged.get("verified") is True
+            and bk1_unchanged.get("previous_80_75_summary_match") is True
+            and bk1_unchanged.get("unchanged_since_rotation_authority") is True
+            and isinstance(execution_guard, dict)
+            and execution_guard.get("validation_result") == "PASS"
+            and execution_guard.get("run_date") == recovery.get("current_run_date")
+            and execution_guard.get("run_id") == recovery.get("current_run_id")
+        )
+        if recovery_ok:
+            lines.append(
+                f"[OK] pre-publication recovery監査 ({len(intervening)} intervening runs)"
+            )
+        else:
+            lines.append("[NG] pre-publication recovery監査が不完全")
+            errors.append("pre-publication recovery audit")
 
     _write_and_exit(logger, lines, errors)
 

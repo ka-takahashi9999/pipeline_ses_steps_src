@@ -127,6 +127,114 @@ class _FakePaginator:
             }
 
 
+def _execution_arn(name):
+    return (
+        "arn:aws:states:ap-northeast-1:166714029268:execution:"
+        f"auto-match-llm-classifier-pipeline-orchestration:{name}"
+    )
+
+
+def make_execution_spec(
+    run_date,
+    run_id,
+    name="focused-current",
+    event_types=(),
+    description_overrides=None,
+):
+    execution_arn = _execution_arn(name)
+    events = [
+        {"id": 1, "type": "ExecutionStarted"},
+        {
+            "id": 2,
+            "type": "PassStateExited",
+            "stateExitedEventDetails": {
+                "name": target.PREPARE_RUN_CONTEXT_STATE,
+                "output": json.dumps({"run_date": run_date, "run_id": run_id}),
+            },
+        },
+    ]
+    for event_type in event_types:
+        events.append({"id": len(events) + 1, "type": event_type})
+    description = {
+        "executionArn": execution_arn,
+        "stateMachineArn": target.EXPECTED_STATE_MACHINE_ARN,
+        "status": "RUNNING",
+        "redriveCount": 0,
+    }
+    description.update(description_overrides or {})
+    return {
+        "executionArn": execution_arn,
+        "description": description,
+        "events": events,
+    }
+
+
+class FakeStepFunctionsClient:
+    """List/Describe/Historyだけを提供するread-only focused test client。"""
+
+    def __init__(
+        self,
+        specs=(),
+        fail_operation=None,
+        paginate_list=False,
+        paginate_history=False,
+        repeat_list_token=False,
+        repeat_history_token=False,
+    ):
+        self.specs = list(specs)
+        self.fail_operation = fail_operation
+        self.paginate_list = paginate_list
+        self.paginate_history = paginate_history
+        self.repeat_list_token = repeat_list_token
+        self.repeat_history_token = repeat_history_token
+        self.calls = []
+
+    def list_executions(self, **kwargs):
+        self.calls.append(("list_executions", kwargs))
+        if self.fail_operation == "list":
+            raise RuntimeError("simulated ListExecutions failure")
+        summaries = [
+            {"executionArn": spec["executionArn"], "status": "RUNNING"}
+            for spec in self.specs
+        ]
+        token = kwargs.get("nextToken")
+        if not self.paginate_list or len(summaries) <= 1:
+            return {"executions": summaries}
+        if token is None:
+            return {"executions": summaries[:1], "nextToken": "list-page-2"}
+        response = {"executions": summaries[1:]}
+        if self.repeat_list_token:
+            response["nextToken"] = "list-page-2"
+        return response
+
+    def describe_execution(self, **kwargs):
+        self.calls.append(("describe_execution", kwargs))
+        if self.fail_operation == "describe":
+            raise RuntimeError("simulated DescribeExecution failure")
+        arn = kwargs["executionArn"]
+        for spec in self.specs:
+            if spec["executionArn"] == arn:
+                return copy.deepcopy(spec["description"])
+        raise RuntimeError(f"unknown execution: {arn}")
+
+    def get_execution_history(self, **kwargs):
+        self.calls.append(("get_execution_history", kwargs))
+        if self.fail_operation == "history":
+            raise RuntimeError("simulated GetExecutionHistory failure")
+        arn = kwargs["executionArn"]
+        spec = next(item for item in self.specs if item["executionArn"] == arn)
+        events = copy.deepcopy(spec["events"])
+        token = kwargs.get("nextToken")
+        if not self.paginate_history or len(events) <= 1:
+            return {"events": events}
+        if token is None:
+            return {"events": events[:1], "nextToken": "history-page-2"}
+        response = {"events": events[1:]}
+        if self.repeat_history_token:
+            response["nextToken"] = "history-page-2"
+        return response
+
+
 def make_sync_summary(**overrides):
     summary = {
         "step": "80-9_portal_s3_sync",
@@ -201,6 +309,7 @@ class RotationTestBase(unittest.TestCase):
         self.current_etags = {path: '"etag-v1"' for path in self.current}
         self.current_last_modified = {path: 100 for path in self.current}
         self.backup = dict(self.current)
+        self.backup_last_modified = {path: 100 for path in self.backup}
         self.manifest_path = (
             self.prepare_dir / "01_result" / target.PREVIOUS_MANIFEST_FILENAME
         )
@@ -213,14 +322,18 @@ class RotationTestBase(unittest.TestCase):
         target.time.sleep = self._fake_sleep
         self.original_run_sync = target.run_sync
         self.original_build = target.build_s3_client
+        self.original_build_stepfunctions = target.build_stepfunctions_client
+        self.sfn_client = None
+        target.build_stepfunctions_client = self._build_stepfunctions_client
         os.environ["PORTAL_S3_VERIFY_WAIT_SEC"] = "0"
-        os.environ.pop("RUN_ID", None)
-        os.environ.pop("RUN_DATE", None)
+        os.environ["RUN_DATE"] = CURRENT_RUN_DATE
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
 
     def tearDown(self):
         target.time.sleep = self.original_sleep
         target.run_sync = self.original_run_sync
         target.build_s3_client = self.original_build
+        target.build_stepfunctions_client = self.original_build_stepfunctions
         for name in (
             "PORTAL_S3_VERIFY_WAIT_SEC",
             "PORTAL_S3_PREFIX",
@@ -236,6 +349,15 @@ class RotationTestBase(unittest.TestCase):
 
     def _fake_sleep(self, seconds):
         self.sleep_calls.append(seconds)
+
+    def _build_stepfunctions_client(self, region):
+        if self.sfn_client is None:
+            run_date = (os.environ.get("RUN_DATE") or CURRENT_RUN_DATE).strip()
+            run_id = (os.environ.get("RUN_ID") or CURRENT_RUN_ID).strip()
+            self.sfn_client = FakeStepFunctionsClient(
+                [make_execution_spec(run_date, run_id)]
+            )
+        return self.sfn_client
 
     def write_sync_summary(self, summary):
         path = self.sync_dir / "01_result" / target.SYNC_SUMMARY_FILENAME
@@ -290,6 +412,7 @@ class RotationTestBase(unittest.TestCase):
     def stub_s3(self, status_runs=None, **kwargs):
         self._status_runs = status_runs if status_runs is not None else [
             (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+            (CURRENT_RUN_DATE, CURRENT_RUN_ID, "RUNNING", None),
         ]
         self._client_kwargs = kwargs
         return self._refresh_client()
@@ -308,6 +431,10 @@ class RotationTestBase(unittest.TestCase):
             key = f"{CURRENT_PREFIX}/{path}"
             last_modified[key] = self.current_last_modified.get(path, 100)
             etags[key] = self.current_etags.get(path, '"etag-v1"')
+        for path in self.backup:
+            key = f"{BACKUP_PREFIX}/{path}"
+            last_modified[key] = self.backup_last_modified.get(path, 100)
+            etags[key] = f'"backup-etag-{path}"'
         for index, (run_date, run_id, status, exit_code) in enumerate(self._status_runs):
             key = f"{BASE_PREFIX}/pipeline-status/{run_date}/{run_id}/status.json"
             objects[key] = 500
@@ -345,6 +472,9 @@ class RotationTestBase(unittest.TestCase):
         failed_step=None,
         include_previous=True,
     ):
+        # 限定recoveryは既存のdry-run非Production経路としてidentity非必須。
+        os.environ.pop("RUN_DATE", None)
+        os.environ.pop("RUN_ID", None)
         for path, last_modified in list(self.current_last_modified.items()):
             if not isinstance(last_modified, datetime):
                 self.current_last_modified[path] = datetime(
@@ -360,6 +490,296 @@ class RotationTestBase(unittest.TestCase):
             f"{target.RECOVERY_FAILED_STEP_NAME}(RUN_DATE={failed_run_date})"
         )
         return client, key
+
+    def write_previous_backup_summary(self):
+        result_dir = self.step_dir / "01_result"
+        result_dir.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "step": target.STEP_NAME,
+            "operation": "rotation",
+            "mode": "apply",
+            "backup_status": "SUCCEEDED",
+            "s3_source": SOURCE_URI,
+            "s3_destination": DESTINATION_URI,
+            "s3_destination_locked": True,
+            "verify": {
+                "verified": True,
+                "expected_file_count": len(self.backup),
+                "actual_file_count": len(self.backup),
+                "expected_total_bytes": sum(self.backup.values()),
+                "actual_total_bytes": sum(self.backup.values()),
+                "missing_count": 0,
+                "extra_count": 0,
+                "size_mismatch_count": 0,
+            },
+        }
+        with open(result_dir / target.BACKUP_SUMMARY_FILENAME, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False)
+
+    def stub_prepublication_recovery(self, failures=None):
+        """authority -> 08-5 FAILED(s) -> same-date RUNNING fresh runを用意する。"""
+        failures = failures or [
+            {
+                "run_date": CURRENT_RUN_DATE,
+                "run_id": RECOVERY_FAILED_RUN_ID,
+            }
+        ]
+        os.environ["RUN_DATE"] = CURRENT_RUN_DATE
+        os.environ["RUN_ID"] = CURRENT_RUN_ID
+        authority_finished = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+        object_modified = datetime(2026, 8, 18, 0, 30, tzinfo=timezone.utc)
+        self.current_last_modified = {path: object_modified for path in self.current}
+        self.backup_last_modified = {path: object_modified for path in self.backup}
+        self.write_previous_backup_summary()
+
+        status_runs = [(PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0)]
+        status_runs.extend(
+            (item["run_date"], item["run_id"], "FAILED", item.get("exit_code", 86))
+            for item in failures
+        )
+        status_runs.append((CURRENT_RUN_DATE, CURRENT_RUN_ID, "RUNNING", None))
+        client = self.stub_s3(status_runs=status_runs)
+
+        authority_key = (
+            f"{BASE_PREFIX}/pipeline-status/{PREV_RUN_DATE}/{PREV_RUN_ID}/status.json"
+        )
+        authority = client.status_docs[authority_key]
+        authority["started_at"] = "2026-08-18T00:00:00Z"
+        authority["finished_at"] = "2026-08-18T01:00:00Z"
+        authority["updated_at"] = "2026-08-18T01:00:01Z"
+        client.last_modified[authority_key] = datetime(
+            2026, 8, 18, 1, 0, 2, tzinfo=timezone.utc
+        )
+
+        for index, item in enumerate(failures):
+            key = (
+                f"{BASE_PREFIX}/pipeline-status/{item['run_date']}/{item['run_id']}/status.json"
+            )
+            document = client.status_docs[key]
+            start_hour = 2 + (index * 2)
+            document["started_at"] = f"2026-08-18T{start_hour:02d}:00:00Z"
+            document["finished_at"] = f"2026-08-18T{start_hour:02d}:30:00Z"
+            document["updated_at"] = f"2026-08-18T{start_hour:02d}:30:01Z"
+            document["current_step"] = item.get(
+                "current_step", target.PREPUBLICATION_FAILED_STEP_NAME
+            )
+            document["finished_at_source"] = item.get(
+                "finished_at_source", target.PREPUBLICATION_FAILURE_SOURCE
+            )
+            document["exit_code_source"] = item.get(
+                "exit_code_source", target.PREPUBLICATION_FAILURE_SOURCE
+            )
+            if "schema_version" in item:
+                document["schema_version"] = item["schema_version"]
+            client.last_modified[key] = datetime(
+                2026, 8, 18, start_hour, 30, 2, tzinfo=timezone.utc
+            )
+
+        current_key = (
+            f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/{CURRENT_RUN_ID}/status.json"
+        )
+        current = client.status_docs[current_key]
+        current_hour = 2 + (len(failures) * 2)
+        current["started_at"] = f"2026-08-18T{current_hour:02d}:00:00Z"
+        current["updated_at"] = f"2026-08-18T{current_hour:02d}:00:01Z"
+        client.last_modified[current_key] = datetime(
+            2026, 8, 18, current_hour, 0, 2, tzinfo=timezone.utc
+        )
+        self.assertLess(authority_finished, datetime.fromisoformat(current["started_at"][:-1] + "+00:00"))
+        return client
+
+
+# ---------------------------------------------------------------------------
+# immutable Step Functions execution history guard
+# ---------------------------------------------------------------------------
+
+
+class TestImmutableExecutionHistoryGuard(RotationTestBase):
+    def guard(self, client):
+        return target.guard_current_execution_history(
+            client,
+            {"run_date": CURRENT_RUN_DATE, "run_id": CURRENT_RUN_ID, "source": "env"},
+            self.logger,
+        )
+
+    def assert_guard_denied(self, client):
+        with self.assertRaises(target.RotationError):
+            self.guard(client)
+
+    def test_fresh_same_date_execution_passes(self):
+        client = FakeStepFunctionsClient(
+            [make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID)]
+        )
+        evidence = self.guard(client)
+        self.assertEqual(evidence["validation_result"], "PASS")
+        self.assertEqual(evidence["immutable_execution_guard_result"], "PASS")
+        self.assertEqual(evidence["execution_status"], "RUNNING")
+        self.assertTrue(evidence["run_identity_match"])
+        self.assertEqual(evidence["redrive_count"], 0)
+        self.assertFalse(evidence["redrive_date_present"])
+        self.assertFalse(evidence["execution_redriven_event_present"])
+        self.assertFalse(evidence["prior_terminal_event_present"])
+        self.assertEqual(evidence["prior_terminal_event_count"], 0)
+
+    def test_redrive_count_missing_is_denied(self):
+        spec = make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID)
+        spec["description"].pop("redriveCount")
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_redrive_count_malformed_is_denied(self):
+        for value in (None, "0", False, 0.0, -1):
+            with self.subTest(value=value):
+                spec = make_execution_spec(
+                    CURRENT_RUN_DATE,
+                    CURRENT_RUN_ID,
+                    description_overrides={"redriveCount": value},
+                )
+                self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_redrive_count_is_denied(self):
+        spec = make_execution_spec(
+            CURRENT_RUN_DATE,
+            CURRENT_RUN_ID,
+            description_overrides={"redriveCount": 1},
+        )
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_redrive_date_is_denied(self):
+        spec = make_execution_spec(
+            CURRENT_RUN_DATE,
+            CURRENT_RUN_ID,
+            description_overrides={"redriveDate": datetime(2026, 8, 19, tzinfo=timezone.utc)},
+        )
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_execution_redriven_event_is_denied(self):
+        spec = make_execution_spec(
+            CURRENT_RUN_DATE, CURRENT_RUN_ID, event_types=("ExecutionRedriven",)
+        )
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_prior_terminal_events_are_denied(self):
+        for event_type in ("ExecutionFailed", "ExecutionAborted", "ExecutionTimedOut"):
+            with self.subTest(event_type=event_type):
+                spec = make_execution_spec(
+                    CURRENT_RUN_DATE, CURRENT_RUN_ID, event_types=(event_type,)
+                )
+                self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_zero_matching_execution_is_denied(self):
+        spec = make_execution_spec(CURRENT_RUN_DATE, "sfn-other-run")
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_multiple_matching_executions_are_denied(self):
+        specs = [
+            make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID, name="match-1"),
+            make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID, name="match-2"),
+        ]
+        self.assert_guard_denied(FakeStepFunctionsClient(specs))
+
+    def test_all_list_and_history_pages_are_checked(self):
+        specs = [
+            make_execution_spec(CURRENT_RUN_DATE, "sfn-other-run", name="other"),
+            make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID, name="current"),
+        ]
+        client = FakeStepFunctionsClient(
+            specs, paginate_list=True, paginate_history=True
+        )
+        evidence = self.guard(client)
+        self.assertEqual(evidence["list_pages_checked"], 2)
+        self.assertEqual(evidence["history_pages_checked"], 2)
+
+    def test_api_failures_are_denied(self):
+        spec = make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID)
+        for operation in ("list", "describe", "history"):
+            with self.subTest(operation=operation):
+                self.assert_guard_denied(
+                    FakeStepFunctionsClient([spec], fail_operation=operation)
+                )
+
+    def test_pagination_token_cycles_are_denied(self):
+        specs = [
+            make_execution_spec(CURRENT_RUN_DATE, "sfn-other-run", name="other"),
+            make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID, name="current"),
+        ]
+        self.assert_guard_denied(
+            FakeStepFunctionsClient(
+                specs, paginate_list=True, repeat_list_token=True
+            )
+        )
+        self.assert_guard_denied(
+            FakeStepFunctionsClient(
+                [specs[1]], paginate_history=True, repeat_history_token=True
+            )
+        )
+
+    def test_malformed_prepare_run_context_is_denied(self):
+        spec = make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID)
+        spec["events"][1]["stateExitedEventDetails"]["output"] = "not-json"
+        self.assert_guard_denied(FakeStepFunctionsClient([spec]))
+
+    def test_status_overwrite_reproduction_is_denied_before_sync(self):
+        # 同一run_idの過去FAILED status.jsonが現RUNNING documentで上書き済み。
+        # S3だけなら自run除外後にprevious SUCCEEDEDが最新となるが、historyで拒否する。
+        self.stub_sync()
+        self.stub_current_running()
+        self.sfn_client = FakeStepFunctionsClient(
+            [
+                make_execution_spec(
+                    CURRENT_RUN_DATE,
+                    CURRENT_RUN_ID,
+                    event_types=("ExecutionFailed",),
+                )
+            ]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+
+    def test_apply_missing_managed_identity_is_denied_before_sync(self):
+        cases = (
+            (None, CURRENT_RUN_ID),
+            (CURRENT_RUN_DATE, None),
+            (None, None),
+            ("", ""),
+        )
+        for run_date, run_id in cases:
+            with self.subTest(run_date=run_date, run_id=run_id):
+                if run_date is None:
+                    os.environ.pop("RUN_DATE", None)
+                else:
+                    os.environ["RUN_DATE"] = run_date
+                if run_id is None:
+                    os.environ.pop("RUN_ID", None)
+                else:
+                    os.environ["RUN_ID"] = run_id
+                self.sync_calls = []
+                self.stub_sync()
+                self.stub_s3()
+                with self.assertRaises(target.RotationError):
+                    target.run(self.make_args(), self.logger)
+                self.assertEqual(self.sync_calls, [])
+
+    def test_apply_malformed_managed_identity_is_denied_before_sync(self):
+        for run_date, run_id in (("20260230", CURRENT_RUN_ID), (CURRENT_RUN_DATE, "bad/id")):
+            with self.subTest(run_date=run_date, run_id=run_id):
+                os.environ["RUN_DATE"] = run_date
+                os.environ["RUN_ID"] = run_id
+                self.sync_calls = []
+                self.stub_sync()
+                with self.assertRaises(target.RotationError):
+                    target.run(self.make_args(), self.logger)
+                self.assertEqual(self.sync_calls, [])
+
+    def test_external_identity_without_matching_execution_is_denied_before_sync(self):
+        self.stub_sync()
+        self.stub_current_running()
+        self.sfn_client = FakeStepFunctionsClient(
+            [make_execution_spec(CURRENT_RUN_DATE, "sfn-other-run")]
+        )
+        with self.assertRaises(target.RotationError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +1066,14 @@ class TestPreviousCurrentGuard(RotationTestBase):
         self.assertEqual(snapshot["sync_step"], "80-9_portal_s3_sync")
         self.assertEqual(snapshot["file_count"], 3)
         self.assertEqual(snapshot["total_bytes"], 35)
+        self.assertEqual(
+            summary["immutable_execution_guard_contract_version"],
+            target.IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION,
+        )
+        guard = summary["current_execution_guard"]
+        self.assertEqual(guard["immutable_execution_guard_result"], "PASS")
+        self.assertEqual(guard["execution_status"], "RUNNING")
+        self.assertTrue(guard["run_identity_match"])
         self.assertTrue(summary["verify"]["verified"])
 
     def test_15_verified_false_fails(self):
@@ -825,6 +1253,8 @@ class TestPreviousCurrentGuard(RotationTestBase):
         self.assertEqual(self.sync_calls, [])
 
     def test_finding_current_cli_without_managed_env_fails(self):
+        os.environ.pop("RUN_DATE", None)
+        os.environ.pop("RUN_ID", None)
         self.stub_sync()
         self.stub_s3(
             status_runs=[
@@ -1128,6 +1558,188 @@ class TestLimitedRecovery(RotationTestBase):
         self.assertEqual(self.sync_calls, [])
 
 
+class TestPrePublicationFailureRecovery(RotationTestBase):
+    def run_recovery(self):
+        self.stub_sync()
+        return target.run(self.make_args(dry_run=True), self.logger)
+
+    def assert_denied_before_sync(self):
+        with self.assertRaises(target.RotationError):
+            self.run_recovery()
+        self.assertEqual(self.sync_calls, [])
+
+    def test_a_normal_previous_succeeded_path_is_unchanged(self):
+        self.stub_current_running()
+        summary = self.run_recovery()
+        self.assertNotIn("recovery", summary)
+        self.assertEqual(len(self.sync_calls), 1)
+
+    def test_b_safe_08_5_failure_recovers_with_full_audit(self):
+        self.stub_prepublication_recovery()
+        summary = self.run_recovery()
+        recovery = summary["recovery"]
+        self.assertEqual(recovery["recovery_mode"], "pre_publication_08_5_failure")
+        self.assertEqual(recovery["rotation_authority_run_id"], PREV_RUN_ID)
+        self.assertTrue(recovery["all_intervening_runs_checked"])
+        self.assertEqual(len(recovery["intervening_runs"]), 1)
+        self.assertEqual(recovery["intervening_runs"][0]["validation_result"], "PASS")
+        self.assertTrue(recovery["current_unchanged"]["manifest_inventory_match"])
+        self.assertTrue(recovery["bk1_unchanged"]["previous_80_75_summary_match"])
+        self.assertEqual(len(self.sync_calls), 1)
+
+    def test_c_source_mismatch_is_denied(self):
+        self.stub_prepublication_recovery(
+            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
+              "exit_code_source": "managed_wrapper"}]
+        )
+        self.assert_denied_before_sync()
+
+    def test_d_exit_code_mismatch_is_denied(self):
+        self.stub_prepublication_recovery(
+            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
+              "exit_code": 85}]
+        )
+        self.assert_denied_before_sync()
+
+    def test_e_80_75_or_later_failure_is_denied(self):
+        for step in (
+            "80-75_portal_s3_backup_rotation",
+            "80-8_portal_s3_prepare",
+            "80-9_portal_s3_sync",
+        ):
+            with self.subTest(step=step):
+                self.sync_calls = []
+                self.stub_prepublication_recovery(
+                    [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
+                      "current_step": step}]
+                )
+                self.assert_denied_before_sync()
+
+    def test_f_bk1_last_modified_or_inventory_change_is_denied(self):
+        self.stub_prepublication_recovery()
+        path = next(iter(self.backup))
+        self.backup_last_modified[path] = datetime(
+            2026, 8, 18, 1, 30, tzinfo=timezone.utc
+        )
+        self._refresh_client()
+        self.assert_denied_before_sync()
+
+        self.sync_calls = []
+        self.backup_last_modified[path] = datetime(
+            2026, 8, 18, 0, 30, tzinfo=timezone.utc
+        )
+        self.backup[path] += 1
+        self._refresh_client()
+        self.assert_denied_before_sync()
+
+    def test_g_current_partial_update_is_denied(self):
+        self.stub_prepublication_recovery()
+        path = next(iter(self.current))
+        self.current.pop(path)
+        self.current_last_modified.pop(path)
+        self._refresh_client()
+        self.assert_denied_before_sync()
+
+    def test_h_80_9_started_or_failed_is_denied(self):
+        self.stub_prepublication_recovery(
+            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
+              "current_step": "80-9_portal_s3_sync"}]
+        )
+        self.assert_denied_before_sync()
+
+    def test_i_unverified_80_9_summary_is_denied(self):
+        summary = make_sync_summary(manifest_path=str(self.manifest_path.resolve()))
+        summary["verify"]["verified"] = False
+        self.write_sync_summary(summary)
+        self.stub_prepublication_recovery()
+        self.assert_denied_before_sync()
+
+    def test_j_missing_summary_status_or_manifest_is_denied(self):
+        cases = ("summary", "status", "manifest")
+        for missing in cases:
+            with self.subTest(missing=missing):
+                self.sync_calls = []
+                client = self.stub_prepublication_recovery()
+                if missing == "summary":
+                    (self.sync_dir / "01_result" / target.SYNC_SUMMARY_FILENAME).unlink()
+                elif missing == "status":
+                    key = (
+                        f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/"
+                        f"{RECOVERY_FAILED_RUN_ID}/status.json"
+                    )
+                    client.status_docs.pop(key)
+                else:
+                    self.manifest_path.unlink()
+                self.assert_denied_before_sync()
+                self.write_manifest()
+                self.write_sync_summary(
+                    make_sync_summary(manifest_path=str(self.manifest_path.resolve()))
+                )
+
+    def test_k_unknown_step_source_or_schema_is_denied(self):
+        cases = (
+            {"current_step": "UNKNOWN"},
+            {"exit_code_source": "unknown"},
+            {"schema_version": "2.0"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.sync_calls = []
+                item = {
+                    "run_date": CURRENT_RUN_DATE,
+                    "run_id": RECOVERY_FAILED_RUN_ID,
+                }
+                item.update(overrides)
+                self.stub_prepublication_recovery([item])
+                self.assert_denied_before_sync()
+
+    def test_l_consecutive_safe_failures_all_pass(self):
+        self.stub_prepublication_recovery(
+            [
+                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure-1"},
+                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure-2"},
+            ]
+        )
+        summary = self.run_recovery()
+        self.assertEqual(len(summary["recovery"]["intervening_runs"]), 2)
+        self.assertTrue(summary["recovery"]["all_intervening_runs_checked"])
+
+    def test_m_consecutive_mixed_failures_are_denied(self):
+        self.stub_prepublication_recovery(
+            [
+                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure"},
+                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-unsafe-failure",
+                 "current_step": "80-8_portal_s3_prepare"},
+            ]
+        )
+        self.assert_denied_before_sync()
+
+    def test_n_same_date_different_run_id_passes(self):
+        self.stub_prepublication_recovery()
+        summary = self.run_recovery()
+        recovery = summary["recovery"]
+        self.assertEqual(recovery["intervening_runs"][0]["run_date"], CURRENT_RUN_DATE)
+        self.assertNotEqual(recovery["intervening_runs"][0]["run_id"], recovery["current_run_id"])
+
+    def test_o_same_run_id_redrive_is_denied(self):
+        os.environ["RUN_DATE"] = CURRENT_RUN_DATE
+        os.environ["RUN_ID"] = RECOVERY_FAILED_RUN_ID
+        client = self.stub_s3(
+            status_runs=[
+                (PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0),
+                (CURRENT_RUN_DATE, RECOVERY_FAILED_RUN_ID, "FAILED", 86),
+            ]
+        )
+        key = (
+            f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/"
+            f"{RECOVERY_FAILED_RUN_ID}/status.json"
+        )
+        client.status_docs[key]["current_step"] = target.PREPUBLICATION_FAILED_STEP_NAME
+        client.status_docs[key]["finished_at_source"] = target.PREPUBLICATION_FAILURE_SOURCE
+        client.status_docs[key]["exit_code_source"] = target.PREPUBLICATION_FAILURE_SOURCE
+        self.assert_denied_before_sync()
+
+
 class TestTailRecoveryRunnerContract(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1246,9 +1858,11 @@ fi
 
 class TestBootstrap(RotationTestBase):
     def test_20_bootstrap_dry_run_passes_when_bk1_absent(self):
+        os.environ.pop("RUN_DATE", None)
+        os.environ.pop("RUN_ID", None)
         self.backup = {}
         self.stub_sync()
-        self.stub_s3()
+        self.stub_s3(status_runs=[(PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0)])
         summary = target.run(self.make_args(bootstrap=True, dry_run=True), self.logger)
         self.assertEqual(summary["operation"], "bootstrap")
         self.assertEqual(summary["mode"], "dry-run")
@@ -1329,14 +1943,24 @@ class TestExitCodes(RotationTestBase):
         self.stub_sync()
         self.stub_s3()
         self.assertEqual(self.run_main(), 0)
-        self.assertEqual(self.read_summary()["backup_status"], "SUCCEEDED")
+        summary = self.read_summary()
+        self.assertEqual(summary["backup_status"], "SUCCEEDED")
+        self.assertEqual(
+            summary["immutable_execution_guard_contract_version"],
+            target.IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION,
+        )
 
     def test_guard_failure_returns_non_zero(self):
         self.write_sync_summary(make_sync_summary(sync_status="FAILED"))
         self.stub_sync()
         self.stub_s3()
         self.assertEqual(self.run_main(), 1)
-        self.assertEqual(self.read_summary()["backup_status"], "FAILED")
+        summary = self.read_summary()
+        self.assertEqual(summary["backup_status"], "FAILED")
+        self.assertEqual(
+            summary["immutable_execution_guard_contract_version"],
+            target.IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION,
+        )
         self.assertEqual(self.sync_calls, [])
 
     def test_verify_failure_returns_non_zero(self):
@@ -1420,11 +2044,36 @@ class TestConfirmUsesRotationSnapshot(unittest.TestCase):
         return {
             "operation": "rotation",
             "mode": "apply",
+            "immutable_execution_guard_contract_version": (
+                target.IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
+            ),
             "s3_source": SOURCE_URI,
             "s3_destination": DESTINATION_URI,
             "s3_destination_locked": True,
             "backup_method": "aws s3 sync CURRENT -> BK1 --delete (no CLI filters)",
             "backup_status": "SUCCEEDED",
+            "current_execution_guard": {
+                "validation_result": "PASS",
+                "immutable_execution_guard_result": "PASS",
+                "evidence_source": "stepfunctions_execution_history",
+                "state_machine_arn": target.EXPECTED_STATE_MACHINE_ARN,
+                "execution_arn": _execution_arn("confirm-current"),
+                "current_execution_arn": _execution_arn("confirm-current"),
+                "execution_status": "RUNNING",
+                "run_date": CURRENT_RUN_DATE,
+                "run_id": CURRENT_RUN_ID,
+                "run_identity_match": True,
+                "prepare_run_context_matches": 1,
+                "redrive_count": 0,
+                "redrive_date_present": False,
+                "execution_redriven_event_present": False,
+                "prior_terminal_event_present": False,
+                "execution_redriven_event_count": 0,
+                "prior_terminal_event_count": 0,
+                "list_pages_checked": 1,
+                "history_pages_checked": 1,
+                "history_event_count": 2,
+            },
             "verify_wait_sec": 0,
             "wait_performed": True,
             "previous_current": {
@@ -1498,6 +2147,82 @@ class TestConfirmUsesRotationSnapshot(unittest.TestCase):
         summary = self.make_backup_summary()
         summary["previous_current"].pop("run_id_source")
         self.assert_confirm_fails(summary)
+
+    def test_prepublication_recovery_complete_audit_passes(self):
+        summary = self.make_backup_summary()
+        summary["recovery"] = {
+            "enabled": True,
+            "eligible": True,
+            "recovery_mode": "pre_publication_08_5_failure",
+            "rotation_authority_run_date": PREV_RUN_DATE,
+            "rotation_authority_run_id": PREV_RUN_ID,
+            "current_run_date": CURRENT_RUN_DATE,
+            "current_run_id": CURRENT_RUN_ID,
+            "all_intervening_runs_checked": True,
+            "failure_contract": {
+                "status": "FAILED",
+                "current_step": "08-5_BATCH_WAIT",
+                "exit_code": 86,
+                "finished_at_source": "batch_status_lambda",
+                "exit_code_source": "batch_status_lambda",
+                "publication_boundary_reached": False,
+            },
+            "intervening_runs": [{"validation_result": "PASS"}],
+            "current_unchanged": {
+                "verified": True,
+                "manifest_inventory_match": True,
+                "unchanged_since_rotation_authority": True,
+            },
+            "bk1_unchanged": {
+                "verified": True,
+                "previous_80_75_summary_match": True,
+                "unchanged_since_rotation_authority": True,
+            },
+        }
+        self.write_summary(summary)
+        confirm_target.main()
+        self.assertIn("【結果】OK", self.result_path.read_text(encoding="utf-8"))
+
+    def test_prepublication_recovery_incomplete_audit_fails(self):
+        summary = self.make_backup_summary()
+        summary["recovery"] = {
+            "enabled": True,
+            "eligible": True,
+            "recovery_mode": "pre_publication_08_5_failure",
+            "rotation_authority_run_date": PREV_RUN_DATE,
+            "rotation_authority_run_id": PREV_RUN_ID,
+            "all_intervening_runs_checked": True,
+            "intervening_runs": [{"validation_result": "PASS"}],
+        }
+        self.assert_confirm_fails(summary)
+
+    def test_immutable_execution_guard_redrive_evidence_fails(self):
+        summary = self.make_backup_summary()
+        summary["current_execution_guard"]["redrive_count"] = 1
+        self.assert_confirm_fails(summary)
+
+    def test_new_contract_missing_guard_fails(self):
+        summary = self.make_backup_summary()
+        summary.pop("current_execution_guard")
+        self.assert_confirm_fails(summary)
+
+    def test_new_contract_missing_redrive_count_fails(self):
+        summary = self.make_backup_summary()
+        summary["current_execution_guard"].pop("redrive_count")
+        self.assert_confirm_fails(summary)
+
+    def test_new_contract_guard_result_fail_fails(self):
+        summary = self.make_backup_summary()
+        summary["current_execution_guard"]["immutable_execution_guard_result"] = "FAIL"
+        self.assert_confirm_fails(summary)
+
+    def test_historical_legacy_summary_without_guard_passes(self):
+        summary = self.make_backup_summary()
+        summary.pop("immutable_execution_guard_contract_version")
+        summary.pop("current_execution_guard")
+        self.write_summary(summary)
+        confirm_target.main()
+        self.assertIn("【結果】OK", self.result_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

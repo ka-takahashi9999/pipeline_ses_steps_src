@@ -23,6 +23,10 @@ CURRENT + bk1 の 2 set 構成（backup 1世代）。将来 bk2 / bk3 へ拡張�
 - 限定recovery: date / run_idをCLIで明示した既知80-7 FAILED runだけを対象とし、
   previous verified success確定後にCURRENT objectが1件も変更されていない場合だけ
   BK1 rotation元として許可する。FAILED statusを無条件に無視する経路ではない。
+- pre-publication recovery: managed RUNNING自runの直前に08-5 Batch wait failureが
+  1件以上あっても、verified 80-9 authority以降の全terminal runが
+  FAILED / 08-5_BATCH_WAIT / exit=86 / batch_status_lambdaに完全一致し、
+  CURRENTとBK1のinventory・LastModifiedが不変の場合だけrotationを許可する。
 - backup本体: `aws s3 sync CURRENT BK1 --delete`（argv配列 / shell未使用 /
   include-excludeフィルタ未使用）
 - backup後 PORTAL_S3_VERIFY_WAIT_SEC 秒待ち、CURRENT と bk1 を全件LISTして
@@ -52,6 +56,7 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_execution_time  # noqa: E402
+from common.json_utils import read_jsonl  # noqa: E402
 from common.logger import get_logger  # noqa: E402
 from common.pipeline_s3_env import get_config_value, load_pipeline_s3_config  # noqa: E402
 
@@ -61,9 +66,13 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 SYNC_STEP_DIR_NAME = "80-9_portal_s3_sync"
 SYNC_SUMMARY_FILENAME = "portal_s3_sync_summary.json"
 BACKUP_SUMMARY_FILENAME = "portal_s3_backup_rotation_summary.json"
+IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION = 1
 PREPARE_STEP_DIR_NAME = "80-8_portal_s3_prepare"
 PREVIOUS_MANIFEST_FILENAME = "portal_s3_manifest.jsonl"
 RECOVERY_FAILED_STEP_NAME = "80-7_manage_09_result_retention"
+PREPUBLICATION_FAILED_STEP_NAME = "08-5_BATCH_WAIT"
+PREPUBLICATION_FAILURE_SOURCE = "batch_status_lambda"
+PREPUBLICATION_FAILURE_EXIT_CODE = 86
 
 AWS_BIN = "/usr/bin/aws"
 RESULT_DIR_NAME = "01_result"
@@ -78,6 +87,17 @@ EXPECTED_CURRENT_PREFIX = f"{EXPECTED_BASE_PREFIX}/{EXPECTED_CURRENT_LEAF}"
 EXPECTED_BACKUP_PREFIX = f"{EXPECTED_BASE_PREFIX}/{EXPECTED_BACKUP_LEAF}"
 EXPECTED_SOURCE_URI = f"s3://{EXPECTED_BUCKET}/{EXPECTED_CURRENT_PREFIX}/"
 EXPECTED_DESTINATION_URI = f"s3://{EXPECTED_BUCKET}/{EXPECTED_BACKUP_PREFIX}/"
+
+# current execution の immutable evidence はこのState Machineだけを参照する。
+# destination lockと同様、環境変数や設定ファイルから任意ARNへ差し替えさせない。
+EXPECTED_STATE_MACHINE_ARN = (
+    "arn:aws:states:ap-northeast-1:166714029268:stateMachine:"
+    "auto-match-llm-classifier-pipeline-orchestration"
+)
+PREPARE_RUN_CONTEXT_STATE = "PrepareRunContext"
+PRIOR_TERMINAL_EVENT_TYPES = frozenset(
+    ("ExecutionFailed", "ExecutionAborted", "ExecutionTimedOut")
+)
 
 # pipeline-status は read-only参照のみ（CONTROL prefixを書き換えない）
 EXPECTED_STATUS_PREFIX = "pipeline-status"
@@ -208,10 +228,10 @@ def _require_zero(container: Dict[str, Any], key: str, label: str) -> None:
         raise RotationError(f"previous CURRENTが正常ではありません: {label}={value!r}")
 
 
-def _require_count(container: Dict[str, Any], key: str) -> int:
+def _require_count(container: Dict[str, Any], key: str, label: str = "previous 80-9 summary") -> int:
     value = container.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise RotationError(f"previous 80-9 summaryの{key}が不正です: {value!r}")
+        raise RotationError(f"{label}の{key}が不正です: {value!r}")
     return value
 
 
@@ -295,6 +315,268 @@ def build_s3_client(region: str):
     import boto3
 
     return boto3.client("s3", region_name=region)
+
+
+def build_stepfunctions_client(region: str):
+    """boto3 Step Functions clientを生成する（read-only APIだけに使用）。"""
+    import boto3
+
+    return boto3.client("stepfunctions", region_name=region)
+
+
+def _next_token(response: Dict[str, Any], operation: str, seen: set) -> Optional[str]:
+    """AWS pagination tokenをfail-closedで検証する。"""
+    token = response.get("nextToken")
+    if token is None:
+        return None
+    if not isinstance(token, str) or not token:
+        raise RotationError(f"Step Functions {operation}のnextTokenが不正です")
+    if token in seen:
+        raise RotationError(f"Step Functions {operation}のnextTokenが循環しています")
+    seen.add(token)
+    return token
+
+
+def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]], int]:
+    """対象State MachineのRUNNING executionを全ページ取得する。"""
+    executions: List[Dict[str, Any]] = []
+    seen_tokens = set()
+    seen_arns = set()
+    token = None
+    pages = 0
+    try:
+        while True:
+            params: Dict[str, Any] = {
+                "stateMachineArn": EXPECTED_STATE_MACHINE_ARN,
+                "statusFilter": "RUNNING",
+                "maxResults": 1000,
+            }
+            if token is not None:
+                params["nextToken"] = token
+            response = stepfunctions_client.list_executions(**params)
+            pages += 1
+            page_executions = response.get("executions")
+            if not isinstance(page_executions, list):
+                raise RotationError("Step Functions ListExecutionsのexecutionsが配列ではありません")
+            for execution in page_executions:
+                if not isinstance(execution, dict):
+                    raise RotationError("Step Functions ListExecutionsに不正なexecutionがあります")
+                execution_arn = execution.get("executionArn")
+                if not isinstance(execution_arn, str) or not execution_arn:
+                    raise RotationError("Step Functions ListExecutionsにexecutionArnがありません")
+                if execution_arn in seen_arns:
+                    raise RotationError(
+                        f"Step Functions ListExecutionsでexecutionArnが重複しました: {execution_arn}"
+                    )
+                if execution.get("status") != "RUNNING":
+                    raise RotationError(
+                        "Step Functions ListExecutionsがRUNNING以外を返しました "
+                        f"({execution_arn} status={execution.get('status')!r})"
+                    )
+                seen_arns.add(execution_arn)
+                executions.append(execution)
+            token = _next_token(response, "ListExecutions", seen_tokens)
+            if token is None:
+                break
+    except RotationError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RotationError(f"Step Functions ListExecutionsに失敗しました: {exc}") from exc
+    return executions, pages
+
+
+def _get_execution_history(
+    stepfunctions_client, execution_arn: str
+) -> Tuple[List[Dict[str, Any]], int]:
+    """execution historyを先頭から全ページ取得する。"""
+    events: List[Dict[str, Any]] = []
+    seen_tokens = set()
+    seen_event_ids = set()
+    token = None
+    pages = 0
+    try:
+        while True:
+            params: Dict[str, Any] = {
+                "executionArn": execution_arn,
+                "maxResults": 1000,
+                "reverseOrder": False,
+                "includeExecutionData": True,
+            }
+            if token is not None:
+                params["nextToken"] = token
+            response = stepfunctions_client.get_execution_history(**params)
+            pages += 1
+            page_events = response.get("events")
+            if not isinstance(page_events, list):
+                raise RotationError("Step Functions GetExecutionHistoryのeventsが配列ではありません")
+            for event in page_events:
+                if not isinstance(event, dict):
+                    raise RotationError("Step Functions execution historyに不正なeventがあります")
+                event_id = event.get("id")
+                event_type = event.get("type")
+                if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id <= 0:
+                    raise RotationError("Step Functions execution historyのevent idが不正です")
+                if event_id in seen_event_ids:
+                    raise RotationError(
+                        f"Step Functions execution historyのevent idが重複しました: {event_id}"
+                    )
+                if not isinstance(event_type, str) or not event_type:
+                    raise RotationError("Step Functions execution historyのevent typeが不正です")
+                seen_event_ids.add(event_id)
+                events.append(event)
+            token = _next_token(response, "GetExecutionHistory", seen_tokens)
+            if token is None:
+                break
+    except RotationError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RotationError(
+            f"Step Functions GetExecutionHistoryに失敗しました: {execution_arn} ({exc})"
+        ) from exc
+    return events, pages
+
+
+def _prepare_run_context_identity(events: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """PrepareRunContext StateExited outputからrun_date/run_idを抽出する。"""
+    prepare_outputs = []
+    for event in events:
+        details = event.get("stateExitedEventDetails")
+        if not isinstance(details, dict) or details.get("name") != PREPARE_RUN_CONTEXT_STATE:
+            continue
+        raw_output = details.get("output")
+        if not isinstance(raw_output, str) or not raw_output:
+            raise RotationError("PrepareRunContext history eventにoutputがありません")
+        try:
+            output = json.loads(raw_output)
+        except ValueError as exc:
+            raise RotationError("PrepareRunContext history outputがJSONではありません") from exc
+        if not isinstance(output, dict):
+            raise RotationError("PrepareRunContext history outputがJSON objectではありません")
+        run_date = output.get("run_date")
+        run_id = output.get("run_id")
+        if not isinstance(run_date, str) or not RUN_DATE_RE.fullmatch(run_date):
+            raise RotationError(f"PrepareRunContext historyのrun_dateが不正です: {run_date!r}")
+        try:
+            datetime.strptime(run_date, "%Y%m%d")
+        except ValueError as exc:
+            raise RotationError(
+                f"PrepareRunContext historyのrun_dateが実在日ではありません: {run_date!r}"
+            ) from exc
+        if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+            raise RotationError(f"PrepareRunContext historyのrun_idが不正です: {run_id!r}")
+        prepare_outputs.append({"run_date": run_date, "run_id": run_id})
+    if not prepare_outputs:
+        return None
+    if len(prepare_outputs) != 1:
+        raise RotationError(
+            "PrepareRunContext history eventを一意に特定できません "
+            f"(matches={len(prepare_outputs)})"
+        )
+    return prepare_outputs[0]
+
+
+def guard_current_execution_history(
+    stepfunctions_client, current_identity: Dict[str, str], logger
+) -> Dict[str, Any]:
+    """
+    current managed runをPrepareRunContext outputで一意解決し、redriveまたは
+    同一execution内の過去terminal eventをimmutable historyから拒否する。
+    """
+    executions, list_pages = _list_running_executions(stepfunctions_client)
+    matches = []
+    try:
+        for execution in executions:
+            execution_arn = execution["executionArn"]
+            description = stepfunctions_client.describe_execution(executionArn=execution_arn)
+            if not isinstance(description, dict):
+                raise RotationError("Step Functions DescribeExecutionの応答がobjectではありません")
+            if description.get("executionArn") != execution_arn:
+                raise RotationError("DescribeExecutionのexecutionArnがListExecutionsと一致しません")
+            if description.get("stateMachineArn") != EXPECTED_STATE_MACHINE_ARN:
+                raise RotationError("DescribeExecutionのstateMachineArnがcanonical ARNではありません")
+            if description.get("status") != "RUNNING":
+                raise RotationError(
+                    "DescribeExecutionのstatusがRUNNINGではありません "
+                    f"({execution_arn} status={description.get('status')!r})"
+                )
+
+            events, history_pages = _get_execution_history(
+                stepfunctions_client, execution_arn
+            )
+            identity = _prepare_run_context_identity(events)
+            if identity is not None and (
+                identity["run_date"] == current_identity["run_date"]
+                and identity["run_id"] == current_identity["run_id"]
+            ):
+                matches.append((description, events, history_pages))
+    except RotationError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise RotationError(f"Step Functions DescribeExecutionに失敗しました: {exc}") from exc
+
+    if len(matches) != 1:
+        raise RotationError(
+            "PrepareRunContextのrun_date/run_idに一致するcurrent executionを一意に特定できません "
+            f"(matches={len(matches)})"
+        )
+
+    description, events, history_pages = matches[0]
+    if "redriveCount" not in description:
+        raise RotationError("DescribeExecutionにredriveCountがありません")
+    redrive_count = description["redriveCount"]
+    if (
+        not isinstance(redrive_count, int)
+        or isinstance(redrive_count, bool)
+        or redrive_count < 0
+    ):
+        raise RotationError(f"DescribeExecutionのredriveCountが不正です: {redrive_count!r}")
+    if redrive_count > 0:
+        raise RotationError(f"current executionはredriveCount={redrive_count}のため拒否します")
+    if description.get("redriveDate") is not None:
+        raise RotationError("current executionにredriveDateがあるため拒否します")
+
+    redriven_count = sum(event["type"] == "ExecutionRedriven" for event in events)
+    if redriven_count:
+        raise RotationError(
+            f"current execution historyにExecutionRedrivenが{redriven_count}件あるため拒否します"
+        )
+    prior_terminal = [
+        event["type"] for event in events if event["type"] in PRIOR_TERMINAL_EVENT_TYPES
+    ]
+    if prior_terminal:
+        raise RotationError(
+            "current execution historyに過去terminal eventがあるため拒否します "
+            f"(events={prior_terminal[:SAMPLE_LIMIT]})"
+        )
+
+    execution_arn = description["executionArn"]
+    logger.info(
+        "immutable execution history照合OK: "
+        f"run={current_identity['run_date']}/{current_identity['run_id']} / "
+        f"execution={execution_arn}"
+    )
+    return {
+        "validation_result": "PASS",
+        "immutable_execution_guard_result": "PASS",
+        "evidence_source": "stepfunctions_execution_history",
+        "state_machine_arn": EXPECTED_STATE_MACHINE_ARN,
+        "execution_arn": execution_arn,
+        "current_execution_arn": execution_arn,
+        "execution_status": "RUNNING",
+        "run_date": current_identity["run_date"],
+        "run_id": current_identity["run_id"],
+        "run_identity_match": True,
+        "prepare_run_context_matches": 1,
+        "redrive_count": redrive_count,
+        "redrive_date_present": False,
+        "execution_redriven_event_present": False,
+        "prior_terminal_event_present": False,
+        "execution_redriven_event_count": 0,
+        "prior_terminal_event_count": 0,
+        "list_pages_checked": list_pages,
+        "history_pages_checked": history_pages,
+        "history_event_count": len(events),
+    }
 
 
 def _list_prefix_objects(
@@ -429,6 +711,12 @@ def resolve_current_managed_identity(args: argparse.Namespace) -> Optional[Dict[
         raise RotationError("current managed runのRUN_DATE/RUN_IDが片方しかありません")
     if not RUN_DATE_RE.match(env_run_date):
         raise RotationError(f"current managed RUN_DATEの形式が不正です: {env_run_date!r}")
+    try:
+        datetime.strptime(env_run_date, "%Y%m%d")
+    except ValueError as exc:
+        raise RotationError(
+            f"current managed RUN_DATEが実在日ではありません: {env_run_date!r}"
+        ) from exc
     if not RUN_ID_RE.match(env_run_id):
         raise RotationError(f"current managed RUN_IDの形式が不正です: {env_run_id!r}")
     return {"run_date": env_run_date, "run_id": env_run_id, "source": "env"}
@@ -525,7 +813,11 @@ def resolve_recovery_target(args: argparse.Namespace) -> Optional[Dict[str, str]
 
 
 def _validate_terminal_status_document(
-    run: Dict[str, Any], document: Dict[str, Any], label: str
+    run: Dict[str, Any],
+    document: Dict[str, Any],
+    label: str,
+    finished_at_source: str = "managed_wrapper",
+    exit_code_source: str = "managed_wrapper",
 ) -> None:
     """recovery判定に使うterminal statusをschema 1.0完全一致で検証する。"""
     actual_keys = set(document)
@@ -564,9 +856,9 @@ def _validate_terminal_status_document(
         parsed_timestamps[name] = parsed
     if parsed_timestamps["finished_at"] < parsed_timestamps["started_at"]:
         raise RotationError(f"{label} statusのfinished_atがstarted_atより前です")
-    if document["finished_at_source"] != "managed_wrapper":
+    if document["finished_at_source"] != finished_at_source:
         raise RotationError(f"{label} statusのfinished_at_sourceが不正です")
-    if document["exit_code_source"] != "managed_wrapper":
+    if document["exit_code_source"] != exit_code_source:
         raise RotationError(f"{label} statusのexit_code_sourceが不正です")
     if not isinstance(document["exit_code"], int) or isinstance(document["exit_code"], bool):
         raise RotationError(f"{label} statusのexit_codeが整数ではありません")
@@ -575,6 +867,184 @@ def _validate_terminal_status_document(
             raise RotationError(f"{label} statusの{key}が空または文字列ではありません")
     if not isinstance(document["error_message"], str):
         raise RotationError(f"{label} statusのerror_messageが文字列ではありません")
+
+
+def _parse_evidence_timestamp(label: str, value: Any) -> datetime:
+    """順序証拠に使うtimezone付きISO 8601 timestampを返す。"""
+    if not isinstance(value, str) or not value:
+        raise RotationError(f"{label}が不正です: {value!r}")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise RotationError(f"{label}がISO 8601形式ではありません") from exc
+    if parsed.tzinfo is None:
+        raise RotationError(f"{label}にtimezoneがありません")
+    return parsed
+
+
+def _require_ordering_last_modified(run: Dict[str, Any], label: str) -> datetime:
+    value = run.get("last_modified")
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise RotationError(f"{label}のLastModifiedが不正です（順序判定不能）")
+    return value
+
+
+def _guard_prepublication_failure_recovery(
+    s3_client,
+    bucket: str,
+    runs: List[Dict[str, Any]],
+    provenance: Dict[str, Any],
+    current_run: Dict[str, Any],
+    current_document: Dict[str, Any],
+    logger,
+) -> Dict[str, Any]:
+    """
+    verified publication以降、自RUNNING runより前の全runが、明示した08-5
+    batch_status_lambda failure contractだけを満たす場合に限りrotation authorityを戻す。
+    """
+    authority_matches = [
+        run
+        for run in runs
+        if run["run_date"] == provenance["run_date"] and run["run_id"] == provenance["run_id"]
+    ]
+    if len(authority_matches) != 1:
+        raise RotationError(
+            "rotation authorityのpipeline-statusを一意に特定できません "
+            f"(matches={len(authority_matches)})"
+        )
+    authority_run = authority_matches[0]
+    authority_document = get_status_document(s3_client, bucket, authority_run["key"])
+    _validate_terminal_status_document(
+        authority_run, authority_document, "rotation authority SUCCEEDED"
+    )
+    if authority_document["status"] != "SUCCEEDED" or authority_document["exit_code"] != 0:
+        raise RotationError("rotation authorityがSUCCEEDED/exit=0ではありません")
+
+    authority_modified = _require_ordering_last_modified(authority_run, "rotation authority status")
+    current_modified = _require_ordering_last_modified(current_run, "current RUNNING status")
+    if authority_modified >= current_modified:
+        raise RotationError("rotation authorityとcurrent RUNNING runの順序を確定できません")
+
+    authority_finished = _parse_evidence_timestamp(
+        "rotation authority finished_at", authority_document["finished_at"]
+    )
+    current_started = _parse_evidence_timestamp(
+        "current RUNNING started_at", current_document["started_at"]
+    )
+    if authority_finished >= current_started:
+        raise RotationError("rotation authority終了とcurrent RUNNING開始の順序が不正です")
+
+    intervening = []
+    for run in runs:
+        if run["key"] == authority_run["key"]:
+            continue
+        modified = _require_ordering_last_modified(run, "pipeline-status run")
+        if modified == authority_modified or modified == current_modified:
+            raise RotationError("pipeline-statusのLastModifiedが同一で順序判定不能です")
+        if modified > current_modified:
+            raise RotationError(
+                "current RUNNING runより後のpipeline-statusが存在します（順序判定不能） "
+                f"({run['run_date']}/{run['run_id']})"
+            )
+        if modified > authority_modified:
+            intervening.append(run)
+
+    if not intervening:
+        raise RotationError("pre-publication recovery対象のintervening terminal runがありません")
+    intervening.sort(key=_sort_key)
+
+    validations = []
+    previous_finished = authority_finished
+    for run in intervening:
+        if run["run_date"] == current_run["run_date"] and run["run_id"] == current_run["run_id"]:
+            raise RotationError("same run_idのRedrive相当はrecoveryとして許可しません")
+        document = get_status_document(s3_client, bucket, run["key"])
+        _validate_terminal_status_document(
+            run,
+            document,
+            "intervening 08-5 FAILED",
+            finished_at_source=PREPUBLICATION_FAILURE_SOURCE,
+            exit_code_source=PREPUBLICATION_FAILURE_SOURCE,
+        )
+        if document["status"] != "FAILED":
+            raise RotationError(
+                "intervening runがFAILED terminalではありません "
+                f"({run['run_date']}/{run['run_id']} status={document['status']!r})"
+            )
+        if document["current_step"] != PREPUBLICATION_FAILED_STEP_NAME:
+            raise RotationError(
+                "pre-publication recoveryを許可しないfailure stepです "
+                f"({run['run_date']}/{run['run_id']} step={document['current_step']!r})"
+            )
+        if document["exit_code"] != PREPUBLICATION_FAILURE_EXIT_CODE:
+            raise RotationError(
+                "08-5 failure contractのexit_codeが不一致です "
+                f"({run['run_date']}/{run['run_id']} exit={document['exit_code']!r})"
+            )
+        if not document["error_message"].strip():
+            raise RotationError("08-5 failure contractのerror_messageが空です")
+
+        started = _parse_evidence_timestamp("intervening started_at", document["started_at"])
+        finished = _parse_evidence_timestamp("intervening finished_at", document["finished_at"])
+        if started <= previous_finished or finished >= current_started:
+            raise RotationError(
+                "intervening runの実行順序をstatus timestampから確定できません "
+                f"({run['run_date']}/{run['run_id']})"
+            )
+        previous_finished = finished
+        validations.append(
+            {
+                "run_date": run["run_date"],
+                "run_id": run["run_id"],
+                "status_key": run["key"],
+                "validation_result": "PASS",
+                "failure_contract": {
+                    "status": "FAILED",
+                    "current_step": PREPUBLICATION_FAILED_STEP_NAME,
+                    "exit_code": PREPUBLICATION_FAILURE_EXIT_CODE,
+                    "finished_at_source": PREPUBLICATION_FAILURE_SOURCE,
+                    "exit_code_source": PREPUBLICATION_FAILURE_SOURCE,
+                    "publication_boundary_reached": False,
+                },
+            }
+        )
+
+    logger.info(
+        "pre-publication recovery pipeline-status照合OK: "
+        f"authority={authority_run['run_date']}/{authority_run['run_id']} / "
+        f"intervening={len(validations)}"
+    )
+    return {
+        "status_key": authority_run["key"],
+        "status": "SUCCEEDED",
+        "exit_code": 0,
+        "recovery": {
+            "enabled": True,
+            "eligible": True,
+            "recovery_mode": "pre_publication_08_5_failure",
+            "rotation_authority_run_date": authority_run["run_date"],
+            "rotation_authority_run_id": authority_run["run_id"],
+            "rotation_authority_status_key": authority_run["key"],
+            "previous_verified_finished_at": authority_document["finished_at"],
+            "current_run_date": current_run["run_date"],
+            "current_run_id": current_run["run_id"],
+            "all_intervening_runs_checked": True,
+            "failure_contract": {
+                "status": "FAILED",
+                "current_step": PREPUBLICATION_FAILED_STEP_NAME,
+                "exit_code": PREPUBLICATION_FAILURE_EXIT_CODE,
+                "finished_at_source": PREPUBLICATION_FAILURE_SOURCE,
+                "exit_code_source": PREPUBLICATION_FAILURE_SOURCE,
+                "publication_boundary_reached": False,
+            },
+            "intervening_runs": validations,
+            "skipped_runs": [
+                {"run_date": item["run_date"], "run_id": item["run_id"]}
+                for item in validations
+            ],
+        },
+    }
 
 
 def _guard_recovery_pipeline_status(
@@ -708,6 +1178,8 @@ def guard_pipeline_status(
     というケースをbackupしない。
     """
     runs = list_status_runs(s3_client, bucket, base_prefix, status_prefix)
+    current_run = None
+    current_document = None
     if current_identity:
         current_runs = [
             run for run in runs
@@ -737,6 +1209,16 @@ def guard_pipeline_status(
 
     latest = sorted(runs, key=_sort_key)[-1]
     if latest["run_date"] != provenance["run_date"] or latest["run_id"] != provenance["run_id"]:
+        if current_run is not None and current_document is not None:
+            return _guard_prepublication_failure_recovery(
+                s3_client,
+                bucket,
+                runs,
+                provenance,
+                current_run,
+                current_document,
+                logger,
+            )
         raise RotationError(
             "previous CURRENTが正常ではありません: 直近のpipeline-status runと80-9 summaryが一致しません "
             f"(status={latest['run_date']}/{latest['run_id']} / "
@@ -783,6 +1265,78 @@ def validate_recovery_manifest_reference(
     }
 
 
+def load_recovery_manifest_inventory(manifest_path: Path) -> Dict[str, int]:
+    """previous verified 80-8 manifestをstrictなpath/size inventoryとして読む。"""
+    inventory: Dict[str, int] = {}
+    try:
+        records = read_jsonl(str(manifest_path))
+        for index, record in enumerate(records, 1):
+            if not isinstance(record, dict) or set(record) != {"relative_path", "size"}:
+                raise RotationError(
+                    f"previous verified manifestのschemaが不正です (record={index})"
+                )
+            relative_path = record.get("relative_path")
+            size = record.get("size")
+            if not isinstance(relative_path, str) or not relative_path:
+                raise RotationError(
+                    f"previous verified manifestのrelative_pathが不正です (record={index})"
+                )
+            parts = relative_path.split("/")
+            if relative_path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+                raise RotationError(
+                    f"previous verified manifestのrelative_pathが安全ではありません: {relative_path!r}"
+                )
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise RotationError(
+                    f"previous verified manifestのsizeが不正です: {relative_path!r}"
+                )
+            if relative_path in inventory:
+                raise RotationError(
+                    f"previous verified manifestにrelative_path重複があります: {relative_path!r}"
+                )
+            inventory[relative_path] = size
+    except RotationError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RotationError(f"previous verified manifestを読めません: {manifest_path} ({exc})") from exc
+    if not inventory:
+        raise RotationError("previous verified manifestが0件です")
+    return inventory
+
+
+def validate_recovery_current_inventory(
+    current: Dict[str, int], manifest: Dict[str, int], provenance: Dict[str, Any]
+) -> Dict[str, Any]:
+    """CURRENTをsummary count/bytesだけでなくmanifest全path/sizeとも照合する。"""
+    if current != manifest:
+        missing = sorted(set(manifest) - set(current))
+        extra = sorted(set(current) - set(manifest))
+        mismatched = sorted(
+            path for path in set(current) & set(manifest) if current[path] != manifest[path]
+        )
+        raise RotationError(
+            "CURRENT実体とprevious verified manifestのinventoryが一致しません "
+            f"(missing={len(missing)} / extra={len(extra)} / size_mismatch={len(mismatched)} / "
+            f"samples={(missing + extra + mismatched)[:SAMPLE_LIMIT]})"
+        )
+    file_count = len(manifest)
+    total_bytes = sum(manifest.values())
+    if file_count != provenance["file_count"] or total_bytes != provenance["total_bytes"]:
+        raise RotationError(
+            "previous verified manifestと80-9 summaryのcount/bytesが一致しません "
+            f"(manifest={file_count}/{total_bytes} / "
+            f"summary={provenance['file_count']}/{provenance['total_bytes']})"
+        )
+    return {
+        "verified": True,
+        "non_empty": True,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "manifest_inventory_match": True,
+        "unchanged_since_rotation_authority": True,
+    }
+
+
 def validate_recovery_current_unchanged(
     current_fingerprints: Dict[str, Dict[str, Any]], previous_finished_at: Any
 ) -> Dict[str, Any]:
@@ -816,6 +1370,96 @@ def validate_recovery_current_unchanged(
     return {
         "current_unchanged_since_previous_success": True,
         "previous_success_finished_at": previous_finished_at,
+    }
+
+
+def load_previous_backup_summary(summary_path: Path) -> Dict[str, Any]:
+    """pre-publication recoveryでBK1 baselineに使う直前80-75成功summaryを読む。"""
+    if not summary_path.is_file():
+        raise RotationError(f"直前の80-75 summaryが存在しません: {summary_path}")
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise RotationError(f"直前の80-75 summaryを読めません: {summary_path} ({exc})") from exc
+    if not isinstance(summary, dict):
+        raise RotationError("直前の80-75 summaryがJSON objectではありません")
+    return summary
+
+
+def validate_previous_backup_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """直前rotationでverifiedとなったBK1のcount/bytes baselineを返す。"""
+    required = (
+        ("step", STEP_NAME),
+        ("operation", "rotation"),
+        ("mode", "apply"),
+        ("backup_status", "SUCCEEDED"),
+        ("s3_source", EXPECTED_SOURCE_URI),
+        ("s3_destination", EXPECTED_DESTINATION_URI),
+        ("s3_destination_locked", True),
+    )
+    for key, expected in required:
+        if summary.get(key) != expected:
+            raise RotationError(
+                "直前の80-75 summaryがBK1 baselineとして不正です "
+                f"({key}={summary.get(key)!r})"
+            )
+    verify = summary.get("verify")
+    if not isinstance(verify, dict) or verify.get("verified") is not True:
+        raise RotationError("直前の80-75 summaryがverified成功ではありません")
+    for key in ("missing_count", "extra_count", "size_mismatch_count"):
+        if verify.get(key) != 0:
+            raise RotationError(f"直前の80-75 summaryの{key}が0ではありません")
+    expected_files = _require_count(verify, "expected_file_count", "previous 80-75 summary")
+    actual_files = _require_count(verify, "actual_file_count", "previous 80-75 summary")
+    expected_bytes = _require_count(verify, "expected_total_bytes", "previous 80-75 summary")
+    actual_bytes = _require_count(verify, "actual_total_bytes", "previous 80-75 summary")
+    if expected_files <= 0 or expected_files != actual_files or expected_bytes != actual_bytes:
+        raise RotationError("直前の80-75 summaryのBK1 count/bytesが不正です")
+    return {
+        "summary_verified": True,
+        "file_count": actual_files,
+        "total_bytes": actual_bytes,
+    }
+
+
+def validate_recovery_bk1_unchanged(
+    backup_fingerprints: Dict[str, Dict[str, Any]],
+    authority_finished_at: Any,
+    baseline: Dict[str, Any],
+) -> Dict[str, Any]:
+    """BK1の非空、完全LIST、baseline count/bytes、authority後の更新なしを確認する。"""
+    if not backup_fingerprints:
+        raise RotationError("BK1が0件のためrecoveryを許可できません")
+    cutoff = _parse_evidence_timestamp("rotation authority finished_at", authority_finished_at)
+    changed = []
+    for relative_path, fingerprint in backup_fingerprints.items():
+        last_modified = fingerprint.get("last_modified")
+        if not isinstance(last_modified, datetime) or last_modified.tzinfo is None:
+            raise RotationError(f"BK1 objectのLastModifiedが不正です: {relative_path}")
+        if last_modified > cutoff:
+            changed.append(relative_path)
+    if changed:
+        raise RotationError(
+            "rotation authority終了後にBK1が変更されています "
+            f"(count={len(changed)} / samples={sorted(changed)[:SAMPLE_LIMIT]})"
+        )
+    file_count = len(backup_fingerprints)
+    total_bytes = sum(item["size"] for item in backup_fingerprints.values())
+    if file_count != baseline["file_count"] or total_bytes != baseline["total_bytes"]:
+        raise RotationError(
+            "BK1実体と直前80-75成功summaryのcount/bytesが一致しません "
+            f"(s3={file_count}/{total_bytes} / "
+            f"summary={baseline['file_count']}/{baseline['total_bytes']})"
+        )
+    return {
+        "verified": True,
+        "non_empty": True,
+        "inventory_listed": True,
+        "previous_80_75_summary_match": True,
+        "unchanged_since_rotation_authority": True,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
     }
 
 
@@ -999,6 +1643,14 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "wait_performed": False,
         "sync_summary_path": str(sync_summary_path),
     }
+    if not args.dry_run:
+        summary["immutable_execution_guard_contract_version"] = (
+            IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
+        )
+
+    current_identity = resolve_current_managed_identity(args)
+    if not args.dry_run and current_identity is None:
+        raise RotationError("apply rotationにはmanaged RUN_DATE/RUN_IDが必須です")
 
     # ---- previous CURRENT 正常性guard ------------------------------------
     previous_summary = load_previous_sync_summary(sync_summary_path)
@@ -1009,7 +1661,11 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     )
 
     s3_client = build_s3_client(region)
-    current_identity = resolve_current_managed_identity(args)
+    if current_identity is not None:
+        stepfunctions_client = build_stepfunctions_client(region)
+        summary["current_execution_guard"] = guard_current_execution_history(
+            stepfunctions_client, current_identity, logger
+        )
     status_info = guard_pipeline_status(
         s3_client,
         bucket,
@@ -1020,13 +1676,18 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         logger,
         recovery_target=recovery_target,
     )
+    recovery_status = status_info.get("recovery")
+    prepublication_recovery = bool(
+        recovery_status
+        and recovery_status.get("recovery_mode") == "pre_publication_08_5_failure"
+    )
 
     current_before_fingerprint = list_source_fingerprints(s3_client, bucket, current_prefix)
     unchanged_info = None
-    if recovery_target is not None:
+    if recovery_status is not None:
         unchanged_info = validate_recovery_current_unchanged(
             current_before_fingerprint,
-            status_info["recovery"]["previous_verified_finished_at"],
+            recovery_status["previous_verified_finished_at"],
         )
     current_before = {
         path: fingerprint["size"] for path, fingerprint in current_before_fingerprint.items()
@@ -1042,27 +1703,50 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         )
     logger.info(f"CURRENT実体照合OK: files={len(current_before)} / bytes={current_bytes}")
 
-    if recovery_target is not None:
+    recovery_info = None
+    if recovery_status is not None:
         manifest_info = validate_recovery_manifest_reference(
             previous_manifest_path,
             previous_summary.get("manifest_path"),
         )
-        recovery_info = dict(status_info["recovery"])
+        recovery_info = dict(recovery_status)
         recovery_info.update(manifest_info)
         recovery_info.update(unchanged_info or {})
         recovery_info["file_count"] = len(current_before)
         recovery_info["total_bytes"] = current_bytes
         recovery_info["inventory_verified"] = True
-        summary["recovery"] = recovery_info
+        if prepublication_recovery:
+            manifest_inventory = load_recovery_manifest_inventory(previous_manifest_path)
+            recovery_info["current_unchanged"] = validate_recovery_current_inventory(
+                current_before, manifest_inventory, provenance
+            )
         logger.info(
             "recovery eligibility=true: "
-            f"target={recovery_info['target_run_date']}/{recovery_info['target_run_id']} / "
-            f"previous={recovery_info['previous_verified_run_date']}/"
-            f"{recovery_info['previous_verified_run_id']} / "
+            f"mode={recovery_info.get('recovery_mode', 'explicit_80_7')} / "
+            f"authority={provenance['run_date']}/{provenance['run_id']} / "
             f"CURRENT files={recovery_info['file_count']} bytes={recovery_info['total_bytes']}"
         )
 
-    backup_before = list_prefix_objects(s3_client, bucket, backup_prefix)
+    if prepublication_recovery:
+        backup_before_fingerprint = list_source_fingerprints(s3_client, bucket, backup_prefix)
+        backup_before = {
+            path: fingerprint["size"]
+            for path, fingerprint in backup_before_fingerprint.items()
+        }
+        previous_backup_summary_path = (
+            Path(args.step_dir) / RESULT_DIR_NAME / BACKUP_SUMMARY_FILENAME
+        )
+        previous_backup_summary = load_previous_backup_summary(previous_backup_summary_path)
+        backup_baseline = validate_previous_backup_summary(previous_backup_summary)
+        if recovery_info is None:
+            raise RotationError("pre-publication recovery auditの初期化に失敗しました")
+        recovery_info["bk1_unchanged"] = validate_recovery_bk1_unchanged(
+            backup_before_fingerprint,
+            recovery_status["previous_verified_finished_at"],
+            backup_baseline,
+        )
+    else:
+        backup_before = list_prefix_objects(s3_client, bucket, backup_prefix)
     if args.bootstrap:
         if backup_before:
             raise RotationError(
@@ -1073,6 +1757,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             raise RotationError(
                 f"bk1が存在しません。初回作成は --bootstrap で実行してください: {destination_uri}"
             )
+
+    if recovery_info is not None:
+        summary["recovery"] = recovery_info
 
     summary["previous_current"] = {
         "run_date": provenance["run_date"],
@@ -1153,6 +1840,10 @@ def main() -> int:
             "backup_status": "FAILED",
             "error_message": str(exc),
         }
+        if not args.dry_run:
+            summary["immutable_execution_guard_contract_version"] = (
+                IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
+            )
         exit_code = 1
     except Exception as exc:  # noqa: BLE001 - 想定外例外も握りつぶさずFAILさせる
         logger.error(f"[NG] 想定外エラー: {type(exc).__name__}: {exc}")
@@ -1164,6 +1855,10 @@ def main() -> int:
             "backup_status": "FAILED",
             "error_message": f"{type(exc).__name__}: {exc}",
         }
+        if not args.dry_run:
+            summary["immutable_execution_guard_contract_version"] = (
+                IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
+            )
         exit_code = 1
 
     with open(summary_path, "w", encoding="utf-8") as f:
