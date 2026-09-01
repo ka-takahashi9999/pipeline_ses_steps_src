@@ -134,6 +134,11 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
                     "StringEquals": "FAILED",
                     "Next": "SetBatchTerminalFailure",
                 },
+                {
+                    "Variable": "$.batch_status_lambda.result.outcome",
+                    "StringEquals": "RECOVERY_REQUIRED",
+                    "Next": "PrepareBatchRecoveryStart",
+                },
             ],
             "Default": "SetUnknownBatchStatusOutcomeFailure",
         },
@@ -156,11 +161,22 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
             "08-5 Batch status Lambda returned an unknown outcome; EC2 remains stopped.",
             "PublishFailureNotification",
         ),
+        "PrepareBatchRecoveryStart": {
+            "Type": "Pass",
+            "Parameters": {
+                "run_id.$": "$.run_id",
+                "run_date.$": "$.run_date",
+                "batch_recovery": True,
+                "phase_b_waits": {"ec2_running": 0, "ssm_ready": 0, "launcher": 0},
+            },
+            "Next": "StartEC2ForPhaseB",
+        },
         "PreparePhaseBStart": {
             "Type": "Pass",
             "Parameters": {
                 "run_id.$": "$.run_id",
                 "run_date.$": "$.run_date",
+                "batch_recovery": False,
                 "phase_b_waits": {"ec2_running": 0, "ssm_ready": 0, "launcher": 0},
             },
             "Next": "StartEC2ForPhaseB",
@@ -196,6 +212,7 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
             "Parameters": {
                 "run_id.$": "$.run_id",
                 "run_date.$": "$.run_date",
+                "batch_recovery.$": "$.batch_recovery",
                 "phase_b_waits": {
                     "ec2_running.$": "States.MathAdd($.phase_b_waits.ec2_running, 1)",
                     "ssm_ready.$": "$.phase_b_waits.ssm_ready",
@@ -242,7 +259,7 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
                         {"Variable": "$.phase_b_ssm_result.InstanceInformationList[0].PingStatus", "IsPresent": True},
                         {"Variable": "$.phase_b_ssm_result.InstanceInformationList[0].PingStatus", "StringEquals": "Online"},
                     ],
-                    "Next": "SendPhaseBLauncherCommand",
+                    "Next": "ChooseBatchRecoveryCommand",
                 }
             ],
             "Default": "IncrementPhaseBSSMWait",
@@ -252,6 +269,7 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
             "Parameters": {
                 "run_id.$": "$.run_id",
                 "run_date.$": "$.run_date",
+                "batch_recovery.$": "$.batch_recovery",
                 "phase_b_waits": {
                     "ec2_running.$": "$.phase_b_waits.ec2_running",
                     "ssm_ready.$": "States.MathAdd($.phase_b_waits.ssm_ready, 1)",
@@ -274,6 +292,41 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
         "SetPhaseBSSMTimeoutFailure": _failure_state(
             "PHASE_B_SSM_TIMEOUT", "SSM did not become Online for Phase B within 15 minutes."
         ),
+        "ChooseBatchRecoveryCommand": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.batch_recovery",
+                    "BooleanEquals": True,
+                    "Next": "SendBatchRecoveryCommand",
+                }
+            ],
+            "Default": "SendPhaseBLauncherCommand",
+        },
+        "SendBatchRecoveryCommand": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+            "Parameters": {
+                "InstanceIds": [INSTANCE_ID],
+                "DocumentName": "AWS-RunShellScript",
+                "Comment": "Run claimed 08-5 one-time file visibility recovery",
+                "Parameters": {
+                    "commands.$": "States.Array(States.Format('/usr/bin/python3 /home/ec2-user/pipeline_ses_steps/08-5_high_score_required_skill_recheck/00_tool/batch_aws_orchestration.py phase-recovery --pipeline-run-id {} --run-date {}', $.run_id, $.run_date))",
+                    "executionTimeout": ["600"],
+                },
+                "CloudWatchOutputConfig": {
+                    "CloudWatchLogGroupName": LOG_GROUP,
+                    "CloudWatchOutputEnabled": True,
+                },
+            },
+            "ResultPath": "$.phase_b_send_result",
+            "TimeoutSeconds": 60,
+            "Retry": _retry(),
+            "Catch": [
+                {"ErrorEquals": ["States.ALL"], "ResultPath": "$.caught_error", "Next": "SetPhaseBSendFailure"}
+            ],
+            "Next": "WaitForPhaseBLauncherCommand",
+        },
         "SendPhaseBLauncherCommand": {
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
@@ -335,7 +388,7 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
         "CheckPhaseBLauncherStatus": {
             "Type": "Choice",
             "Choices": [
-                {"Variable": "$.phase_b_command_result.Status", "StringEquals": "Success", "Next": "InitializePhaseBStatusPolling"},
+                {"Variable": "$.phase_b_command_result.Status", "StringEquals": "Success", "Next": "RouteAfterBatchCommandSuccess"},
                 {
                     "Or": [
                         {"Variable": "$.phase_b_command_result.Status", "StringEquals": value}
@@ -356,11 +409,29 @@ def _phase_b_states(lambda_arn: str) -> Dict[str, Any]:
         "SetPhaseBLauncherStatusFailure": _failure_state(
             "PHASE_B_LAUNCHER_FAILED", "Phase B launcher returned failure or an unknown status."
         ),
+        "RouteAfterBatchCommandSuccess": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.batch_recovery",
+                    "BooleanEquals": True,
+                    "Next": "StopEC2AfterBatchRecovery",
+                }
+            ],
+            "Default": "InitializePhaseBStatusPolling",
+        },
+        "StopEC2AfterBatchRecovery": _ec2_task(
+            "stopInstances",
+            "$.batch_recovery_stop_result",
+            "WaitForBatchStatus",
+            "SetStopForBatchWaitFailure",
+        ),
         "IncrementPhaseBLauncherWait": {
             "Type": "Pass",
             "Parameters": {
                 "run_id.$": "$.run_id",
                 "run_date.$": "$.run_date",
+                "batch_recovery.$": "$.batch_recovery",
                 "phase_b_send_result.$": "$.phase_b_send_result",
                 "phase_b_waits": {
                     "ec2_running.$": "$.phase_b_waits.ec2_running",

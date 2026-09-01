@@ -6,6 +6,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -147,9 +148,24 @@ def _metadata_matches(batch: Dict[str, Any], state: Dict[str, Any]) -> bool:
         "submission_nonce": str(state.get("submission_nonce") or ""),
         "manifest_sha256": str(state.get("manifest_sha256") or ""),
     }
+    recovery_pending = state.get("state") == "RECOVERY_PENDING_RECONCILIATION"
+    if recovery_pending:
+        expected.update(
+            {
+                "recovery_nonce": str(state.get("recovery_nonce") or ""),
+                "recovery_attempt_count": "1",
+            }
+        )
     if not all(str(metadata.get(key) or "") == value for key, value in expected.items()):
         return False
-    input_file_id = str(state.get("input_file_id") or "")
+    input_file_id = str(
+        (
+            state.get("recovery_file_id")
+            if recovery_pending
+            else state.get("input_file_id")
+        )
+        or ""
+    )
     return not input_file_id or str(batch.get("input_file_id") or "") == input_file_id
 
 
@@ -191,7 +207,9 @@ def _sanitize_batch_terminal_errors(batch: Dict[str, Any]) -> List[Dict[str, Any
 
 
 def _reconcile_pending(state: Dict[str, Any], api_key: str) -> Optional[Dict[str, Any]]:
-    if not state.get("input_file_id"):
+    recovery_pending = state.get("state") == "RECOVERY_PENDING_RECONCILIATION"
+    expected_file_id = state.get("recovery_file_id") if recovery_pending else state.get("input_file_id")
+    if not expected_file_id:
         raise StatusError("PENDING_RECONCILIATION input_file_id欠落")
     listed = _openai_get("/batches", api_key, {"limit": "100"})
     data = listed.get("data")
@@ -206,6 +224,13 @@ def _reconcile_pending(state: Dict[str, Any], api_key: str) -> Optional[Dict[str
         state["batch_id"] = batch_id
         state["state"] = "SUBMITTED"
         state["reconciled_at"] = utc_now()
+        if recovery_pending:
+            if batch_id == state.get("original_batch_id"):
+                raise StatusError("reconciliation Recovery batch_idがoriginalと同一です")
+            state["input_file_id"] = str(expected_file_id)
+            state["recovery_batch_id"] = batch_id
+            state["recovery_state"] = "RECOVERY_SUBMITTED"
+            state["recovery_final_outcome"] = "WAITING"
         return _openai_get(f"/batches/{batch_id}", api_key)
     if len(matches) > 1:
         state["state"] = "SAFE_STOPPED"
@@ -217,6 +242,50 @@ def _reconcile_pending(state: Dict[str, Any], api_key: str) -> Optional[Dict[str
     else:
         state["batch_status"] = "pending_reconciliation"
     return None
+
+
+def _recovery_eligibility(
+    state: Dict[str, Any], batch: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Classify only the known zero-request file visibility validation failure."""
+    if str(batch.get("status") or "") != "failed":
+        return {"eligible": False, "reason": "terminal_status_not_failed"}
+    attempt = state.get("recovery_attempt_count")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt != 0:
+        return {"eligible": False, "reason": "recovery_already_attempted"}
+    counts = batch.get("request_counts")
+    if not isinstance(counts, dict):
+        return {"eligible": False, "reason": "request_counts_missing"}
+    for field in ("total", "completed", "failed"):
+        value = counts.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value != 0:
+            return {"eligible": False, "reason": "request_counts_not_all_zero"}
+    if "in_progress_at" not in batch or batch.get("in_progress_at") is not None:
+        return {"eligible": False, "reason": "in_progress_at_not_null"}
+    if "output_file_id" not in batch or batch.get("output_file_id") is not None:
+        return {"eligible": False, "reason": "output_file_id_not_null"}
+    if "error_file_id" not in batch or batch.get("error_file_id") is not None:
+        return {"eligible": False, "reason": "error_file_id_not_null"}
+    errors = batch.get("errors")
+    data = errors.get("data") if isinstance(errors, dict) else None
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        return {"eligible": False, "reason": "terminal_error_contract_unknown"}
+    error = data[0]
+    code = str(error.get("code") or "").lower()
+    param = str(error.get("param") or "").lower()
+    message = str(error.get("message") or "")
+    visibility_message = bool(
+        re.search(r"(?i)cannot\s+find\s+(?:the\s+)?file\b", message)
+        or re.search(r"(?i)\bfile\b.{0,160}\bnot\s+found\b", message)
+        or re.search(r"(?i)\borganization\b.{0,160}\bdoes\s+not\s+have\s+access\b", message)
+    )
+    if code != "invalid_request" or param != "file_id" or not visibility_message:
+        return {"eligible": False, "reason": "not_known_file_visibility_error"}
+    if not str(state.get("input_file_id") or "") or not str(
+        state.get("batch_id") or ""
+    ):
+        return {"eligible": False, "reason": "original_identity_missing"}
+    return {"eligible": True, "reason": "file_visibility_validation_failure"}
 
 
 def _observe(state: Dict[str, Any], batch: Dict[str, Any]) -> str:
@@ -243,9 +312,33 @@ def _observe(state: Dict[str, Any], batch: Dict[str, Any]) -> str:
     )
     if status == "completed" and state.get("state") not in {"COLLECTED", "COMMITTED"}:
         state["state"] = "COMPLETED"
+        if state.get("recovery_attempt_count") == 1:
+            state["recovery_state"] = "RECOVERY_COMPLETED"
+            state["recovery_final_outcome"] = "COMPLETED"
     elif status in FAILURE_STATUSES:
-        state["state"] = "SAFE_STOPPED"
-        state["safe_stop_reason"] = f"batch_{status}"
+        classification = _recovery_eligibility(state, batch)
+        state["recovery_eligible"] = bool(classification["eligible"])
+        state["recovery_reason"] = str(classification["reason"])
+        if classification["eligible"]:
+            state.update(
+                {
+                    "state": "RECOVERY_REQUIRED",
+                    "recovery_state": "RECOVERY_REQUIRED",
+                    "recovery_nonce": uuid.uuid4().hex,
+                    "original_file_id": str(state.get("input_file_id") or ""),
+                    "original_batch_id": batch_id,
+                    "original_terminal_error": list(state.get("batch_errors") or []),
+                    "original_request_counts": dict(batch.get("request_counts") or {}),
+                    "recovery_final_outcome": "RECOVERY_REQUIRED",
+                    "safe_stop_reason": None,
+                }
+            )
+        else:
+            state["state"] = "SAFE_STOPPED"
+            state["safe_stop_reason"] = f"batch_{status}"
+            if state.get("recovery_attempt_count") == 1:
+                state["recovery_state"] = "SAFE_STOPPED"
+                state["recovery_final_outcome"] = "SAFE_STOPPED"
     elif status not in WAIT_STATUSES:
         state["state"] = "SAFE_STOPPED"
         state["safe_stop_reason"] = f"unknown_batch_status:{status}"
@@ -304,7 +397,12 @@ def check_status(
     batch: Optional[Dict[str, Any]] = None
     if state.get("state") == "COMMITTED":
         status = "completed"
-    elif state.get("state") == "PENDING_RECONCILIATION" and not state.get("batch_id"):
+    elif state.get("state") == "RECOVERY_REQUIRED":
+        status = "failed"
+    elif state.get("state") in {
+        "PENDING_RECONCILIATION",
+        "RECOVERY_PENDING_RECONCILIATION",
+    } and not state.get("batch_id"):
         batch = _reconcile_pending(state, key_value)
         status = str(state.get("batch_status") or "pending_reconciliation")
     else:
@@ -321,6 +419,14 @@ def check_status(
     state["state_updated_at"] = utc_now()
     _put_json_s3(s3_client, settings["bucket"], key, state)
 
+    if state.get("state") == "RECOVERY_REQUIRED":
+        return {
+            "outcome": "RECOVERY_REQUIRED",
+            "batch_status": status,
+            "reason": str(state.get("recovery_reason") or ""),
+            "run_id": run_id,
+            "run_date": run_date,
+        }
     if state.get("state") == "SAFE_STOPPED":
         reason = str(state.get("safe_stop_reason") or f"batch_{status}")
         _write_pipeline_failed(

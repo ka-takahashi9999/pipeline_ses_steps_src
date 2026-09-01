@@ -18,7 +18,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -56,6 +56,11 @@ STATE_COMPLETED = "COMPLETED"
 STATE_COLLECTED = "COLLECTED"
 STATE_COMMITTED = "COMMITTED"
 STATE_SAFE_STOPPED = "SAFE_STOPPED"
+STATE_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+RECOVERY_CLAIMED = "RECOVERY_CLAIMED"
+RECOVERY_FILE_UPLOADED = "RECOVERY_FILE_UPLOADED"
+RECOVERY_PENDING_RECONCILIATION = "RECOVERY_PENDING_RECONCILIATION"
+RECOVERY_SUBMITTED = "RECOVERY_SUBMITTED"
 TERMINAL_BATCH_STATUSES = {"completed", "failed", "expired", "cancelled"}
 
 ARTIFACT_PATHS = {
@@ -178,6 +183,7 @@ class FileStateStore:
         self.state_path = run_dir / "batch_state.json"
         self.lock_path = run_dir / ".batch_state.lock"
         self.claim_path = run_dir / "submit.claim"
+        self.recovery_claim_path = run_dir / "recovery.claim"
 
     @staticmethod
     def _etag(payload: bytes) -> str:
@@ -234,6 +240,30 @@ class FileStateStore:
         except FileExistsError as error:
             raise SubmissionBlocked(
                 "persistent submit claim取得済み: 二重submitを拒否"
+            ) from error
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(_json_bytes(claim, pretty=True))
+            target.flush()
+            os.fsync(target.fileno())
+
+    def acquire_recovery_claim(
+        self, recovery_nonce: str, claim_identity: Optional[Dict[str, str]] = None
+    ) -> None:
+        claim = {
+            "claimed_at": utc_now(),
+            "recovery_nonce": recovery_nonce,
+        }
+        if claim_identity:
+            claim.update(claim_identity)
+        try:
+            descriptor = os.open(
+                str(self.recovery_claim_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError as error:
+            raise SubmissionBlocked(
+                "persistent recovery claim取得済み: 二重recovery submitを拒否"
             ) from error
         with os.fdopen(descriptor, "wb") as target:
             target.write(_json_bytes(claim, pretty=True))
@@ -417,11 +447,21 @@ def validate_prepared(run_dir: Path) -> Dict[str, Any]:
     state, state_etag = FileStateStore(run_dir).load()
     if state.get("manifest_sha256") != manifest_sha256:
         raise ValueError("state/manifest SHA-256不一致")
+    input_file_sha256 = _file_sha256(run_dir / "input.jsonl")
+    manifest_file_sha256 = _file_sha256(run_dir / "manifest.jsonl")
+    if state.get("input_sha256") not in (None, input_file_sha256):
+        raise ValueError("state/input file SHA-256不一致")
+    if state.get("manifest_file_sha256") not in (None, manifest_file_sha256):
+        raise ValueError("state/manifest file SHA-256不一致")
+    if int(state.get("request_count", -1)) != len(input_records):
+        raise ValueError("state/input request count不一致")
     return {
         "manifest_count": len(manifest),
         "request_count": len(input_records),
         "custom_id_unique": len(input_by_id) == len(input_records),
         "manifest_sha256": manifest_sha256,
+        "input_sha256": input_file_sha256,
+        "manifest_file_sha256": manifest_file_sha256,
         "state_etag": state_etag,
     }
 
@@ -459,6 +499,8 @@ def prepare_run(
         "state_updated_at": utc_now(),
         "submission_nonce": submission_nonce,
         "manifest_sha256": SHARED_CORE.sha256_value(manifest),
+        "input_sha256": _file_sha256(run_dir / "input.jsonl"),
+        "manifest_file_sha256": _file_sha256(run_dir / "manifest.jsonl"),
         "manifest_count": len(manifest),
         "request_count": len(requests_to_send),
         "input_file_id": None,
@@ -472,6 +514,20 @@ def prepare_run(
         "reconciliation_checks": 0,
         "safe_stop_reason": None,
         "production_commit_marker": None,
+        "recovery_attempt_count": 0,
+        "recovery_reason": None,
+        "recovery_eligible": None,
+        "original_file_id": None,
+        "original_batch_id": None,
+        "original_terminal_error": None,
+        "original_request_counts": None,
+        "recovery_file_id": None,
+        "recovery_batch_id": None,
+        "recovery_started_at": None,
+        "recovery_state": None,
+        "recovery_claim_id": None,
+        "recovery_file_readiness": None,
+        "recovery_final_outcome": None,
     }
     FileStateStore(run_dir).create(state)
     validation = validate_prepared(run_dir)
@@ -584,13 +640,25 @@ def _require_network(allow_network: bool) -> None:
         raise PermissionError("network処理は--allow-network明示時だけ実行できます")
 
 
-def _batch_metadata(state: Dict[str, Any]) -> Dict[str, str]:
-    return {
+def _batch_metadata(
+    state: Dict[str, Any], recovery: bool = False
+) -> Dict[str, str]:
+    metadata = {
         "run_id": str(state["run_id"]),
         "step": DIRECT.STEP_NAME,
         "submission_nonce": str(state["submission_nonce"]),
         "manifest_sha256": str(state["manifest_sha256"]),
     }
+    if recovery:
+        metadata.update(
+            {
+                "recovery_nonce": str(state.get("recovery_nonce") or ""),
+                "recovery_attempt_count": str(
+                    state.get("recovery_attempt_count", "")
+                ),
+            }
+        )
+    return metadata
 
 
 def _wait_for_input_file_ready(
@@ -922,11 +990,344 @@ def submit_run(
     }
 
 
+def _safe_stop_recovery(
+    store: FileStateStore,
+    state: Dict[str, Any],
+    etag: str,
+    reason: str,
+) -> None:
+    state["state"] = STATE_SAFE_STOPPED
+    state["safe_stop_reason"] = reason
+    state["recovery_state"] = STATE_SAFE_STOPPED
+    state["recovery_final_outcome"] = "SAFE_STOPPED"
+    state["recovery_eligible"] = False
+    store.cas(etag, state)
+
+
+def _stored_recovery_contract_matches(state: Dict[str, Any]) -> bool:
+    counts = state.get("request_counts")
+    if not isinstance(counts, dict):
+        return False
+    if any(
+        not isinstance(counts.get(field), int)
+        or isinstance(counts.get(field), bool)
+        or counts.get(field) != 0
+        for field in ("total", "completed", "failed")
+    ):
+        return False
+    errors = state.get("batch_errors")
+    if not isinstance(errors, list) or len(errors) != 1 or not isinstance(errors[0], dict):
+        return False
+    terminal_error = errors[0]
+    message = str(terminal_error.get("message") or "")
+    known_message = bool(
+        re.search(r"(?i)cannot\s+find\s+(?:the\s+)?file\b", message)
+        or re.search(r"(?i)\bfile\b.{0,160}\bnot\s+found\b", message)
+        or re.search(
+            r"(?i)\borganization\b.{0,160}\bdoes\s+not\s+have\s+access\b",
+            message,
+        )
+    )
+    return (
+        str(terminal_error.get("code") or "").lower() == "invalid_request"
+        and str(terminal_error.get("param") or "").lower() == "file_id"
+        and known_message
+        and "in_progress_at" in state
+        and state.get("in_progress_at") is None
+        and "output_file_id" in state
+        and state.get("output_file_id") is None
+        and "error_file_id" in state
+        and state.get("error_file_id") is None
+        and state.get("original_request_counts") == counts
+        and state.get("original_terminal_error") == errors
+        and state.get("recovery_reason") == "file_visibility_validation_failure"
+    )
+
+
+RECOVERY_CLAIM_IDENTITY_FIELDS = (
+    "recovery_nonce",
+    "recovery_claim_id",
+    "original_file_id",
+    "original_batch_id",
+    "input_sha256",
+    "manifest_sha256",
+    "manifest_file_sha256",
+)
+
+
+def _recovery_claim_identity(state: Dict[str, Any]) -> Dict[str, str]:
+    identity = {
+        field: str(state.get(field) or "")
+        for field in RECOVERY_CLAIM_IDENTITY_FIELDS
+    }
+    if any(not value for value in identity.values()):
+        raise SubmissionBlocked("recovery claim identity証拠不足")
+    return identity
+
+
+def _validate_owned_recovery_claim(
+    claim: Dict[str, Any], state: Dict[str, Any]
+) -> None:
+    expected = _recovery_claim_identity(state)
+    if any(str(claim.get(field) or "") != value for field, value in expected.items()):
+        raise SubmissionBlocked("persistent recovery claim identity不一致")
+
+
+def _recovery_checkpoint(
+    store: FileStateStore,
+    etag: str,
+    state: Dict[str, Any],
+    checkpoint_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> str:
+    next_etag = store.cas(etag, state)
+    persisted, _ = store.load()
+    if checkpoint_callback is not None:
+        checkpoint_callback(persisted)
+    return next_etag
+
+
+def recover_file_visibility_failure(
+    run_id: str,
+    client: Any,
+    runtime_root: Path = RUNTIME_ROOT,
+    claim_already_acquired: bool = False,
+    checkpoint_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    claim_callback: Optional[Callable[[bytes, Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Re-upload the immutable input and submit one replacement Batch at most once."""
+    run_dir = _run_dir(run_id, runtime_root)
+    store = FileStateStore(run_dir)
+    state, etag = store.load()
+    try:
+        validation = validate_prepared(run_dir)
+    except Exception as error:
+        state, etag = store.load()
+        _safe_stop_recovery(
+            store, state, etag, "recovery_saved_artifact_validation_failed"
+        )
+        raise SubmissionBlocked(
+            "保存済みBatch input/manifest検証不一致のためrecoveryを拒否"
+        ) from error
+
+    digest_matches = (
+        isinstance(state.get("input_sha256"), str)
+        and state.get("input_sha256") == validation["input_sha256"]
+        and isinstance(state.get("manifest_file_sha256"), str)
+        and state.get("manifest_file_sha256")
+        == validation["manifest_file_sha256"]
+        and state.get("manifest_sha256") == validation["manifest_sha256"]
+        and isinstance(state.get("request_count"), int)
+        and not isinstance(state.get("request_count"), bool)
+        and state.get("request_count") == validation["request_count"]
+    )
+    if not digest_matches:
+        _safe_stop_recovery(
+            store, state, etag, "recovery_saved_artifact_digest_mismatch"
+        )
+        raise SubmissionBlocked("保存済みBatch input/manifest digest不一致")
+
+    recovery_state = state.get("recovery_state")
+    recovery_attempt = state.get("recovery_attempt_count")
+    if (
+        recovery_attempt == 1
+        and recovery_state == RECOVERY_SUBMITTED
+        and state.get("state") == STATE_SUBMITTED
+        and str(state.get("recovery_batch_id") or "")
+        == str(state.get("batch_id") or "")
+    ):
+        return {
+            "run_id": run_id,
+            "batch_id": state.get("batch_id"),
+            "batch_status": state.get("batch_status"),
+            "state": state.get("state"),
+            "state_etag": etag,
+            "recovered": True,
+            "recovery_attempt_count": 1,
+            "resumed": True,
+        }
+    allowed_resume = recovery_attempt == 1 and recovery_state in {
+        RECOVERY_CLAIMED,
+        RECOVERY_FILE_UPLOADED,
+        RECOVERY_PENDING_RECONCILIATION,
+    }
+    initial_attempt = (
+        state.get("state") == STATE_RECOVERY_REQUIRED
+        and recovery_state == STATE_RECOVERY_REQUIRED
+        and recovery_attempt == 0
+    )
+    if (
+        not (initial_attempt or allowed_resume)
+        or state.get("recovery_eligible") is not True
+        or state.get("batch_status") != "failed"
+        or not _stored_recovery_contract_matches(state)
+    ):
+        raise SubmissionBlocked("one-time file visibility recovery条件外")
+    original_file_id = str(state.get("original_file_id") or "")
+    original_batch_id = str(state.get("original_batch_id") or "")
+    recovery_nonce = str(state.get("recovery_nonce") or "")
+    if (
+        not original_file_id
+        or original_file_id != str(state.get("input_file_id") or "")
+        or not original_batch_id
+        or (
+            recovery_state != RECOVERY_PENDING_RECONCILIATION
+            and original_batch_id != str(state.get("batch_id") or "")
+        )
+        or (
+            recovery_state == RECOVERY_PENDING_RECONCILIATION
+            and state.get("batch_id") is not None
+        )
+        or not recovery_nonce
+    ):
+        _safe_stop_recovery(store, state, etag, "recovery_identity_invalid")
+        raise SubmissionBlocked("recovery original identity/nonce不正")
+
+    resumed = not initial_attempt
+    if initial_attempt:
+        state, etag = store.load()
+        if (
+            state.get("state") != STATE_RECOVERY_REQUIRED
+            or state.get("recovery_attempt_count") != 0
+        ):
+            raise CASConflict("recovery claim前のstate/attemptが一致しません")
+        state["recovery_attempt_count"] = 1
+        state["recovery_started_at"] = utc_now()
+        state["recovery_state"] = RECOVERY_CLAIMED
+        state["recovery_reason"] = "file_visibility_validation_failure"
+        state["recovery_claim_id"] = uuid.uuid4().hex
+        etag = _recovery_checkpoint(store, etag, state, checkpoint_callback)
+        state, _ = store.load()
+
+    claim_identity = _recovery_claim_identity(state)
+    if store.recovery_claim_path.exists():
+        pass
+    elif claim_already_acquired:
+        raise SubmissionBlocked("persistent recovery claimがありません")
+    else:
+        store.acquire_recovery_claim(recovery_nonce, claim_identity)
+    try:
+        recovery_claim = _read_json_object(store.recovery_claim_path)
+    except Exception as error:
+        raise SubmissionBlocked("persistent recovery claimが不正です") from error
+    _validate_owned_recovery_claim(recovery_claim, state)
+    if claim_callback is not None:
+        claim_callback(store.recovery_claim_path.read_bytes(), state)
+
+    if recovery_state == RECOVERY_PENDING_RECONCILIATION:
+        raise PendingReconciliation(
+            "Recovery Batch create済み可能性あり。再submitせずreconciliationが必要です"
+        )
+
+    recovery_file_id = str(state.get("recovery_file_id") or "")
+    if state.get("recovery_state") == RECOVERY_CLAIMED:
+        recovery_file_id = str(client.upload_input(run_dir / "input.jsonl") or "")
+        if not recovery_file_id or recovery_file_id == original_file_id:
+            state, etag = store.load()
+            _safe_stop_recovery(store, state, etag, "recovery_new_file_id_required")
+            raise SubmissionBlocked("recovery uploadは新しいfile_idが必須です")
+        state, etag = store.load()
+        if (
+            state.get("recovery_state") != RECOVERY_CLAIMED
+            or state.get("recovery_attempt_count") != 1
+        ):
+            raise CASConflict("recovery upload後のstate/attemptが一致しません")
+        state["recovery_file_id"] = recovery_file_id
+        state["recovery_file_uploaded_at"] = utc_now()
+        state["recovery_state"] = RECOVERY_FILE_UPLOADED
+        etag = _recovery_checkpoint(store, etag, state, checkpoint_callback)
+    elif state.get("recovery_state") == RECOVERY_FILE_UPLOADED:
+        if not recovery_file_id or recovery_file_id == original_file_id:
+            raise SubmissionBlocked("保存済みrecovery_file_id identity不正")
+    else:
+        raise SubmissionBlocked("Recovery resume state不正")
+
+    try:
+        readiness = _wait_for_input_file_ready(client, recovery_file_id)
+    except FileReadinessError as error:
+        state, etag = store.load()
+        state["recovery_file_readiness"] = error.audit
+        _safe_stop_recovery(
+            store, state, etag, f"recovery_input_file_{error.reason}"
+        )
+        raise
+
+    state, etag = store.load()
+    if (
+        state.get("recovery_state") != RECOVERY_FILE_UPLOADED
+        or state.get("recovery_file_id") != recovery_file_id
+        or state.get("recovery_attempt_count") != 1
+    ):
+        raise CASConflict("recovery readiness後のstate/file/attemptが一致しません")
+    state["recovery_file_readiness"] = readiness
+    state["state"] = RECOVERY_PENDING_RECONCILIATION
+    state["recovery_state"] = RECOVERY_PENDING_RECONCILIATION
+    state["recovery_batch_create_started_at"] = utc_now()
+    state["batch_id"] = None
+    etag = _recovery_checkpoint(store, etag, state, checkpoint_callback)
+
+    try:
+        recovery_batch = client.create_batch(
+            recovery_file_id, _batch_metadata(state, recovery=True)
+        )
+    except Exception as error:
+        raise PendingReconciliation(
+            "Recovery Batch create応答不明。再submitせずreconciliationが必要です"
+        ) from error
+    recovery_batch_id = str(recovery_batch.get("id") or "")
+    if not recovery_batch_id:
+        raise PendingReconciliation(
+            "Recovery Batch create応答にidがありません"
+        )
+    if recovery_batch_id == original_batch_id:
+        state, etag = store.load()
+        _safe_stop_recovery(store, state, etag, "recovery_new_batch_id_required")
+        raise SubmissionBlocked("Recovery Batchは新しいbatch_idが必須です")
+
+    state, etag = store.load()
+    if state.get("recovery_state") != RECOVERY_PENDING_RECONCILIATION:
+        raise CASConflict("Recovery create応答後のstateがpendingではありません")
+    state.update(
+        {
+            "input_file_id": recovery_file_id,
+            "batch_id": recovery_batch_id,
+            "recovery_batch_id": recovery_batch_id,
+            "recovery_batch_submitted_at": utc_now(),
+            "state": STATE_SUBMITTED,
+            "recovery_state": RECOVERY_SUBMITTED,
+            "recovery_final_outcome": "WAITING",
+            "batch_status": None,
+            "batch_errors": [],
+            "request_counts": None,
+            "output_file_id": None,
+            "error_file_id": None,
+            "batch_timestamps": {},
+        }
+    )
+    _update_observed_batch(state, recovery_batch)
+    next_etag = _recovery_checkpoint(store, etag, state, checkpoint_callback)
+    return {
+        "run_id": run_id,
+        "batch_id": recovery_batch_id,
+        "batch_status": state.get("batch_status"),
+        "state": state.get("state"),
+        "state_etag": next_etag,
+        "recovered": True,
+        "recovery_attempt_count": 1,
+        "resumed": resumed,
+    }
+
+
 def _reconciliation_matches(
     batches: Iterable[Dict[str, Any]], state: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
-    expected = _batch_metadata(state)
-    input_file_id = str(state.get("input_file_id") or "")
+    recovery_pending = state.get("state") == RECOVERY_PENDING_RECONCILIATION
+    expected = _batch_metadata(state, recovery=recovery_pending)
+    input_file_id = str(
+        state.get("recovery_file_id")
+        if recovery_pending
+        else state.get("input_file_id")
+        or ""
+    )
     matches: List[Dict[str, Any]] = []
     for batch in batches:
         metadata = batch.get("metadata")
@@ -954,7 +1355,11 @@ def reconcile_pending(
     pending_state, pending_etag = store.load()
     if pending_state.get("batch_id"):
         return resume_run(run_id, client, runtime_root)
-    if pending_state.get("state") != STATE_PENDING_RECONCILIATION:
+    recovery_pending = pending_state.get("state") == RECOVERY_PENDING_RECONCILIATION
+    if pending_state.get("state") not in {
+        STATE_PENDING_RECONCILIATION,
+        RECOVERY_PENDING_RECONCILIATION,
+    }:
         raise SubmissionBlocked("PENDING_RECONCILIATION stateではありません")
     pending_identity = tuple(
         pending_state.get(field)
@@ -963,6 +1368,9 @@ def reconcile_pending(
             "submission_nonce",
             "manifest_sha256",
             "input_file_id",
+            "recovery_nonce",
+            "recovery_file_id",
+            "recovery_attempt_count",
         )
     )
 
@@ -982,7 +1390,10 @@ def reconcile_pending(
     for _ in range(3):
         if state.get("batch_id"):
             return resume_run(run_id, client, runtime_root)
-        if state.get("state") != STATE_PENDING_RECONCILIATION:
+        if state.get("state") not in {
+            STATE_PENDING_RECONCILIATION,
+            RECOVERY_PENDING_RECONCILIATION,
+        }:
             return {
                 "run_id": run_id,
                 "match_count": len(matches_by_id),
@@ -998,6 +1409,9 @@ def reconcile_pending(
                 "submission_nonce",
                 "manifest_sha256",
                 "input_file_id",
+                "recovery_nonce",
+                "recovery_file_id",
+                "recovery_attempt_count",
             )
         )
         if current_identity != pending_identity:
@@ -1018,6 +1432,15 @@ def reconcile_pending(
             next_state["batch_id"] = str(adopted["id"])
             next_state["state"] = STATE_SUBMITTED
             next_state["reconciled_at"] = utc_now()
+            if recovery_pending:
+                if next_state["batch_id"] == next_state.get("original_batch_id"):
+                    raise ReconciliationFailed(
+                        "Recovery reconciliation batch_idがoriginalと同一"
+                    )
+                next_state["input_file_id"] = next_state.get("recovery_file_id")
+                next_state["recovery_batch_id"] = next_state["batch_id"]
+                next_state["recovery_state"] = RECOVERY_SUBMITTED
+                next_state["recovery_final_outcome"] = "WAITING"
             _update_observed_batch(next_state, adopted)
         else:
             next_state["state"] = STATE_SAFE_STOPPED
@@ -1026,6 +1449,9 @@ def reconcile_pending(
                 if not matches_by_id
                 else "reconciliation_duplicate_batches"
             )
+            if recovery_pending:
+                next_state["recovery_state"] = STATE_SAFE_STOPPED
+                next_state["recovery_final_outcome"] = "SAFE_STOPPED"
         try:
             next_etag = store.cas(etag, next_state)
             state = next_state

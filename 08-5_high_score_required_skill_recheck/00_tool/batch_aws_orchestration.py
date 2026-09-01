@@ -31,7 +31,12 @@ DEFAULT_REGION = "ap-northeast-1"
 STATE_PREFIX = "batch-state/08-5"
 PIPELINE_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RUN_DATE_RE = re.compile(r"^[0-9]{8}$")
-REMOTE_ARTIFACTS = ("input.jsonl", "manifest.jsonl", "submit.claim")
+REMOTE_ARTIFACTS = (
+    "input.jsonl",
+    "manifest.jsonl",
+    "submit.claim",
+    "recovery.claim",
+)
 
 
 class OrchestrationError(RuntimeError):
@@ -89,20 +94,34 @@ def _read_s3_object(s3: Any, bucket: str, key: str) -> bytes:
 def _remote_state(
     s3: Any, bucket: str, prefix: str
 ) -> Optional[Dict[str, Any]]:
+    state, _ = _remote_state_version(s3, bucket, prefix)
+    return state
+
+
+def _remote_state_version(
+    s3: Any, bucket: str, prefix: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        payload = _read_s3_object(s3, bucket, f"{prefix}/state.json")
+        response = s3.get_object(Bucket=bucket, Key=f"{prefix}/state.json")
     except Exception as error:
         code = getattr(error, "response", {}).get("Error", {}).get("Code")
         if code in ("NoSuchKey", "404", "NotFound"):
-            return None
+            return None, None
         raise
+    body = response.get("Body")
+    if body is None:
+        raise OrchestrationError("S3 state.json body欠落")
+    payload = body.read()
+    if not isinstance(payload, bytes):
+        raise OrchestrationError("S3 state.json body型不正")
     try:
         parsed = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise OrchestrationError("S3 state.jsonがvalid UTF-8 JSONではありません") from error
     if not isinstance(parsed, dict):
         raise OrchestrationError("S3 state.jsonがJSON objectではありません")
-    return parsed
+    etag = response.get("ETag")
+    return parsed, str(etag) if etag else None
 
 
 def _validate_state_identity(
@@ -156,7 +175,7 @@ def persist_run(
     for filename in REMOTE_ARTIFACTS:
         path = run_dir / filename
         if not path.exists():
-            if filename == "submit.claim":
+            if filename in ("submit.claim", "recovery.claim"):
                 continue
             raise OrchestrationError(f"Batch artifact欠落: {filename}")
         s3.put_object(
@@ -172,6 +191,59 @@ def persist_run(
         ContentType="application/json; charset=utf-8",
     )
     return state
+
+
+def _persist_recovery_checkpoint(
+    s3: Any,
+    bucket: str,
+    prefix: str,
+    state: Dict[str, Any],
+    expected_remote_revision: int,
+    allow_revision_jump: bool = False,
+) -> int:
+    """CAS one Recovery state transition to S3 before its next side effect."""
+    remote, remote_etag = _remote_state_version(s3, bucket, prefix)
+    if remote is None:
+        raise OrchestrationError("Recovery checkpoint対象のS3 stateがありません")
+    remote_revision = int(remote.get("state_revision", -1))
+    next_revision = int(state.get("state_revision", -1))
+    if remote_revision != expected_remote_revision:
+        raise OrchestrationError(
+            "Recovery checkpoint S3 revision競合: "
+            f"expected={expected_remote_revision} actual={remote_revision}"
+        )
+    valid_next_revision = (
+        next_revision > expected_remote_revision
+        if allow_revision_jump
+        else next_revision == expected_remote_revision + 1
+    )
+    if not valid_next_revision:
+        raise OrchestrationError(
+            "Recovery checkpoint local revision不正: "
+            f"expected_after={expected_remote_revision} actual={next_revision}"
+        )
+    if any(
+        remote.get(field) != state.get(field)
+        for field in ("run_id", "pipeline_run_id", "run_date", "manifest_sha256")
+    ):
+        raise OrchestrationError("Recovery checkpoint identity不一致")
+    kwargs: Dict[str, Any] = {}
+    if remote_etag:
+        kwargs["IfMatch"] = remote_etag
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"{prefix}/state.json",
+            Body=_json_bytes(state),
+            ContentType="application/json; charset=utf-8",
+            **kwargs,
+        )
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        if code in ("PreconditionFailed", "ConditionalRequestConflict", "412"):
+            raise OrchestrationError("Recovery checkpoint S3 CAS競合") from error
+        raise
+    return next_revision
 
 
 def restore_run(
@@ -201,14 +273,15 @@ def restore_run(
     for filename in ("input.jsonl", "manifest.jsonl"):
         payload = _read_s3_object(s3, bucket, f"{prefix}/{filename}")
         ENGINE._atomic_write_bytes(run_dir / filename, payload)
-    try:
-        claim = _read_s3_object(s3, bucket, f"{prefix}/submit.claim")
-    except Exception as error:
-        code = getattr(error, "response", {}).get("Error", {}).get("Code")
-        if code not in ("NoSuchKey", "404", "NotFound"):
-            raise
-    else:
-        ENGINE._atomic_write_bytes(run_dir / "submit.claim", claim)
+    for claim_name in ("submit.claim", "recovery.claim"):
+        try:
+            claim = _read_s3_object(s3, bucket, f"{prefix}/{claim_name}")
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if code not in ("NoSuchKey", "404", "NotFound"):
+                raise
+        else:
+            ENGINE._atomic_write_bytes(run_dir / claim_name, claim)
     ENGINE._atomic_write_bytes(run_dir / "batch_state.json", _json_bytes(remote))
     ENGINE.validate_prepared(run_dir)
     return run_dir
@@ -298,6 +371,193 @@ def phase_a(
     }
 
 
+def _acquire_remote_recovery_claim(
+    s3: Any,
+    bucket: str,
+    prefix: str,
+    claim_payload: bytes,
+    state: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"{prefix}/recovery.claim",
+            Body=claim_payload,
+            ContentType="application/json; charset=utf-8",
+            IfNoneMatch="*",
+        )
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        if code in ("PreconditionFailed", "ConditionalRequestConflict", "412"):
+            if state is None:
+                raise ENGINE.SubmissionBlocked(
+                    "persistent S3 recovery claim取得済み: 二重submitを拒否"
+                ) from error
+            try:
+                existing = json.loads(
+                    _read_s3_object(s3, bucket, f"{prefix}/recovery.claim").decode(
+                        "utf-8"
+                    )
+                )
+            except Exception as read_error:
+                raise ENGINE.SubmissionBlocked(
+                    "persistent S3 recovery claim証拠不正"
+                ) from read_error
+            if not isinstance(existing, dict):
+                raise ENGINE.SubmissionBlocked(
+                    "persistent S3 recovery claim証拠不正"
+                ) from error
+            ENGINE._validate_owned_recovery_claim(existing, state)
+            remote = _remote_state(s3, bucket, prefix)
+            if (
+                remote is None
+                or remote.get("recovery_attempt_count") != 1
+                or remote.get("recovery_state") != state.get("recovery_state")
+            ):
+                raise ENGINE.SubmissionBlocked(
+                    "persistent S3 recovery claim/state不一致"
+                ) from error
+            ENGINE._validate_owned_recovery_claim(existing, remote)
+            return
+        raise
+
+
+def phase_recovery(
+    pipeline_run_id: str,
+    run_date: str,
+    s3: Optional[Any] = None,
+    runtime_root: Path = ENGINE.RUNTIME_ROOT,
+    client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run only the claimed one-time 08-5 file visibility recovery on EC2."""
+    _required_identity(pipeline_run_id, run_date)
+    bucket, _, region = _settings()
+    prefix = state_prefix(pipeline_run_id, run_date)
+    s3_client = s3 or boto3.client("s3", region_name=region)
+    run_dir = restore_run(
+        s3_client, bucket, prefix, pipeline_run_id, run_date, runtime_root
+    )
+    if run_dir is None:
+        raise OrchestrationError("Recovery対象のS3 Batch stateがありません")
+    batch_run_id = batch_run_id_for(pipeline_run_id)
+    state = _attach_pipeline_identity(run_dir, pipeline_run_id, run_date, prefix)
+    store = ENGINE.FileStateStore(run_dir)
+    recovery_nonce = str(state.get("recovery_nonce") or "")
+    if not recovery_nonce:
+        raise OrchestrationError("recovery_nonce欠落")
+    remote_state = _remote_state(s3_client, bucket, prefix)
+    if remote_state is None:
+        raise OrchestrationError("Recovery対象のS3 Batch stateがありません")
+    remote_revision = int(remote_state.get("state_revision", -1))
+
+    def checkpoint(checkpoint_state: Dict[str, Any]) -> None:
+        nonlocal remote_revision
+        remote_revision = _persist_recovery_checkpoint(
+            s3_client,
+            bucket,
+            prefix,
+            checkpoint_state,
+            remote_revision,
+        )
+
+    local_revision = int(state.get("state_revision", -1))
+    if local_revision > remote_revision:
+        if (
+            state.get("recovery_attempt_count") != 1
+            or state.get("recovery_state")
+            not in {
+                ENGINE.RECOVERY_CLAIMED,
+                ENGINE.RECOVERY_FILE_UPLOADED,
+                ENGINE.RECOVERY_PENDING_RECONCILIATION,
+                ENGINE.RECOVERY_SUBMITTED,
+            }
+        ):
+            raise OrchestrationError("Recovery local checkpoint state不正")
+        remote_revision = _persist_recovery_checkpoint(
+            s3_client,
+            bucket,
+            prefix,
+            state,
+            remote_revision,
+            allow_revision_jump=True,
+        )
+    elif local_revision < remote_revision:
+        raise OrchestrationError("Recovery local state revisionがS3より古いです")
+
+    if (
+        state.get("recovery_attempt_count") == 1
+        and state.get("recovery_state")
+        in (ENGINE.RECOVERY_SUBMITTED, ENGINE.RECOVERY_PENDING_RECONCILIATION)
+    ):
+        return {
+            "contract": "SUSPENDED",
+            "reason": "BATCH_WAIT",
+            "current_step": "08-5_BATCH_WAIT",
+            "pipeline_run_id": pipeline_run_id,
+            "run_date": run_date,
+            "batch_run_id": batch_run_id,
+            "batch_id": state.get("batch_id"),
+            "state": state.get("state"),
+            "recovery_attempt_count": 1,
+            "resumed": True,
+            "state_s3_prefix": prefix,
+        }
+
+    def acquire_claim(
+        claim_payload: bytes, checkpoint_state: Dict[str, Any]
+    ) -> None:
+        _acquire_remote_recovery_claim(
+            s3_client,
+            bucket,
+            prefix,
+            claim_payload,
+            state=checkpoint_state,
+        )
+
+    batch_client = client or ENGINE.OpenAIHttpBatchClient()
+    try:
+        result = ENGINE.recover_file_visibility_failure(
+            batch_run_id,
+            batch_client,
+            runtime_root=runtime_root,
+            checkpoint_callback=checkpoint,
+            claim_callback=acquire_claim,
+        )
+    except ENGINE.PendingReconciliation:
+        state, _ = store.load()
+        if state.get("state") != ENGINE.RECOVERY_PENDING_RECONCILIATION:
+            raise
+        result = {
+            "state": state.get("state"),
+            "batch_id": None,
+            "resumed": True,
+        }
+    except Exception:
+        state, _ = store.load()
+        if (
+            state.get("state") == ENGINE.STATE_SAFE_STOPPED
+            and int(state.get("state_revision", -1)) == remote_revision + 1
+        ):
+            checkpoint(state)
+        raise
+
+    state, _ = store.load()
+    return {
+        "contract": "SUSPENDED",
+        "reason": "BATCH_WAIT",
+        "current_step": "08-5_BATCH_WAIT",
+        "pipeline_run_id": pipeline_run_id,
+        "run_date": run_date,
+        "batch_run_id": batch_run_id,
+        "batch_id": state.get("batch_id"),
+        "batch_status": state.get("batch_status"),
+        "state": state.get("state"),
+        "recovery_attempt_count": state.get("recovery_attempt_count"),
+        "resumed": bool(result.get("resumed")),
+        "state_s3_prefix": prefix,
+    }
+
+
 def phase_b(
     pipeline_run_id: str,
     run_date: str,
@@ -350,7 +610,7 @@ def phase_b(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("phase-a", "phase-b"):
+    for command in ("phase-a", "phase-b", "phase-recovery"):
         child = subparsers.add_parser(command)
         child.add_argument("--pipeline-run-id", required=True)
         child.add_argument("--run-date", required=True)
@@ -362,6 +622,8 @@ def main() -> int:
     try:
         if args.command == "phase-a":
             result = phase_a(args.pipeline_run_id, args.run_date)
+        elif args.command == "phase-recovery":
+            result = phase_recovery(args.pipeline_run_id, args.run_date)
         else:
             result = phase_b(args.pipeline_run_id, args.run_date)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
