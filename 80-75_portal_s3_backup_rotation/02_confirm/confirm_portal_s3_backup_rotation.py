@@ -11,7 +11,8 @@
 ⑦ rotation時previous CURRENT snapshot / bk1 の total bytes 一致
 ⑧ previous CURRENT snapshotのprovenance / destination / verifiedが記録されている
 ⑨ 新contract summaryのcurrent execution immutable history guardが完全
-⑩ pre-publication recovery時はauthority / 全intervening run / CURRENT / BK1監査が完全
+⑩ pre-publication recovery時は全FAILED executionのpublication未到達 / Redriveなし /
+   authority / CURRENT / BK1監査が完全
 
 AWS APIと最新80-9 summaryは読み直さず、80-75 summaryに固定保存された
 rotation時previous CURRENT snapshotを正本とする。
@@ -20,6 +21,8 @@ rotation時previous CURRENT snapshotを正本とする。
 import json
 import re
 import sys
+from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parents[2]
@@ -42,6 +45,10 @@ EXPECTED_EXECUTION_ARN_PREFIX = EXPECTED_STATE_MACHINE_ARN.replace(
     ":stateMachine:", ":execution:"
 ) + ":"
 IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION = 1
+PREPUBLICATION_RECOVERY_MODE = "pre_publication_failed_runs"
+PUBLICATION_BOUNDARY_STEP_NAME = "80-75_portal_s3_backup_rotation"
+PUBLICATION_BOUNDARY_STATE = "SendPhaseBLauncherCommand"
+PIPELINE_STEP_RE = re.compile(r"^(\d{2})-(\d+)(?:_|\(|$)")
 
 RUN_DATE_RE = re.compile(r"^\d{8}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -49,6 +56,36 @@ RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 def _is_count(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _parse_timestamp(value):
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _before_publication_boundary(step_name):
+    if not isinstance(step_name, str):
+        return False
+    match = PIPELINE_STEP_RE.match(step_name)
+    boundary = PIPELINE_STEP_RE.match(PUBLICATION_BOUNDARY_STEP_NAME)
+    if match is None or boundary is None:
+        return False
+    major, minor = match.groups()
+    boundary_major, boundary_minor = boundary.groups()
+    actual_order = (int(major), Fraction(int(minor), 10 ** len(minor)))
+    boundary_order = (
+        int(boundary_major),
+        Fraction(int(boundary_minor), 10 ** len(boundary_minor)),
+    )
+    return actual_order < boundary_order
 
 
 def main() -> None:
@@ -286,26 +323,170 @@ def main() -> None:
 
     # ⑩: recoveryが記録された場合だけ追加監査する。
     recovery = summary.get("recovery")
-    if recovery is not None and recovery.get("recovery_mode") == "pre_publication_08_5_failure":
+    if recovery is not None and not isinstance(recovery, dict):
+        lines.append("[NG] recoveryがJSON objectではありません")
+        errors.append("unknown recovery mode")
+    elif recovery is not None and recovery.get("recovery_mode") == PREPUBLICATION_RECOVERY_MODE:
         intervening = recovery.get("intervening_runs")
+        execution_window = recovery.get("execution_window") or {}
         current_unchanged = recovery.get("current_unchanged") or {}
         bk1_unchanged = recovery.get("bk1_unchanged") or {}
-        contract = recovery.get("failure_contract") or {}
+        publication_guard = recovery.get("publication_guard") or {}
+        runs_ok = (
+            isinstance(intervening, list)
+            and len(intervening) > 0
+            and all(
+                isinstance(item, dict)
+                and item.get("status") == "FAILED"
+                and item.get("validation_result") == "PASS"
+                and item.get("step_order_verified") is True
+                and item.get("before_publication_boundary") is True
+                and _before_publication_boundary(item.get("current_step"))
+                and item.get("publication_boundary_reached") is False
+                and isinstance(item.get("execution_evidence"), dict)
+                and item["execution_evidence"].get("validation_result") == "PASS"
+                and item["execution_evidence"].get("evidence_source")
+                == "stepfunctions_execution_history"
+                and isinstance(item["execution_evidence"].get("execution_arn"), str)
+                and item["execution_evidence"].get("execution_arn", "").startswith(
+                    EXPECTED_EXECUTION_ARN_PREFIX
+                )
+                and item["execution_evidence"].get("execution_status") == "FAILED"
+                and item["execution_evidence"].get("run_identity_match") is True
+                and item["execution_evidence"].get("redrive_count") == 0
+                and item["execution_evidence"].get("redrive_date_present") is False
+                and item["execution_evidence"].get(
+                    "execution_redriven_event_present"
+                ) is False
+                and _is_count(
+                    item["execution_evidence"].get("history_pages_checked")
+                )
+                and item["execution_evidence"].get("history_pages_checked", 0) > 0
+                and _is_count(
+                    item["execution_evidence"].get("history_event_count")
+                )
+                and item["execution_evidence"].get("history_event_count", 0) > 0
+                and item["execution_evidence"].get("publication_boundary_state")
+                == PUBLICATION_BOUNDARY_STATE
+                and item["execution_evidence"].get(
+                    "publication_boundary_reached"
+                ) is False
+                for item in intervening
+            )
+        )
+        authority_stop = _parse_timestamp(
+            execution_window.get("authority_stop_date")
+        )
+        current_start = _parse_timestamp(
+            execution_window.get("current_start_date")
+        )
+        outside = execution_window.get("outside_recovery_window")
+        outside_ok = (
+            isinstance(outside, list)
+            and all(
+                isinstance(item, dict)
+                and item.get("classification") == "OUTSIDE_RECOVERY_WINDOW"
+                and item.get("reason")
+                in ("COMPLETED_BEFORE_AUTHORITY", "STARTED_AFTER_CURRENT")
+                and isinstance(item.get("execution_arn"), str)
+                and item.get("execution_arn", "").startswith(
+                    EXPECTED_EXECUTION_ARN_PREFIX
+                )
+                and _parse_timestamp(item.get("execution_start_date")) is not None
+                and _parse_timestamp(item.get("execution_stop_date")) is not None
+                and (
+                    (
+                        item.get("reason") == "COMPLETED_BEFORE_AUTHORITY"
+                        and authority_stop is not None
+                        and _parse_timestamp(item.get("execution_stop_date"))
+                        < authority_stop
+                    )
+                    or (
+                        item.get("reason") == "STARTED_AFTER_CURRENT"
+                        and current_start is not None
+                        and _parse_timestamp(item.get("execution_start_date"))
+                        > current_start
+                    )
+                )
+                for item in outside
+            )
+        )
+        candidate_times_ok = (
+            authority_stop is not None
+            and current_start is not None
+            and isinstance(intervening, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("execution_evidence"), dict)
+                and _parse_timestamp(
+                    item.get("execution_evidence", {}).get(
+                        "execution_start_date"
+                    )
+                )
+                is not None
+                and _parse_timestamp(
+                    item.get("execution_evidence", {}).get(
+                        "execution_stop_date"
+                    )
+                )
+                is not None
+                and authority_stop
+                < _parse_timestamp(
+                    item["execution_evidence"]["execution_start_date"]
+                )
+                < _parse_timestamp(
+                    item["execution_evidence"]["execution_stop_date"]
+                )
+                < current_start
+                and item["execution_evidence"].get(
+                    "recovery_window_candidate"
+                )
+                is True
+                for item in intervening
+            )
+        )
+        window_ok = (
+            execution_window.get("ordering_source")
+            == "stepfunctions_execution_metadata"
+            and isinstance(execution_window.get("authority_execution_arn"), str)
+            and execution_window.get("authority_execution_arn", "").startswith(
+                EXPECTED_EXECUTION_ARN_PREFIX
+            )
+            and isinstance(execution_window.get("current_execution_arn"), str)
+            and execution_window.get("current_execution_arn", "").startswith(
+                EXPECTED_EXECUTION_ARN_PREFIX
+            )
+            and authority_stop is not None
+            and current_start is not None
+            and authority_stop < current_start
+            and execution_window.get("candidate_execution_count")
+            == len(intervening or [])
+            and execution_window.get("outside_recovery_window_count")
+            == len(outside or [])
+            and outside_ok
+            and candidate_times_ok
+            and isinstance(execution_guard, dict)
+            and execution_guard.get("execution_start_date")
+            == execution_window.get("current_start_date")
+        )
         recovery_ok = (
             recovery.get("enabled") is True
             and recovery.get("eligible") is True
             and recovery.get("rotation_authority_run_date") == run_date
             and recovery.get("rotation_authority_run_id") == run_id
             and recovery.get("all_intervening_runs_checked") is True
-            and isinstance(intervening, list)
-            and len(intervening) > 0
-            and all(item.get("validation_result") == "PASS" for item in intervening)
-            and contract.get("status") == "FAILED"
-            and contract.get("current_step") == "08-5_BATCH_WAIT"
-            and contract.get("exit_code") == 86
-            and contract.get("finished_at_source") == "batch_status_lambda"
-            and contract.get("exit_code_source") == "batch_status_lambda"
-            and contract.get("publication_boundary_reached") is False
+            and _is_count(recovery.get("failed_execution_list_pages_checked"))
+            and recovery.get("failed_execution_list_pages_checked", 0) > 0
+            and runs_ok
+            and window_ok
+            and publication_guard.get("terminal_status") == "FAILED"
+            and publication_guard.get("publication_boundary_step")
+            == PUBLICATION_BOUNDARY_STEP_NAME
+            and publication_guard.get("publication_boundary_state")
+            == PUBLICATION_BOUNDARY_STATE
+            and publication_guard.get("publication_boundary_reached") is False
+            and publication_guard.get("failure_reason_allowlist_used") is False
+            and recovery.get("failure_contract") is None
             and current_unchanged.get("verified") is True
             and current_unchanged.get("manifest_inventory_match") is True
             and current_unchanged.get("unchanged_since_rotation_authority") is True
@@ -324,6 +505,25 @@ def main() -> None:
         else:
             lines.append("[NG] pre-publication recovery監査が不完全")
             errors.append("pre-publication recovery audit")
+    elif recovery is not None and recovery.get("recovery_mode") is None:
+        # commit済みの既存80-7限定recovery contractは互換維持する。
+        legacy_keys = {
+            "target_run_date",
+            "target_run_id",
+            "failed_status_key",
+            "failed_step",
+            "previous_verified_run_date",
+            "previous_verified_run_id",
+            "previous_verified_finished_at",
+        }
+        if legacy_keys.issubset(recovery):
+            lines.append("[OK] existing 80-7 recovery contract")
+        else:
+            lines.append("[NG] recovery modeが不明です")
+            errors.append("unknown recovery mode")
+    elif recovery is not None:
+        lines.append(f"[NG] recovery modeが不明です: {recovery.get('recovery_mode')!r}")
+        errors.append("unknown recovery mode")
 
     _write_and_exit(logger, lines, errors)
 

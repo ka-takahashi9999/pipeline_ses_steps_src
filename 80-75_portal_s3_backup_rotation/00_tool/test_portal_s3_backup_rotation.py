@@ -160,6 +160,7 @@ def make_execution_spec(
         "stateMachineArn": target.EXPECTED_STATE_MACHINE_ARN,
         "status": "RUNNING",
         "redriveCount": 0,
+        "startDate": datetime(2026, 8, 18, 10, 0, tzinfo=timezone.utc),
     }
     description.update(description_overrides or {})
     return {
@@ -167,6 +168,74 @@ def make_execution_spec(
         "description": description,
         "events": events,
     }
+
+
+def make_failed_execution_spec(
+    run_date,
+    run_id,
+    name=None,
+    boundary_reached=False,
+    event_types=(),
+    description_overrides=None,
+):
+    spec = make_execution_spec(
+        run_date,
+        run_id,
+        name=name or f"failed-{run_date}-{run_id}",
+        description_overrides={"status": "FAILED", "redriveCount": 0},
+    )
+    spec["events"][1]["stateExitedEventDetails"]["outputDetails"] = {
+        "truncated": False
+    }
+    if boundary_reached:
+        spec["events"].append(
+            {
+                "id": len(spec["events"]) + 1,
+                "type": "TaskStateEntered",
+                "stateEnteredEventDetails": {
+                    "name": target.PUBLICATION_BOUNDARY_STATE,
+                },
+            }
+        )
+    for event_type in event_types:
+        spec["events"].append(
+            {"id": len(spec["events"]) + 1, "type": event_type}
+        )
+    spec["events"].append(
+        {"id": len(spec["events"]) + 1, "type": "ExecutionFailed"}
+    )
+    spec["description"].setdefault(
+        "stopDate", datetime(2026, 8, 18, 10, 30, tzinfo=timezone.utc)
+    )
+    spec["description"].update(description_overrides or {})
+    return spec
+
+
+def make_succeeded_execution_spec(
+    run_date,
+    run_id,
+    name="focused-authority",
+    description_overrides=None,
+):
+    spec = make_execution_spec(
+        run_date,
+        run_id,
+        name=name,
+        description_overrides={
+            "status": "SUCCEEDED",
+            "redriveCount": 0,
+            "startDate": datetime(2026, 8, 18, 0, 0, tzinfo=timezone.utc),
+            "stopDate": datetime(2026, 8, 18, 1, 1, tzinfo=timezone.utc),
+        },
+    )
+    spec["events"][1]["stateExitedEventDetails"]["outputDetails"] = {
+        "truncated": False
+    }
+    spec["events"].append(
+        {"id": len(spec["events"]) + 1, "type": "ExecutionSucceeded"}
+    )
+    spec["description"].update(description_overrides or {})
+    return spec
 
 
 class FakeStepFunctionsClient:
@@ -193,9 +262,20 @@ class FakeStepFunctionsClient:
         self.calls.append(("list_executions", kwargs))
         if self.fail_operation == "list":
             raise RuntimeError("simulated ListExecutions failure")
+        status_filter = kwargs.get("statusFilter")
         summaries = [
-            {"executionArn": spec["executionArn"], "status": "RUNNING"}
+            {
+                "executionArn": spec["executionArn"],
+                "status": spec["description"].get("status"),
+                **{
+                    key: spec["description"][key]
+                    for key in ("startDate", "stopDate")
+                    if key in spec["description"]
+                },
+            }
             for spec in self.specs
+            if status_filter is None
+            or spec["description"].get("status") == status_filter
         ]
         token = kwargs.get("nextToken")
         if not self.paginate_list or len(summaries) <= 1:
@@ -516,32 +596,48 @@ class RotationTestBase(unittest.TestCase):
         with open(result_dir / target.BACKUP_SUMMARY_FILENAME, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False)
 
-    def stub_prepublication_recovery(self, failures=None):
-        """authority -> 08-5 FAILED(s) -> same-date RUNNING fresh runを用意する。"""
+    def stub_prepublication_recovery(
+        self,
+        failures=None,
+        current_run_date=None,
+        authority_run_date=None,
+        authority_run_id=None,
+    ):
+        """authority -> publication前FAILED(s) -> Fresh RUNNING runを用意する。"""
         failures = failures or [
             {
                 "run_date": CURRENT_RUN_DATE,
                 "run_id": RECOVERY_FAILED_RUN_ID,
             }
         ]
-        os.environ["RUN_DATE"] = CURRENT_RUN_DATE
+        current_run_date = current_run_date or CURRENT_RUN_DATE
+        authority_run_date = authority_run_date or PREV_RUN_DATE
+        authority_run_id = authority_run_id or PREV_RUN_ID
+        os.environ["RUN_DATE"] = current_run_date
         os.environ["RUN_ID"] = CURRENT_RUN_ID
         authority_finished = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
         object_modified = datetime(2026, 8, 18, 0, 30, tzinfo=timezone.utc)
         self.current_last_modified = {path: object_modified for path in self.current}
         self.backup_last_modified = {path: object_modified for path in self.backup}
+        self.write_sync_summary(
+            make_sync_summary(
+                run_date=authority_run_date,
+                run_id=authority_run_id,
+                manifest_path=str(self.manifest_path.resolve()),
+            )
+        )
         self.write_previous_backup_summary()
 
-        status_runs = [(PREV_RUN_DATE, PREV_RUN_ID, "SUCCEEDED", 0)]
+        status_runs = [(authority_run_date, authority_run_id, "SUCCEEDED", 0)]
         status_runs.extend(
             (item["run_date"], item["run_id"], "FAILED", item.get("exit_code", 86))
             for item in failures
         )
-        status_runs.append((CURRENT_RUN_DATE, CURRENT_RUN_ID, "RUNNING", None))
+        status_runs.append((current_run_date, CURRENT_RUN_ID, "RUNNING", None))
         client = self.stub_s3(status_runs=status_runs)
 
         authority_key = (
-            f"{BASE_PREFIX}/pipeline-status/{PREV_RUN_DATE}/{PREV_RUN_ID}/status.json"
+            f"{BASE_PREFIX}/pipeline-status/{authority_run_date}/{authority_run_id}/status.json"
         )
         authority = client.status_docs[authority_key]
         authority["started_at"] = "2026-08-18T00:00:00Z"
@@ -561,13 +657,13 @@ class RotationTestBase(unittest.TestCase):
             document["finished_at"] = f"2026-08-18T{start_hour:02d}:30:00Z"
             document["updated_at"] = f"2026-08-18T{start_hour:02d}:30:01Z"
             document["current_step"] = item.get(
-                "current_step", target.PREPUBLICATION_FAILED_STEP_NAME
+                "current_step", "08-5_BATCH_WAIT"
             )
             document["finished_at_source"] = item.get(
-                "finished_at_source", target.PREPUBLICATION_FAILURE_SOURCE
+                "finished_at_source", "batch_status_lambda"
             )
             document["exit_code_source"] = item.get(
-                "exit_code_source", target.PREPUBLICATION_FAILURE_SOURCE
+                "exit_code_source", "batch_status_lambda"
             )
             if "schema_version" in item:
                 document["schema_version"] = item["schema_version"]
@@ -576,7 +672,7 @@ class RotationTestBase(unittest.TestCase):
             )
 
         current_key = (
-            f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/{CURRENT_RUN_ID}/status.json"
+            f"{BASE_PREFIX}/pipeline-status/{current_run_date}/{CURRENT_RUN_ID}/status.json"
         )
         current = client.status_docs[current_key]
         current_hour = 2 + (len(failures) * 2)
@@ -586,6 +682,47 @@ class RotationTestBase(unittest.TestCase):
             2026, 8, 18, current_hour, 0, 2, tzinfo=timezone.utc
         )
         self.assertLess(authority_finished, datetime.fromisoformat(current["started_at"][:-1] + "+00:00"))
+        current_execution_start = datetime(
+            2026, 8, 18, current_hour, 0, tzinfo=timezone.utc
+        )
+        specs = [
+            make_execution_spec(
+                current_run_date,
+                CURRENT_RUN_ID,
+                description_overrides={"startDate": current_execution_start},
+            ),
+            make_succeeded_execution_spec(
+                authority_run_date,
+                authority_run_id,
+                description_overrides={
+                    "startDate": datetime(
+                        2026, 8, 18, 0, 0, tzinfo=timezone.utc
+                    ),
+                    "stopDate": datetime(
+                        2026, 8, 18, 1, 1, tzinfo=timezone.utc
+                    ),
+                },
+            ),
+        ]
+        specs.extend(
+            make_failed_execution_spec(
+                item["run_date"],
+                item["run_id"],
+                boundary_reached=item.get("boundary_reached", False),
+                event_types=item.get("history_event_types", ()),
+                description_overrides={
+                    "startDate": datetime(
+                        2026, 8, 18, 2 + (index * 2), 0, tzinfo=timezone.utc
+                    ),
+                    "stopDate": datetime(
+                        2026, 8, 18, 2 + (index * 2), 30, tzinfo=timezone.utc
+                    ),
+                    **(item.get("description_overrides") or {}),
+                },
+            )
+            for index, item in enumerate(failures)
+        )
+        self.sfn_client = FakeStepFunctionsClient(specs)
         return client
 
 
@@ -1568,54 +1705,267 @@ class TestPrePublicationFailureRecovery(RotationTestBase):
             self.run_recovery()
         self.assertEqual(self.sync_calls, [])
 
-    def test_a_normal_previous_succeeded_path_is_unchanged(self):
-        self.stub_current_running()
-        summary = self.run_recovery()
-        self.assertNotIn("recovery", summary)
-        self.assertEqual(len(self.sync_calls), 1)
+    def add_old_failed_without_prepare_run_context(self):
+        old = make_failed_execution_spec(
+            "20260810",
+            "sfn-old-without-prepare",
+            name="45d851d4-5431-4c3d-9746-bb6e371c10aa",
+            description_overrides={
+                "startDate": datetime(
+                    2026, 8, 17, 20, 0, tzinfo=timezone.utc
+                ),
+                "stopDate": datetime(
+                    2026, 8, 17, 20, 30, tzinfo=timezone.utc
+                ),
+            },
+        )
+        old["events"] = [
+            {"id": 1, "type": "ExecutionStarted"},
+            {"id": 2, "type": "ExecutionFailed"},
+        ]
+        self.sfn_client.specs.append(old)
+        return old
 
-    def test_b_safe_08_5_failure_recovers_with_full_audit(self):
-        self.stub_prepublication_recovery()
+    def test_01_current_three_prepublication_failures_allow_fresh_run(self):
+        failures = [
+            {
+                "run_date": "20260828",
+                "run_id": "sfn-failed-20260828",
+                "current_step": "08-5_BATCH_WAIT",
+                "finished_at_source": "batch_status_lambda",
+                "exit_code_source": "batch_status_lambda",
+                "exit_code": 86,
+            },
+            {
+                "run_date": "20260829",
+                "run_id": "sfn-failed-20260829",
+                "current_step": "08-1_restore_and_merge_requirement_skill_ai_matching",
+                "finished_at_source": "managed_wrapper",
+                "exit_code_source": "managed_wrapper",
+                "exit_code": 1,
+            },
+            {
+                "run_date": "20260831",
+                "run_id": "sfn-failed-20260831",
+                "current_step": "08-5_BATCH_WAIT",
+                "finished_at_source": "batch_status_lambda",
+                "exit_code_source": "batch_status_lambda",
+                "exit_code": 86,
+            },
+        ]
+        self.stub_prepublication_recovery(
+            failures,
+            current_run_date="20260901",
+            authority_run_date="20260827",
+            authority_run_id="sfn-authority-20260827",
+        )
         summary = self.run_recovery()
         recovery = summary["recovery"]
-        self.assertEqual(recovery["recovery_mode"], "pre_publication_08_5_failure")
-        self.assertEqual(recovery["rotation_authority_run_id"], PREV_RUN_ID)
+        self.assertEqual(recovery["recovery_mode"], target.PREPUBLICATION_RECOVERY_MODE)
+        self.assertEqual(recovery["rotation_authority_run_date"], "20260827")
+        self.assertEqual(len(recovery["intervening_runs"]), 3)
         self.assertTrue(recovery["all_intervening_runs_checked"])
-        self.assertEqual(len(recovery["intervening_runs"]), 1)
-        self.assertEqual(recovery["intervening_runs"][0]["validation_result"], "PASS")
+        self.assertFalse(
+            recovery["publication_guard"]["failure_reason_allowlist_used"]
+        )
+        self.assertTrue(
+            all(
+                item["publication_boundary_reached"] is False
+                and item["execution_evidence"]["publication_boundary_reached"] is False
+                for item in recovery["intervening_runs"]
+            )
+        )
         self.assertTrue(recovery["current_unchanged"]["manifest_inventory_match"])
         self.assertTrue(recovery["bk1_unchanged"]["previous_80_75_summary_match"])
         self.assertEqual(len(self.sync_calls), 1)
 
-    def test_c_source_mismatch_is_denied(self):
+    def test_01a_old_failed_without_identity_before_authority_does_not_block(self):
+        failures = [
+            {"run_date": "20260828", "run_id": "sfn-failed-20260828"},
+            {"run_date": "20260829", "run_id": "sfn-failed-20260829"},
+            {"run_date": "20260831", "run_id": "sfn-failed-20260831"},
+        ]
         self.stub_prepublication_recovery(
-            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
-              "exit_code_source": "managed_wrapper"}]
+            failures,
+            current_run_date="20260901",
+            authority_run_date="20260827",
+            authority_run_id="sfn-authority-20260827",
+        )
+        old = self.add_old_failed_without_prepare_run_context()
+
+        summary = self.run_recovery()
+
+        self.assertEqual(len(summary["recovery"]["intervening_runs"]), 3)
+        old_history_calls = [
+            call
+            for call in self.sfn_client.calls
+            if call[0] == "get_execution_history"
+            and call[1]["executionArn"] == old["executionArn"]
+        ]
+        self.assertEqual(old_history_calls, [])
+        list_call_indexes = {
+            call[1]["statusFilter"]: index
+            for index, call in enumerate(self.sfn_client.calls)
+            if call[0] == "list_executions"
+        }
+        first_candidate_history = next(
+            index
+            for index, call in enumerate(self.sfn_client.calls)
+            if call[0] == "get_execution_history"
+            and call[1]["executionArn"].startswith(
+                target.EXPECTED_STATE_MACHINE_ARN.replace(
+                    ":stateMachine:", ":execution:"
+                )
+                + ":failed-"
+            )
+        )
+        self.assertLess(list_call_indexes["SUCCEEDED"], list_call_indexes["RUNNING"])
+        self.assertLess(list_call_indexes["RUNNING"], list_call_indexes["FAILED"])
+        self.assertLess(list_call_indexes["FAILED"], first_candidate_history)
+
+    def test_01b_old_failed_is_audited_as_outside_recovery_window(self):
+        self.stub_prepublication_recovery()
+        old = self.add_old_failed_without_prepare_run_context()
+
+        summary = self.run_recovery()
+        outside = summary["recovery"]["execution_window"][
+            "outside_recovery_window"
+        ]
+
+        self.assertIn(
+            {
+                "execution_arn": old["executionArn"],
+                "classification": "OUTSIDE_RECOVERY_WINDOW",
+                "reason": "COMPLETED_BEFORE_AUTHORITY",
+                "execution_start_date": "2026-08-17T20:00:00+00:00",
+                "execution_stop_date": "2026-08-17T20:30:00+00:00",
+            },
+            outside,
+        )
+
+    def test_01c_window_candidate_without_prepare_run_context_is_denied(self):
+        self.stub_prepublication_recovery()
+        failed = next(
+            spec
+            for spec in self.sfn_client.specs
+            if spec["description"]["status"] == "FAILED"
+        )
+        failed["events"] = [
+            {"id": 1, "type": "ExecutionStarted"},
+            {"id": 2, "type": "ExecutionFailed"},
+        ]
+        self.assert_denied_before_sync()
+
+    def test_01d_window_candidate_without_history_is_denied(self):
+        self.stub_prepublication_recovery()
+        failed = next(
+            spec
+            for spec in self.sfn_client.specs
+            if spec["description"]["status"] == "FAILED"
+        )
+        failed["events"] = []
+        self.assert_denied_before_sync()
+
+    def test_01e_execution_crossing_authority_boundary_is_denied(self):
+        self.stub_prepublication_recovery()
+        failed = next(
+            spec
+            for spec in self.sfn_client.specs
+            if spec["description"]["status"] == "FAILED"
+        )
+        failed["description"]["startDate"] = datetime(
+            2026, 8, 18, 0, 30, tzinfo=timezone.utc
+        )
+        failed["description"]["stopDate"] = datetime(
+            2026, 8, 18, 2, 30, tzinfo=timezone.utc
         )
         self.assert_denied_before_sync()
 
-    def test_d_exit_code_mismatch_is_denied(self):
+    def test_01f_execution_after_current_is_not_a_candidate(self):
+        self.stub_prepublication_recovery()
+        future = make_failed_execution_spec(
+            "20260820",
+            "sfn-after-current",
+            name="after-current",
+            description_overrides={
+                "startDate": datetime(
+                    2026, 8, 18, 5, 0, tzinfo=timezone.utc
+                ),
+                "stopDate": datetime(
+                    2026, 8, 18, 5, 30, tzinfo=timezone.utc
+                ),
+            },
+        )
+        future["events"] = [
+            {"id": 1, "type": "ExecutionStarted"},
+            {"id": 2, "type": "ExecutionFailed"},
+        ]
+        self.sfn_client.specs.append(future)
+
+        summary = self.run_recovery()
+        window = summary["recovery"]["execution_window"]
+
+        self.assertEqual(window["candidate_execution_count"], 1)
+        self.assertTrue(
+            any(
+                item["execution_arn"] == future["executionArn"]
+                and item["reason"] == "STARTED_AFTER_CURRENT"
+                for item in window["outside_recovery_window"]
+            )
+        )
+        self.assertFalse(
+            any(
+                call[0] == "get_execution_history"
+                and call[1]["executionArn"] == future["executionArn"]
+                for call in self.sfn_client.calls
+            )
+        )
+
+    def test_02_80_75_reached_then_failed_is_denied(self):
         self.stub_prepublication_recovery(
-            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
-              "exit_code": 85}]
+            [{
+                "run_date": "20260828",
+                "run_id": "sfn-rotation-failed",
+                "current_step": "08-5_BATCH_WAIT",
+                "boundary_reached": True,
+            }]
         )
         self.assert_denied_before_sync()
 
-    def test_e_80_75_or_later_failure_is_denied(self):
-        for step in (
-            "80-75_portal_s3_backup_rotation",
-            "80-8_portal_s3_prepare",
-            "80-9_portal_s3_sync",
-        ):
+    def test_03_bk1_rotation_started_then_failed_is_denied(self):
+        self.stub_prepublication_recovery(
+            [{
+                "run_date": "20260828",
+                "run_id": "sfn-bk1-rotation-started",
+                "current_step": "80-75_portal_s3_backup_rotation",
+                "boundary_reached": True,
+            }]
+        )
+        self.assert_denied_before_sync()
+
+    def test_04_80_8_or_80_9_failure_is_denied(self):
+        for step in ("80-8_portal_s3_prepare", "80-9_portal_s3_sync"):
             with self.subTest(step=step):
                 self.sync_calls = []
                 self.stub_prepublication_recovery(
-                    [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
-                      "current_step": step}]
+                    [{
+                        "run_date": "20260828",
+                        "run_id": f"sfn-{step[:4]}-failed",
+                        "current_step": step,
+                        "boundary_reached": True,
+                    }]
                 )
                 self.assert_denied_before_sync()
 
-    def test_f_bk1_last_modified_or_inventory_change_is_denied(self):
+    def test_05_current_change_is_denied(self):
+        self.stub_prepublication_recovery()
+        path = next(iter(self.current))
+        self.current.pop(path)
+        self.current_last_modified.pop(path)
+        self._refresh_client()
+        self.assert_denied_before_sync()
+
+    def test_06_bk1_change_is_denied(self):
         self.stub_prepublication_recovery()
         path = next(iter(self.backup))
         self.backup_last_modified[path] = datetime(
@@ -1624,104 +1974,61 @@ class TestPrePublicationFailureRecovery(RotationTestBase):
         self._refresh_client()
         self.assert_denied_before_sync()
 
-        self.sync_calls = []
-        self.backup_last_modified[path] = datetime(
-            2026, 8, 18, 0, 30, tzinfo=timezone.utc
-        )
-        self.backup[path] += 1
-        self._refresh_client()
-        self.assert_denied_before_sync()
-
-    def test_g_current_partial_update_is_denied(self):
-        self.stub_prepublication_recovery()
-        path = next(iter(self.current))
-        self.current.pop(path)
-        self.current_last_modified.pop(path)
-        self._refresh_client()
-        self.assert_denied_before_sync()
-
-    def test_h_80_9_started_or_failed_is_denied(self):
+    def test_07_unknown_failure_step_is_denied(self):
         self.stub_prepublication_recovery(
-            [{"run_date": CURRENT_RUN_DATE, "run_id": RECOVERY_FAILED_RUN_ID,
-              "current_step": "80-9_portal_s3_sync"}]
+            [{
+                "run_date": "20260828",
+                "run_id": "sfn-unknown-step",
+                "current_step": "UNKNOWN",
+            }]
         )
         self.assert_denied_before_sync()
 
-    def test_i_unverified_80_9_summary_is_denied(self):
-        summary = make_sync_summary(manifest_path=str(self.manifest_path.resolve()))
-        summary["verify"]["verified"] = False
-        self.write_sync_summary(summary)
+    def test_08_fresh_execution_passes(self):
         self.stub_prepublication_recovery()
+        summary = self.run_recovery()
+        guard = summary["current_execution_guard"]
+        self.assertEqual(guard["execution_status"], "RUNNING")
+        self.assertEqual(guard["redrive_count"], 0)
+        self.assertFalse(guard["execution_redriven_event_present"])
+
+    def test_09_historical_redrive_is_denied(self):
+        self.stub_prepublication_recovery(
+            [{
+                "run_date": "20260828",
+                "run_id": "sfn-redriven",
+                "description_overrides": {"redriveCount": 1},
+            }]
+        )
         self.assert_denied_before_sync()
 
-    def test_j_missing_summary_status_or_manifest_is_denied(self):
-        cases = ("summary", "status", "manifest")
-        for missing in cases:
-            with self.subTest(missing=missing):
+    def test_10_normal_previous_succeeded_new_run_passes(self):
+        self.stub_current_running()
+        summary = self.run_recovery()
+        self.assertNotIn("recovery", summary)
+        self.assertEqual(len(self.sync_calls), 1)
+
+    def test_11_publication_history_unknown_is_denied(self):
+        self.stub_prepublication_recovery()
+        self.sfn_client = FakeStepFunctionsClient(
+            [make_execution_spec(CURRENT_RUN_DATE, CURRENT_RUN_ID)]
+        )
+        self.assert_denied_before_sync()
+
+    def test_12_current_or_bk1_baseline_mismatch_is_denied(self):
+        for changed in ("current", "bk1"):
+            with self.subTest(changed=changed):
                 self.sync_calls = []
-                client = self.stub_prepublication_recovery()
-                if missing == "summary":
-                    (self.sync_dir / "01_result" / target.SYNC_SUMMARY_FILENAME).unlink()
-                elif missing == "status":
-                    key = (
-                        f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/"
-                        f"{RECOVERY_FAILED_RUN_ID}/status.json"
-                    )
-                    client.status_docs.pop(key)
+                self.stub_prepublication_recovery()
+                path = next(iter(self.current))
+                if changed == "current":
+                    self.current[path] += 1
                 else:
-                    self.manifest_path.unlink()
-                self.assert_denied_before_sync()
-                self.write_manifest()
-                self.write_sync_summary(
-                    make_sync_summary(manifest_path=str(self.manifest_path.resolve()))
-                )
-
-    def test_k_unknown_step_source_or_schema_is_denied(self):
-        cases = (
-            {"current_step": "UNKNOWN"},
-            {"exit_code_source": "unknown"},
-            {"schema_version": "2.0"},
-        )
-        for overrides in cases:
-            with self.subTest(overrides=overrides):
-                self.sync_calls = []
-                item = {
-                    "run_date": CURRENT_RUN_DATE,
-                    "run_id": RECOVERY_FAILED_RUN_ID,
-                }
-                item.update(overrides)
-                self.stub_prepublication_recovery([item])
+                    self.backup[path] += 1
+                self._refresh_client()
                 self.assert_denied_before_sync()
 
-    def test_l_consecutive_safe_failures_all_pass(self):
-        self.stub_prepublication_recovery(
-            [
-                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure-1"},
-                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure-2"},
-            ]
-        )
-        summary = self.run_recovery()
-        self.assertEqual(len(summary["recovery"]["intervening_runs"]), 2)
-        self.assertTrue(summary["recovery"]["all_intervening_runs_checked"])
-
-    def test_m_consecutive_mixed_failures_are_denied(self):
-        self.stub_prepublication_recovery(
-            [
-                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-safe-failure"},
-                {"run_date": CURRENT_RUN_DATE, "run_id": "sfn-unsafe-failure",
-                 "current_step": "80-8_portal_s3_prepare"},
-            ]
-        )
-        self.assert_denied_before_sync()
-
-    def test_n_same_date_different_run_id_passes(self):
-        self.stub_prepublication_recovery()
-        summary = self.run_recovery()
-        recovery = summary["recovery"]
-        self.assertEqual(recovery["intervening_runs"][0]["run_date"], CURRENT_RUN_DATE)
-        self.assertNotEqual(recovery["intervening_runs"][0]["run_id"], recovery["current_run_id"])
-
-    def test_o_same_run_id_redrive_is_denied(self):
+    def test_13_same_run_id_redrive_is_denied(self):
         os.environ["RUN_DATE"] = CURRENT_RUN_DATE
         os.environ["RUN_ID"] = RECOVERY_FAILED_RUN_ID
         client = self.stub_s3(
@@ -1734,9 +2041,18 @@ class TestPrePublicationFailureRecovery(RotationTestBase):
             f"{BASE_PREFIX}/pipeline-status/{CURRENT_RUN_DATE}/"
             f"{RECOVERY_FAILED_RUN_ID}/status.json"
         )
-        client.status_docs[key]["current_step"] = target.PREPUBLICATION_FAILED_STEP_NAME
-        client.status_docs[key]["finished_at_source"] = target.PREPUBLICATION_FAILURE_SOURCE
-        client.status_docs[key]["exit_code_source"] = target.PREPUBLICATION_FAILURE_SOURCE
+        client.status_docs[key]["current_step"] = "08-5_BATCH_WAIT"
+        self.assert_denied_before_sync()
+
+    def test_14_unknown_history_ordering_is_denied(self):
+        self.stub_prepublication_recovery()
+        failed_spec = next(
+            spec
+            for spec in self.sfn_client.specs
+            if spec["description"]["status"] == "FAILED"
+        )
+        failed_spec["events"][1]["id"] = 3
+        failed_spec["events"][2]["id"] = 2
         self.assert_denied_before_sync()
 
 
@@ -2060,6 +2376,7 @@ class TestConfirmUsesRotationSnapshot(unittest.TestCase):
                 "execution_arn": _execution_arn("confirm-current"),
                 "current_execution_arn": _execution_arn("confirm-current"),
                 "execution_status": "RUNNING",
+                "execution_start_date": "2026-08-19T10:00:00+00:00",
                 "run_date": CURRENT_RUN_DATE,
                 "run_id": CURRENT_RUN_ID,
                 "run_identity_match": True,
@@ -2153,21 +2470,55 @@ class TestConfirmUsesRotationSnapshot(unittest.TestCase):
         summary["recovery"] = {
             "enabled": True,
             "eligible": True,
-            "recovery_mode": "pre_publication_08_5_failure",
+            "recovery_mode": target.PREPUBLICATION_RECOVERY_MODE,
             "rotation_authority_run_date": PREV_RUN_DATE,
             "rotation_authority_run_id": PREV_RUN_ID,
             "current_run_date": CURRENT_RUN_DATE,
             "current_run_id": CURRENT_RUN_ID,
             "all_intervening_runs_checked": True,
-            "failure_contract": {
-                "status": "FAILED",
-                "current_step": "08-5_BATCH_WAIT",
-                "exit_code": 86,
-                "finished_at_source": "batch_status_lambda",
-                "exit_code_source": "batch_status_lambda",
-                "publication_boundary_reached": False,
+            "failed_execution_list_pages_checked": 1,
+            "execution_window": {
+                "ordering_source": "stepfunctions_execution_metadata",
+                "authority_execution_arn": _execution_arn("confirm-authority"),
+                "authority_stop_date": "2026-08-19T01:00:00+00:00",
+                "current_execution_arn": _execution_arn("confirm-current"),
+                "current_start_date": "2026-08-19T10:00:00+00:00",
+                "candidate_execution_count": 1,
+                "outside_recovery_window_count": 0,
+                "outside_recovery_window": [],
             },
-            "intervening_runs": [{"validation_result": "PASS"}],
+            "publication_guard": {
+                "terminal_status": "FAILED",
+                "publication_boundary_step": target.PUBLICATION_BOUNDARY_STEP_NAME,
+                "publication_boundary_state": target.PUBLICATION_BOUNDARY_STATE,
+                "publication_boundary_reached": False,
+                "failure_reason_allowlist_used": False,
+            },
+            "intervening_runs": [{
+                "status": "FAILED",
+                "validation_result": "PASS",
+                "current_step": "08-1_restore_and_merge_requirement_skill_ai_matching",
+                "step_order_verified": True,
+                "before_publication_boundary": True,
+                "publication_boundary_reached": False,
+                "execution_evidence": {
+                    "validation_result": "PASS",
+                    "evidence_source": "stepfunctions_execution_history",
+                    "execution_arn": _execution_arn("confirm-failed"),
+                    "execution_status": "FAILED",
+                    "execution_start_date": "2026-08-19T02:00:00+00:00",
+                    "execution_stop_date": "2026-08-19T02:30:00+00:00",
+                    "recovery_window_candidate": True,
+                    "run_identity_match": True,
+                    "redrive_count": 0,
+                    "redrive_date_present": False,
+                    "execution_redriven_event_present": False,
+                    "history_pages_checked": 1,
+                    "history_event_count": 3,
+                    "publication_boundary_state": target.PUBLICATION_BOUNDARY_STATE,
+                    "publication_boundary_reached": False,
+                },
+            }],
             "current_unchanged": {
                 "verified": True,
                 "manifest_inventory_match": True,
@@ -2188,7 +2539,7 @@ class TestConfirmUsesRotationSnapshot(unittest.TestCase):
         summary["recovery"] = {
             "enabled": True,
             "eligible": True,
-            "recovery_mode": "pre_publication_08_5_failure",
+            "recovery_mode": target.PREPUBLICATION_RECOVERY_MODE,
             "rotation_authority_run_date": PREV_RUN_DATE,
             "rotation_authority_run_id": PREV_RUN_ID,
             "all_intervening_runs_checked": True,

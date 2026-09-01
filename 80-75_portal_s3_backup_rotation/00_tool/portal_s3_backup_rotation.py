@@ -23,10 +23,10 @@ CURRENT + bk1 の 2 set 構成（backup 1世代）。将来 bk2 / bk3 へ拡張�
 - 限定recovery: date / run_idをCLIで明示した既知80-7 FAILED runだけを対象とし、
   previous verified success確定後にCURRENT objectが1件も変更されていない場合だけ
   BK1 rotation元として許可する。FAILED statusを無条件に無視する経路ではない。
-- pre-publication recovery: managed RUNNING自runの直前に08-5 Batch wait failureが
-  1件以上あっても、verified 80-9 authority以降の全terminal runが
-  FAILED / 08-5_BATCH_WAIT / exit=86 / batch_status_lambdaに完全一致し、
+- pre-publication recovery: verified 80-9 authority以降の全terminal runがFAILEDで、
+  immutable execution history上publication境界未到達かつRedriveなしと証明でき、
   CURRENTとBK1のinventory・LastModifiedが不変の場合だけrotationを許可する。
+  Gmail件数やfailure reason/step固有のallowlistはrotation許可条件にしない。
 - backup本体: `aws s3 sync CURRENT BK1 --delete`（argv配列 / shell未使用 /
   include-excludeフィルタ未使用）
 - backup後 PORTAL_S3_VERIFY_WAIT_SEC 秒待ち、CURRENT と bk1 を全件LISTして
@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,9 +71,10 @@ IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION = 1
 PREPARE_STEP_DIR_NAME = "80-8_portal_s3_prepare"
 PREVIOUS_MANIFEST_FILENAME = "portal_s3_manifest.jsonl"
 RECOVERY_FAILED_STEP_NAME = "80-7_manage_09_result_retention"
-PREPUBLICATION_FAILED_STEP_NAME = "08-5_BATCH_WAIT"
-PREPUBLICATION_FAILURE_SOURCE = "batch_status_lambda"
-PREPUBLICATION_FAILURE_EXIT_CODE = 86
+PREPUBLICATION_RECOVERY_MODE = "pre_publication_failed_runs"
+PUBLICATION_BOUNDARY_STEP_NAME = "80-75_portal_s3_backup_rotation"
+PUBLICATION_BOUNDARY_STATE = "SendPhaseBLauncherCommand"
+PIPELINE_STEP_RE = re.compile(r"^(\d{2})-(\d+)(?:_|\(|$)")
 
 AWS_BIN = "/usr/bin/aws"
 RESULT_DIR_NAME = "01_result"
@@ -337,8 +339,10 @@ def _next_token(response: Dict[str, Any], operation: str, seen: set) -> Optional
     return token
 
 
-def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]], int]:
-    """対象State MachineのRUNNING executionを全ページ取得する。"""
+def _list_executions_by_status(
+    stepfunctions_client, status: str
+) -> Tuple[List[Dict[str, Any]], int]:
+    """対象State Machineの指定status executionを全ページ取得する。"""
     executions: List[Dict[str, Any]] = []
     seen_tokens = set()
     seen_arns = set()
@@ -348,7 +352,7 @@ def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]]
         while True:
             params: Dict[str, Any] = {
                 "stateMachineArn": EXPECTED_STATE_MACHINE_ARN,
-                "statusFilter": "RUNNING",
+                "statusFilter": status,
                 "maxResults": 1000,
             }
             if token is not None:
@@ -368,9 +372,9 @@ def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]]
                     raise RotationError(
                         f"Step Functions ListExecutionsでexecutionArnが重複しました: {execution_arn}"
                     )
-                if execution.get("status") != "RUNNING":
+                if execution.get("status") != status:
                     raise RotationError(
-                        "Step Functions ListExecutionsがRUNNING以外を返しました "
+                        "Step Functions ListExecutionsが指定status以外を返しました "
                         f"({execution_arn} status={execution.get('status')!r})"
                     )
                 seen_arns.add(execution_arn)
@@ -383,6 +387,30 @@ def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]]
     except Exception as exc:  # noqa: BLE001
         raise RotationError(f"Step Functions ListExecutionsに失敗しました: {exc}") from exc
     return executions, pages
+
+
+def _list_running_executions(stepfunctions_client) -> Tuple[List[Dict[str, Any]], int]:
+    """対象State MachineのRUNNING executionを全ページ取得する。"""
+    return _list_executions_by_status(stepfunctions_client, "RUNNING")
+
+
+def _require_execution_timestamp(
+    execution: Dict[str, Any], key: str, label: str
+) -> datetime:
+    """AWS管理execution metadataのtimezone付きtimestampをfail-closedで返す。"""
+    value = execution.get(key)
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise RotationError(f"{label}の{key}が不正です（execution ordering判定不能）")
+    return value
+
+
+def _execution_timestamp_text(value: datetime) -> str:
+    """summary監査用にAWS execution timestampをISO 8601へ固定する。"""
+    return value.isoformat()
 
 
 def _get_execution_history(
@@ -436,13 +464,19 @@ def _get_execution_history(
     return events, pages
 
 
-def _prepare_run_context_identity(events: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+def _prepare_run_context_identity(
+    events: List[Dict[str, Any]], require_complete_output: bool = False
+) -> Optional[Dict[str, str]]:
     """PrepareRunContext StateExited outputからrun_date/run_idを抽出する。"""
     prepare_outputs = []
     for event in events:
         details = event.get("stateExitedEventDetails")
         if not isinstance(details, dict) or details.get("name") != PREPARE_RUN_CONTEXT_STATE:
             continue
+        if require_complete_output:
+            output_details = details.get("outputDetails")
+            if not isinstance(output_details, dict) or output_details.get("truncated") is not False:
+                raise RotationError("PrepareRunContext history outputが完全取得されていません")
         raw_output = details.get("output")
         if not isinstance(raw_output, str) or not raw_output:
             raise RotationError("PrepareRunContext history eventにoutputがありません")
@@ -473,6 +507,329 @@ def _prepare_run_context_identity(events: List[Dict[str, Any]]) -> Optional[Dict
             f"(matches={len(prepare_outputs)})"
         )
     return prepare_outputs[0]
+
+
+def _pipeline_step_order(step_name: Any) -> Optional[Tuple[int, Fraction]]:
+    """step prefixをDAG上の数値順へ変換する。解析不能は安全側DENY用にNone。"""
+    if not isinstance(step_name, str):
+        return None
+    match = PIPELINE_STEP_RE.match(step_name)
+    if match is None:
+        return None
+    major_text, minor_text = match.groups()
+    return int(major_text), Fraction(int(minor_text), 10 ** len(minor_text))
+
+
+def _validate_prepublication_step(step_name: Any) -> Dict[str, Any]:
+    """failure reasonではなく、current_stepが80-75より前かだけを判定する。"""
+    actual_order = _pipeline_step_order(step_name)
+    boundary_order = _pipeline_step_order(PUBLICATION_BOUNDARY_STEP_NAME)
+    if actual_order is None or boundary_order is None:
+        raise RotationError(f"failure stepの順序を解決できません: {step_name!r}")
+    if actual_order >= boundary_order:
+        raise RotationError(
+            "publication境界以降のFAILED runはrecoveryできません "
+            f"(step={step_name!r} / boundary={PUBLICATION_BOUNDARY_STEP_NAME})"
+        )
+    return {
+        "current_step": step_name,
+        "step_order_verified": True,
+        "before_publication_boundary": True,
+    }
+
+
+def _validate_historical_prepublication_execution(
+    stepfunctions_client,
+    execution: Dict[str, Any],
+    expected_identity: Dict[str, str],
+) -> Dict[str, Any]:
+    """過去FAILED executionのidentity・freshness・publication未到達を履歴で証明する。"""
+    execution_arn = execution["executionArn"]
+    try:
+        description = stepfunctions_client.describe_execution(executionArn=execution_arn)
+    except Exception as exc:  # noqa: BLE001
+        raise RotationError(f"historical DescribeExecutionに失敗しました: {exc}") from exc
+    if not isinstance(description, dict):
+        raise RotationError("historical DescribeExecutionの応答がobjectではありません")
+    if description.get("executionArn") != execution_arn:
+        raise RotationError("historical execution ARNがListExecutionsと一致しません")
+    if description.get("stateMachineArn") != EXPECTED_STATE_MACHINE_ARN:
+        raise RotationError("historical state machine ARNがcanonicalではありません")
+    if description.get("status") != "FAILED":
+        raise RotationError("historical execution statusがFAILEDではありません")
+    listed_start = _require_execution_timestamp(
+        execution, "startDate", "historical ListExecutions"
+    )
+    listed_stop = _require_execution_timestamp(
+        execution, "stopDate", "historical ListExecutions"
+    )
+    described_start = _require_execution_timestamp(
+        description, "startDate", "historical DescribeExecution"
+    )
+    described_stop = _require_execution_timestamp(
+        description, "stopDate", "historical DescribeExecution"
+    )
+    if described_start != listed_start or described_stop != listed_stop:
+        raise RotationError("historical execution timestampがList/Describe間で一致しません")
+    if "redriveCount" not in description:
+        raise RotationError("historical DescribeExecutionにredriveCountがありません")
+    redrive_count = description["redriveCount"]
+    if (
+        not isinstance(redrive_count, int)
+        or isinstance(redrive_count, bool)
+        or redrive_count != 0
+    ):
+        raise RotationError(f"historical redriveCountが0ではありません: {redrive_count!r}")
+    if description.get("redriveDate") is not None:
+        raise RotationError("historical executionにredriveDateがあります")
+
+    events, history_pages = _get_execution_history(stepfunctions_client, execution_arn)
+    event_ids = [event["id"] for event in events]
+    if event_ids != sorted(event_ids):
+        raise RotationError("historical execution historyのevent順序が不明です")
+    identity = _prepare_run_context_identity(events, require_complete_output=True)
+    if identity is None or identity != expected_identity:
+        raise RotationError(
+            "historical execution identityがpipeline-statusと一致しません "
+            f"(expected={expected_identity!r} / actual={identity!r})"
+        )
+    if any(event["type"] == "ExecutionRedriven" for event in events):
+        raise RotationError("historical execution historyにExecutionRedrivenがあります")
+    terminal_events = [
+        event for event in events
+        if event["type"] in PRIOR_TERMINAL_EVENT_TYPES or event["type"] == "ExecutionSucceeded"
+    ]
+    if (
+        len(terminal_events) != 1
+        or terminal_events[0]["type"] != "ExecutionFailed"
+        or terminal_events[0]["id"] != max(event_ids)
+    ):
+        raise RotationError("historical executionのterminal historyを一意に証明できません")
+
+    entered_states = []
+    for event in events:
+        details = event.get("stateEnteredEventDetails")
+        if details is None:
+            continue
+        if not isinstance(details, dict):
+            raise RotationError("historical executionのStateEntered detailsが不正です")
+        state_name = details.get("name")
+        if not isinstance(state_name, str) or not state_name:
+            raise RotationError("historical executionのStateEntered nameが不正です")
+        entered_states.append(state_name)
+    if PUBLICATION_BOUNDARY_STATE in entered_states:
+        raise RotationError(
+            "historical executionがpublication境界へ到達しています "
+            f"(state={PUBLICATION_BOUNDARY_STATE})"
+        )
+    return {
+        "validation_result": "PASS",
+        "evidence_source": "stepfunctions_execution_history",
+        "execution_arn": execution_arn,
+        "execution_status": "FAILED",
+        "execution_start_date": _execution_timestamp_text(listed_start),
+        "execution_stop_date": _execution_timestamp_text(listed_stop),
+        "recovery_window_candidate": True,
+        "run_identity_match": True,
+        "redrive_count": 0,
+        "redrive_date_present": False,
+        "execution_redriven_event_present": False,
+        "history_pages_checked": history_pages,
+        "history_event_count": len(events),
+        "publication_boundary_state": PUBLICATION_BOUNDARY_STATE,
+        "publication_boundary_reached": False,
+    }
+
+
+def _resolve_authority_execution_boundary(
+    stepfunctions_client,
+    authority_identity: Dict[str, str],
+    authority_document: Dict[str, Any],
+) -> Dict[str, Any]:
+    """verified authorityをSUCCEEDED executionへ結び、AWS stopDateを確定する。"""
+    if stepfunctions_client is None:
+        raise RotationError("authority execution metadataを取得できません")
+    authority_started = _parse_evidence_timestamp(
+        "rotation authority started_at", authority_document["started_at"]
+    )
+    authority_finished = _parse_evidence_timestamp(
+        "rotation authority finished_at", authority_document["finished_at"]
+    )
+    executions, list_pages = _list_executions_by_status(
+        stepfunctions_client, "SUCCEEDED"
+    )
+    time_matches = []
+    for execution in executions:
+        start_date = _require_execution_timestamp(
+            execution, "startDate", "authority ListExecutions"
+        )
+        stop_date = _require_execution_timestamp(
+            execution, "stopDate", "authority ListExecutions"
+        )
+        if start_date >= stop_date:
+            raise RotationError("authority candidate executionのtimestamp順序が不正です")
+        if start_date <= authority_started and stop_date >= authority_finished:
+            time_matches.append(execution)
+
+    identity_matches = []
+    for execution in time_matches:
+        execution_arn = execution["executionArn"]
+        events, history_pages = _get_execution_history(
+            stepfunctions_client, execution_arn
+        )
+        event_ids = [event["id"] for event in events]
+        if not event_ids or event_ids != sorted(event_ids):
+            raise RotationError("authority execution historyのevent順序が不明です")
+        identity = _prepare_run_context_identity(events, require_complete_output=True)
+        if identity != authority_identity:
+            continue
+        try:
+            description = stepfunctions_client.describe_execution(
+                executionArn=execution_arn
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RotationError(f"authority DescribeExecutionに失敗しました: {exc}") from exc
+        if not isinstance(description, dict):
+            raise RotationError("authority DescribeExecutionの応答がobjectではありません")
+        if description.get("executionArn") != execution_arn:
+            raise RotationError("authority execution ARNがListExecutionsと一致しません")
+        if description.get("stateMachineArn") != EXPECTED_STATE_MACHINE_ARN:
+            raise RotationError("authority state machine ARNがcanonicalではありません")
+        if description.get("status") != "SUCCEEDED":
+            raise RotationError("authority execution statusがSUCCEEDEDではありません")
+        listed_start = _require_execution_timestamp(
+            execution, "startDate", "authority ListExecutions"
+        )
+        listed_stop = _require_execution_timestamp(
+            execution, "stopDate", "authority ListExecutions"
+        )
+        described_start = _require_execution_timestamp(
+            description, "startDate", "authority DescribeExecution"
+        )
+        described_stop = _require_execution_timestamp(
+            description, "stopDate", "authority DescribeExecution"
+        )
+        if listed_start != described_start or listed_stop != described_stop:
+            raise RotationError("authority execution timestampがList/Describe間で一致しません")
+        identity_matches.append(
+            {
+                "execution_arn": execution_arn,
+                "execution_start": listed_start,
+                "execution_stop": listed_stop,
+                "history_pages_checked": history_pages,
+                "history_event_count": len(events),
+            }
+        )
+    if len(identity_matches) != 1:
+        raise RotationError(
+            "rotation authority executionを一意に特定できません "
+            f"(time_matches={len(time_matches)} / identity_matches={len(identity_matches)})"
+        )
+    matched = identity_matches[0]
+    return {
+        "execution_arn": matched["execution_arn"],
+        "execution_start": matched["execution_start"],
+        "execution_stop": matched["execution_stop"],
+        "execution_start_date": _execution_timestamp_text(
+            matched["execution_start"]
+        ),
+        "execution_stop_date": _execution_timestamp_text(matched["execution_stop"]),
+        "list_pages_checked": list_pages,
+        "history_pages_checked": matched["history_pages_checked"],
+        "history_event_count": matched["history_event_count"],
+    }
+
+
+def _historical_failed_execution_evidence(
+    stepfunctions_client,
+    identities: List[Dict[str, str]],
+    authority_stop: datetime,
+    current_start: datetime,
+) -> Tuple[
+    Dict[Tuple[str, str], Dict[str, Any]], int, Dict[str, Any]
+]:
+    """AWS execution時刻でwindow抽出後、candidate historyだけをstrict検証する。"""
+    if stepfunctions_client is None:
+        raise RotationError("historical execution historyを取得できません")
+    if authority_stop >= current_start:
+        raise RotationError("authority/current execution windowの順序を確定できません")
+    executions, list_pages = _list_executions_by_status(stepfunctions_client, "FAILED")
+    wanted = {(item["run_date"], item["run_id"]) for item in identities}
+    evidence_by_identity: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    candidates = []
+    outside_window = []
+    for execution in executions:
+        execution_arn = execution["executionArn"]
+        start_date = _require_execution_timestamp(
+            execution, "startDate", "historical ListExecutions"
+        )
+        stop_date = _require_execution_timestamp(
+            execution, "stopDate", "historical ListExecutions"
+        )
+        if start_date >= stop_date:
+            raise RotationError(
+                f"historical executionのtimestamp順序が不正です: {execution_arn}"
+            )
+        if stop_date < authority_stop:
+            outside_window.append(
+                {
+                    "execution_arn": execution_arn,
+                    "classification": "OUTSIDE_RECOVERY_WINDOW",
+                    "reason": "COMPLETED_BEFORE_AUTHORITY",
+                    "execution_start_date": _execution_timestamp_text(start_date),
+                    "execution_stop_date": _execution_timestamp_text(stop_date),
+                }
+            )
+            continue
+        if start_date > current_start:
+            outside_window.append(
+                {
+                    "execution_arn": execution_arn,
+                    "classification": "OUTSIDE_RECOVERY_WINDOW",
+                    "reason": "STARTED_AFTER_CURRENT",
+                    "execution_start_date": _execution_timestamp_text(start_date),
+                    "execution_stop_date": _execution_timestamp_text(stop_date),
+                }
+            )
+            continue
+        if not (
+            authority_stop < start_date
+            and stop_date < current_start
+        ):
+            raise RotationError(
+                "historical executionがrecovery window境界を跨ぐため順序判定不能です "
+                f"({execution_arn})"
+            )
+        candidates.append(execution)
+
+    for execution in candidates:
+        execution_arn = execution["executionArn"]
+        events, _ = _get_execution_history(stepfunctions_client, execution_arn)
+        identity = _prepare_run_context_identity(events, require_complete_output=True)
+        if identity is None:
+            raise RotationError(
+                "intervening candidate executionにPrepareRunContext identityがありません"
+            )
+        identity_key = (identity["run_date"], identity["run_id"])
+        if identity_key not in wanted:
+            raise RotationError(
+                "intervening candidate executionに対応するpipeline-statusがありません "
+                f"({identity_key!r})"
+            )
+        if identity_key in evidence_by_identity:
+            raise RotationError(f"historical execution identityが重複しています: {identity_key!r}")
+        evidence_by_identity[identity_key] = _validate_historical_prepublication_execution(
+            stepfunctions_client, execution, identity
+        )
+    missing = sorted(wanted - set(evidence_by_identity))
+    if missing:
+        raise RotationError(f"intervening FAILED execution historyを解決できません: {missing!r}")
+    return evidence_by_identity, list_pages, {
+        "ordering_source": "stepfunctions_execution_metadata",
+        "candidate_execution_count": len(candidates),
+        "outside_recovery_window_count": len(outside_window),
+        "outside_recovery_window": outside_window,
+    }
 
 
 def guard_current_execution_history(
@@ -508,7 +865,7 @@ def guard_current_execution_history(
                 identity["run_date"] == current_identity["run_date"]
                 and identity["run_id"] == current_identity["run_id"]
             ):
-                matches.append((description, events, history_pages))
+                matches.append((execution, description, events, history_pages))
     except RotationError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -520,7 +877,15 @@ def guard_current_execution_history(
             f"(matches={len(matches)})"
         )
 
-    description, events, history_pages = matches[0]
+    execution, description, events, history_pages = matches[0]
+    listed_start = _require_execution_timestamp(
+        execution, "startDate", "current ListExecutions"
+    )
+    described_start = _require_execution_timestamp(
+        description, "startDate", "current DescribeExecution"
+    )
+    if listed_start != described_start:
+        raise RotationError("current execution startDateがList/Describe間で一致しません")
     if "redriveCount" not in description:
         raise RotationError("DescribeExecutionにredriveCountがありません")
     redrive_count = description["redriveCount"]
@@ -563,6 +928,7 @@ def guard_current_execution_history(
         "execution_arn": execution_arn,
         "current_execution_arn": execution_arn,
         "execution_status": "RUNNING",
+        "execution_start_date": _execution_timestamp_text(listed_start),
         "run_date": current_identity["run_date"],
         "run_id": current_identity["run_id"],
         "run_identity_match": True,
@@ -816,8 +1182,8 @@ def _validate_terminal_status_document(
     run: Dict[str, Any],
     document: Dict[str, Any],
     label: str,
-    finished_at_source: str = "managed_wrapper",
-    exit_code_source: str = "managed_wrapper",
+    finished_at_source: Optional[str] = "managed_wrapper",
+    exit_code_source: Optional[str] = "managed_wrapper",
 ) -> None:
     """recovery判定に使うterminal statusをschema 1.0完全一致で検証する。"""
     actual_keys = set(document)
@@ -856,9 +1222,13 @@ def _validate_terminal_status_document(
         parsed_timestamps[name] = parsed
     if parsed_timestamps["finished_at"] < parsed_timestamps["started_at"]:
         raise RotationError(f"{label} statusのfinished_atがstarted_atより前です")
-    if document["finished_at_source"] != finished_at_source:
+    if not isinstance(document["finished_at_source"], str) or not document["finished_at_source"]:
         raise RotationError(f"{label} statusのfinished_at_sourceが不正です")
-    if document["exit_code_source"] != exit_code_source:
+    if finished_at_source is not None and document["finished_at_source"] != finished_at_source:
+        raise RotationError(f"{label} statusのfinished_at_sourceが不正です")
+    if not isinstance(document["exit_code_source"], str) or not document["exit_code_source"]:
+        raise RotationError(f"{label} statusのexit_code_sourceが不正です")
+    if exit_code_source is not None and document["exit_code_source"] != exit_code_source:
         raise RotationError(f"{label} statusのexit_code_sourceが不正です")
     if not isinstance(document["exit_code"], int) or isinstance(document["exit_code"], bool):
         raise RotationError(f"{label} statusのexit_codeが整数ではありません")
@@ -892,16 +1262,18 @@ def _require_ordering_last_modified(run: Dict[str, Any], label: str) -> datetime
 
 def _guard_prepublication_failure_recovery(
     s3_client,
+    stepfunctions_client,
     bucket: str,
     runs: List[Dict[str, Any]],
     provenance: Dict[str, Any],
     current_run: Dict[str, Any],
     current_document: Dict[str, Any],
+    current_identity: Dict[str, str],
     logger,
 ) -> Dict[str, Any]:
     """
-    verified publication以降、自RUNNING runより前の全runが、明示した08-5
-    batch_status_lambda failure contractだけを満たす場合に限りrotation authorityを戻す。
+    verified publication以降、自RUNNING runより前の全terminal runについて、
+    failure reasonではなくpublication境界未到達とCURRENT/BK1不変をauthority条件にする。
     """
     authority_matches = [
         run
@@ -920,6 +1292,21 @@ def _guard_prepublication_failure_recovery(
     )
     if authority_document["status"] != "SUCCEEDED" or authority_document["exit_code"] != 0:
         raise RotationError("rotation authorityがSUCCEEDED/exit=0ではありません")
+
+    authority_execution = _resolve_authority_execution_boundary(
+        stepfunctions_client,
+        {"run_date": authority_run["run_date"], "run_id": authority_run["run_id"]},
+        authority_document,
+    )
+    current_execution_guard = guard_current_execution_history(
+        stepfunctions_client, current_identity, logger
+    )
+    current_execution_start = _parse_evidence_timestamp(
+        "current execution startDate",
+        current_execution_guard.get("execution_start_date"),
+    )
+    if authority_execution["execution_stop"] >= current_execution_start:
+        raise RotationError("authority/current execution metadataの順序を確定できません")
 
     authority_modified = _require_ordering_last_modified(authority_run, "rotation authority status")
     current_modified = _require_ordering_last_modified(current_run, "current RUNNING status")
@@ -953,6 +1340,18 @@ def _guard_prepublication_failure_recovery(
     if not intervening:
         raise RotationError("pre-publication recovery対象のintervening terminal runがありません")
     intervening.sort(key=_sort_key)
+    identities = [
+        {"run_date": run["run_date"], "run_id": run["run_id"]}
+        for run in intervening
+    ]
+    history_by_identity, failed_list_pages, execution_window = (
+        _historical_failed_execution_evidence(
+            stepfunctions_client,
+            identities,
+            authority_execution["execution_stop"],
+            current_execution_start,
+        )
+    )
 
     validations = []
     previous_finished = authority_finished
@@ -963,27 +1362,17 @@ def _guard_prepublication_failure_recovery(
         _validate_terminal_status_document(
             run,
             document,
-            "intervening 08-5 FAILED",
-            finished_at_source=PREPUBLICATION_FAILURE_SOURCE,
-            exit_code_source=PREPUBLICATION_FAILURE_SOURCE,
+            "intervening pre-publication FAILED",
+            finished_at_source=None,
+            exit_code_source=None,
         )
-        if document["status"] != "FAILED":
+        if document["status"] != "FAILED" or document["exit_code"] == 0:
             raise RotationError(
-                "intervening runがFAILED terminalではありません "
-                f"({run['run_date']}/{run['run_id']} status={document['status']!r})"
+                "intervening runが非正常FAILED terminalではありません "
+                f"({run['run_date']}/{run['run_id']} status={document['status']!r} "
+                f"exit={document['exit_code']!r})"
             )
-        if document["current_step"] != PREPUBLICATION_FAILED_STEP_NAME:
-            raise RotationError(
-                "pre-publication recoveryを許可しないfailure stepです "
-                f"({run['run_date']}/{run['run_id']} step={document['current_step']!r})"
-            )
-        if document["exit_code"] != PREPUBLICATION_FAILURE_EXIT_CODE:
-            raise RotationError(
-                "08-5 failure contractのexit_codeが不一致です "
-                f"({run['run_date']}/{run['run_id']} exit={document['exit_code']!r})"
-            )
-        if not document["error_message"].strip():
-            raise RotationError("08-5 failure contractのerror_messageが空です")
+        step_evidence = _validate_prepublication_step(document["current_step"])
 
         started = _parse_evidence_timestamp("intervening started_at", document["started_at"])
         finished = _parse_evidence_timestamp("intervening finished_at", document["finished_at"])
@@ -993,25 +1382,27 @@ def _guard_prepublication_failure_recovery(
                 f"({run['run_date']}/{run['run_id']})"
             )
         previous_finished = finished
+        identity_key = (run["run_date"], run["run_id"])
+        history_evidence = history_by_identity.get(identity_key)
+        if history_evidence is None:
+            raise RotationError(f"intervening execution evidenceがありません: {identity_key!r}")
         validations.append(
             {
                 "run_date": run["run_date"],
                 "run_id": run["run_id"],
                 "status_key": run["key"],
+                "status": "FAILED",
                 "validation_result": "PASS",
-                "failure_contract": {
-                    "status": "FAILED",
-                    "current_step": PREPUBLICATION_FAILED_STEP_NAME,
-                    "exit_code": PREPUBLICATION_FAILURE_EXIT_CODE,
-                    "finished_at_source": PREPUBLICATION_FAILURE_SOURCE,
-                    "exit_code_source": PREPUBLICATION_FAILURE_SOURCE,
-                    "publication_boundary_reached": False,
-                },
+                "current_step": step_evidence["current_step"],
+                "step_order_verified": True,
+                "before_publication_boundary": True,
+                "publication_boundary_reached": False,
+                "execution_evidence": history_evidence,
             }
         )
 
     logger.info(
-        "pre-publication recovery pipeline-status照合OK: "
+        "pre-publication recovery authority照合OK: "
         f"authority={authority_run['run_date']}/{authority_run['run_id']} / "
         f"intervening={len(validations)}"
     )
@@ -1019,10 +1410,11 @@ def _guard_prepublication_failure_recovery(
         "status_key": authority_run["key"],
         "status": "SUCCEEDED",
         "exit_code": 0,
+        "current_execution_guard": current_execution_guard,
         "recovery": {
             "enabled": True,
             "eligible": True,
-            "recovery_mode": "pre_publication_08_5_failure",
+            "recovery_mode": PREPUBLICATION_RECOVERY_MODE,
             "rotation_authority_run_date": authority_run["run_date"],
             "rotation_authority_run_id": authority_run["run_id"],
             "rotation_authority_status_key": authority_run["key"],
@@ -1030,13 +1422,29 @@ def _guard_prepublication_failure_recovery(
             "current_run_date": current_run["run_date"],
             "current_run_id": current_run["run_id"],
             "all_intervening_runs_checked": True,
-            "failure_contract": {
-                "status": "FAILED",
-                "current_step": PREPUBLICATION_FAILED_STEP_NAME,
-                "exit_code": PREPUBLICATION_FAILURE_EXIT_CODE,
-                "finished_at_source": PREPUBLICATION_FAILURE_SOURCE,
-                "exit_code_source": PREPUBLICATION_FAILURE_SOURCE,
+            "failed_execution_list_pages_checked": failed_list_pages,
+            "execution_window": {
+                "ordering_source": execution_window["ordering_source"],
+                "authority_execution_arn": authority_execution["execution_arn"],
+                "authority_stop_date": authority_execution["execution_stop_date"],
+                "current_execution_arn": current_execution_guard["execution_arn"],
+                "current_start_date": current_execution_guard["execution_start_date"],
+                "candidate_execution_count": execution_window[
+                    "candidate_execution_count"
+                ],
+                "outside_recovery_window_count": execution_window[
+                    "outside_recovery_window_count"
+                ],
+                "outside_recovery_window": execution_window[
+                    "outside_recovery_window"
+                ],
+            },
+            "publication_guard": {
+                "terminal_status": "FAILED",
+                "publication_boundary_step": PUBLICATION_BOUNDARY_STEP_NAME,
+                "publication_boundary_state": PUBLICATION_BOUNDARY_STATE,
                 "publication_boundary_reached": False,
+                "failure_reason_allowlist_used": False,
             },
             "intervening_runs": validations,
             "skipped_runs": [
@@ -1167,6 +1575,7 @@ def guard_pipeline_status(
     current_identity: Optional[Dict[str, str]],
     logger,
     recovery_target: Optional[Dict[str, str]] = None,
+    stepfunctions_client=None,
 ) -> Dict[str, Any]:
     """
     pipeline-status を照合し、直前の terminal run が
@@ -1201,9 +1610,14 @@ def guard_pipeline_status(
     if not runs:
         raise RotationError("自runを除くpipeline-status runが存在しません")
     if recovery_target is not None:
-        return _guard_recovery_pipeline_status(
+        result = _guard_recovery_pipeline_status(
             s3_client, bucket, runs, provenance, recovery_target, logger
         )
+        if current_identity is not None:
+            result["current_execution_guard"] = guard_current_execution_history(
+                stepfunctions_client, current_identity, logger
+            )
+        return result
     if any(run.get("last_modified") is None for run in runs):
         raise RotationError("pipeline-status LISTにLastModifiedがありません（順序判定不能）")
 
@@ -1212,11 +1626,13 @@ def guard_pipeline_status(
         if current_run is not None and current_document is not None:
             return _guard_prepublication_failure_recovery(
                 s3_client,
+                stepfunctions_client,
                 bucket,
                 runs,
                 provenance,
                 current_run,
                 current_document,
+                current_identity,
                 logger,
             )
         raise RotationError(
@@ -1241,7 +1657,16 @@ def guard_pipeline_status(
         )
 
     logger.info(f"pipeline-status照合OK: {latest['run_date']}/{latest['run_id']} SUCCEEDED")
-    return {"status_key": latest["key"], "status": document.get("status"), "exit_code": 0}
+    result = {
+        "status_key": latest["key"],
+        "status": document.get("status"),
+        "exit_code": 0,
+    }
+    if current_identity is not None:
+        result["current_execution_guard"] = guard_current_execution_history(
+            stepfunctions_client, current_identity, logger
+        )
+    return result
 
 
 def validate_recovery_manifest_reference(
@@ -1661,11 +2086,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     )
 
     s3_client = build_s3_client(region)
+    stepfunctions_client = None
     if current_identity is not None:
         stepfunctions_client = build_stepfunctions_client(region)
-        summary["current_execution_guard"] = guard_current_execution_history(
-            stepfunctions_client, current_identity, logger
-        )
     status_info = guard_pipeline_status(
         s3_client,
         bucket,
@@ -1675,11 +2098,15 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         current_identity,
         logger,
         recovery_target=recovery_target,
+        stepfunctions_client=stepfunctions_client,
     )
+    current_execution_guard = status_info.pop("current_execution_guard", None)
+    if current_execution_guard is not None:
+        summary["current_execution_guard"] = current_execution_guard
     recovery_status = status_info.get("recovery")
     prepublication_recovery = bool(
         recovery_status
-        and recovery_status.get("recovery_mode") == "pre_publication_08_5_failure"
+        and recovery_status.get("recovery_mode") == PREPUBLICATION_RECOVERY_MODE
     )
 
     current_before_fingerprint = list_source_fingerprints(s3_client, bucket, current_prefix)
