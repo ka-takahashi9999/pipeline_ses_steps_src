@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="/home/ec2-user/pipeline_ses_steps"
 LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
 RUN_DATE="${RUN_DATE:-$(date '+%Y%m%d')}"
+MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
+STEP_08_5_EXECUTION_MODE="$(python3 "$MODE_CONFIG" --print-mode)" || exit 2
+export STEP_08_5_EXECUTION_MODE
 
 mkdir -p "$ROOT/00_pipeline/01_result"
 
@@ -59,6 +62,7 @@ suspend_for_batch_wait() {
 
 log "########## pipeline start ##########"
 log "RUN_DATE=$RUN_DATE"
+log "STEP_08_5_EXECUTION_MODE=$STEP_08_5_EXECUTION_MODE"
 
 # RUN_DATEを処理対象データ日とし、当日から翌日までのメールを取得する。
 RUN_DATE_ISO="$(date -d "$RUN_DATE" "+%Y-%m-%d")"
@@ -190,21 +194,10 @@ run_step "08-3_match_score_partition" "$ROOT/08-3_match_score_partition/00_tool/
 
 run_step "08-4_match_score_sort" "$ROOT/08-4_match_score_sort/00_tool/match_score_sort.py"
 
-if [[ "${ENABLE_08_5_BATCH_ORCHESTRATION:-0}" == "1" ]]; then
-  run_step \
-    "08-5_batch_prepare_submit" \
-    "$ROOT/08-5_high_score_required_skill_recheck/00_tool/batch_aws_orchestration.py" \
-    phase-a --pipeline-run-id "$RUN_ID" --run-date "$RUN_DATE"
-
-  # Phase Aはterminal successではない。managed wrapperの明示contractでRUNNINGを維持し、
-  # Step FunctionsがEC2を停止してBatch status waitへ移る。
-  suspend_for_batch_wait
-elif [[ "${ENABLE_08_5_BATCH_ORCHESTRATION:-0}" == "0" ]]; then
-  run_step "08-5_high_score_required_skill_recheck" "$ROOT/08-5_high_score_required_skill_recheck/00_tool/high_score_required_skill_recheck.py"
-else
-  log "ENABLE_08_5_BATCH_ORCHESTRATION must be 0 or 1"
-  exit 2
-fi
+run_step \
+  "08-5_high_score_required_skill_recheck(mode=$STEP_08_5_EXECUTION_MODE)" \
+  "$ROOT/08-5_high_score_required_skill_recheck/00_tool/run_high_score_required_skill_recheck.py" \
+  --phase phase-a --pipeline-run-id "${RUN_ID:-standalone-$RUN_DATE}" --run-date "$RUN_DATE"
 
 run_step "09-1_mail_display_format(RUN_DATE=$RUN_DATE)" "$ROOT/09-1_mail_display_format/00_tool/mail_display_format.py" --target-date "$RUN_DATE"
 

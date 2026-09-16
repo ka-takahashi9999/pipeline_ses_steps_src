@@ -10,6 +10,15 @@ from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
+OUTPUT_ARTIFACT_ORDER = (
+    "all",
+    "confirmed",
+    "human_review",
+    "not_confirmed",
+    "error",
+)
+
+
 def canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -199,3 +208,133 @@ def refresh_result_counts(
     info["not_confirmed_count"] = sum(
         1 for check in checks if check.get("confidence") == "not_confirmed"
     )
+
+
+def _result_partition(record: Dict[str, Any]) -> str:
+    status = record.get("recheck_info", {}).get("recheck_status")
+    mapping = {
+        "required_skill_confirmed": "confirmed",
+        "required_skill_human_review": "human_review",
+        "required_skill_not_confirmed": "not_confirmed",
+    }
+    if status not in mapping:
+        raise ValueError(f"recheck_status不正: {status!r}")
+    return mapping[status]
+
+
+def validate_output_contract(
+    rows: Dict[str, Sequence[Dict[str, Any]]],
+    skill_text: Callable[[Dict[str, Any]], str],
+    expected_source_records: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Validate the five-file contract shared by legacy and Batch output."""
+    if set(rows) != set(OUTPUT_ARTIFACT_ORDER):
+        raise ValueError("08-5成果物集合不一致")
+
+    all_rows = list(rows["all"])
+    expected_partitions: Dict[str, List[Dict[str, Any]]] = {
+        "confirmed": [],
+        "human_review": [],
+        "not_confirmed": [],
+    }
+    identities = []
+    for ordinal, record in enumerate(all_rows, 1):
+        if not isinstance(record, dict):
+            raise ValueError(f"all ordinal={ordinal}がJSON objectでない")
+        project_info = record.get("project_info")
+        resource_info = record.get("resource_info")
+        if not isinstance(project_info, dict) or not isinstance(resource_info, dict):
+            raise ValueError(f"all ordinal={ordinal}の元record必須field型不正")
+        project_id = str(project_info.get("message_id") or "")
+        resource_id = str(resource_info.get("message_id") or "")
+        if not project_id or not resource_id:
+            raise ValueError(f"all ordinal={ordinal}のpair message_id欠落")
+        identities.append((project_id, resource_id))
+
+        required_skills = project_info.get("required_skills", [])
+        checks = record.get("required_skill_checks")
+        if not isinstance(required_skills, list) or not isinstance(checks, list):
+            raise ValueError(f"all ordinal={ordinal}のrequired skill構造不正")
+        if len(checks) != len(required_skills):
+            raise ValueError(
+                f"required_skill_checks件数不一致: ordinal={ordinal} "
+                f"input={len(required_skills)} output={len(checks)}"
+            )
+        for index, (required_skill, check) in enumerate(
+            zip(required_skills, checks), 1
+        ):
+            normalized_skill = (
+                required_skill
+                if isinstance(required_skill, dict)
+                else {"skill": str(required_skill)}
+            )
+            if not isinstance(check, dict) or check.get("skill") != skill_text(
+                normalized_skill
+            ):
+                raise ValueError(
+                    f"required_skill_checks順序/文言不一致: "
+                    f"ordinal={ordinal} check={index}"
+                )
+            if check.get("confidence") not in {
+                "confirmed",
+                "human_review",
+                "not_confirmed",
+            }:
+                raise ValueError(
+                    f"required_skill_checks confidence不正: "
+                    f"ordinal={ordinal} check={index}"
+                )
+            if not isinstance(check.get("reason"), str) or not check["reason"].strip():
+                raise ValueError(
+                    f"required_skill_checks reason不正: ordinal={ordinal} check={index}"
+                )
+        recheck_info = record.get("recheck_info")
+        if not isinstance(recheck_info, dict):
+            raise ValueError(f"all ordinal={ordinal}のrecheck_info型不正")
+        expected_counts = {
+            "required_skill_count": len(checks),
+            "confirmed_count": sum(
+                check.get("confidence") == "confirmed" for check in checks
+            ),
+            "human_review_count": sum(
+                check.get("confidence") == "human_review" for check in checks
+            ),
+            "not_confirmed_count": sum(
+                check.get("confidence") == "not_confirmed" for check in checks
+            ),
+        }
+        for field, expected_value in expected_counts.items():
+            if recheck_info.get(field) != expected_value:
+                raise ValueError(
+                    f"recheck_info件数不一致: ordinal={ordinal} field={field}"
+                )
+        expected_partitions[_result_partition(record)].append(record)
+
+    if len(identities) != len(set(identities)):
+        raise ValueError("有効対象pairの結果が重複しています")
+    for name in ("confirmed", "human_review", "not_confirmed"):
+        if list(rows[name]) != expected_partitions[name]:
+            raise ValueError(f"分類成果物内容不一致: {name}")
+
+    if expected_source_records is not None:
+        sources = list(expected_source_records)
+        if len(sources) != len(all_rows):
+            raise ValueError(
+                f"有効対象件数不一致: input={len(sources)} output={len(all_rows)}"
+            )
+        for ordinal, (source, result) in enumerate(zip(sources, all_rows), 1):
+            for field, value in source.items():
+                if field in {
+                    "source_score_band",
+                    "recheck_info",
+                    "required_skill_checks",
+                    "category_match",
+                    "category_note",
+                }:
+                    continue
+                if result.get(field) != value:
+                    raise ValueError(
+                        f"元record field保持違反: ordinal={ordinal} field={field}"
+                    )
+
+    return {name: len(list(rows[name])) for name in OUTPUT_ARTIFACT_ORDER}

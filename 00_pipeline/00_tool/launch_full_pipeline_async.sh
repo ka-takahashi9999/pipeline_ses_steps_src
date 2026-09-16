@@ -15,6 +15,11 @@ fi
 # shellcheck source=pipeline_s3_config.env
 source "$CONFIG_FILE"
 
+if [[ -z "${STEP_08_5_EXECUTION_MODE:-}" ]]; then
+  echo "STEP_08_5_EXECUTION_MODE must be set by pipeline S3 config" >&2
+  exit 2
+fi
+
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_DATE:?RUN_DATE is required}"
 : "${PIPELINE_PHASE:=A}"
@@ -41,8 +46,16 @@ if [[ ! -r "$MANAGED_WRAPPER" ]]; then
   exit 2
 fi
 
+MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
+if ! STEP_08_5_EXECUTION_MODE="$(/usr/bin/python3 "$MODE_CONFIG" --print-mode)"; then
+  echo "invalid 08-5 execution mode configuration" >&2
+  exit 2
+fi
+export STEP_08_5_EXECUTION_MODE
+
 phase_suffix="$(printf '%s' "$PIPELINE_PHASE" | tr '[:upper:]' '[:lower:]')"
 UNIT_NAME="pipeline-ses-${RUN_DATE}-${RUN_ID}-phase-${phase_suffix}.service"
+echo "managed pipeline launch: phase=$PIPELINE_PHASE mode=$STEP_08_5_EXECUTION_MODE run_id=$RUN_ID run_date=$RUN_DATE"
 
 # A repeated SSM launcher call for the same execution is treated as already accepted.
 if "$SYSTEMCTL_BIN" is-active --quiet "$UNIT_NAME"; then
@@ -67,8 +80,12 @@ systemd_args=(
   --setenv="PIPELINE_STATUS_PREFIX=$PIPELINE_STATUS_PREFIX"
   --setenv="PIPELINE_LOG_PREFIX=$PIPELINE_LOG_PREFIX"
   --setenv="PIPELINE_AWS_REGION=$PIPELINE_AWS_REGION"
-  --setenv="ENABLE_08_5_BATCH_ORCHESTRATION=$ENABLE_08_5_BATCH_ORCHESTRATION"
+  --setenv="STEP_08_5_EXECUTION_MODE=$STEP_08_5_EXECUTION_MODE"
 )
+
+if [[ -n "${ENABLE_08_5_BATCH_ORCHESTRATION:-}" ]]; then
+  systemd_args+=(--setenv="ENABLE_08_5_BATCH_ORCHESTRATION=$ENABLE_08_5_BATCH_ORCHESTRATION")
+fi
 
 if [[ -n "$PIPELINE_SYSTEMD_USER" ]]; then
   systemd_args+=(--uid="$PIPELINE_SYSTEMD_USER")
@@ -89,4 +106,4 @@ if [[ "$systemd_exit_code" -ne 0 ]]; then
   exit "$systemd_exit_code"
 fi
 
-echo "managed pipeline accepted: unit=$UNIT_NAME phase=$PIPELINE_PHASE run_id=$RUN_ID run_date=$RUN_DATE"
+echo "managed pipeline accepted: unit=$UNIT_NAME phase=$PIPELINE_PHASE mode=$STEP_08_5_EXECUTION_MODE run_id=$RUN_ID run_date=$RUN_DATE"

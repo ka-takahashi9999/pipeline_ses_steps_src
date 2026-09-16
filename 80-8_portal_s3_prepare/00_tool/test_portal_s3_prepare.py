@@ -51,6 +51,37 @@ class PrepareTestBase(unittest.TestCase):
         self._write("03-50_extract_project_required_skills/01_result/nohup_extract.log", "log")
         self._write("03-50_extract_project_required_skills/01_result/nohup.log", "log")
         self._write("03-50_extract_project_required_skills/01_result/skills.jsonl", "sk")
+        # Pipeline内部runtimeはPortal非公開。秘密情報様の名前も含め、配下を走査させない。
+        self._write(
+            "03-50_extract_project_required_skills/01_result/"
+            "_batch_runtime/run-1/recovery.claim",
+            "claim",
+        )
+        self._write(
+            "03-50_extract_project_required_skills/01_result/"
+            "_legacy_runtime/run-1/runtime.json",
+            "legacy",
+        )
+        self._write(
+            "03-50_extract_project_required_skills/01_result/"
+            "_execution_context/run-1/gmail_credentials.json",
+            "internal",
+        )
+        self._write(
+            "07-1_requirement_skill_ai_matching/01_result/"
+            "concurrent_checkpoints/run-1/checkpoint.jsonl",
+            "checkpoint",
+        )
+        self._write(
+            "07-1_requirement_skill_ai_matching/01_result/"
+            "concurrent_checkpoints/run-1/manifest.jsonl",
+            "checkpoint-manifest",
+        )
+        self._write(
+            "07-1_requirement_skill_ai_matching/01_result/"
+            "requirement_skill_ai_matching.jsonl",
+            "ai-match",
+        )
         # error JSONL / 処理対象外JSONL は業務成果物のため除外しない
         self._write("08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
                     "99_error_restore_requirement_skill_ai_matching.jsonl", "err")
@@ -62,6 +93,25 @@ class PrepareTestBase(unittest.TestCase):
         self._write("03-10_extract_project_location/01_result/loc.jsonl", "bb")
         self._write("06-80_duplicate_proposal_check/01_result/dup.jsonl", "ccc")
         self._write("06-80_duplicate_proposal_check/01_result/dup.jsonl.bak_20260424", "old")
+        self._write(
+            "06-80_duplicate_proposal_check/01_result/"
+            "bk_duplicate_proposal_check_diff_file.jsonl",
+            "diff-backup",
+        )
+        self._write(
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "bk_merged_requirement_skill_ai_matching.jsonl",
+            "merged-backup",
+        )
+        self._write(
+            "03-2_extract_project_age/01_result/99_default_with_age_signal.jsonl",
+            "confirm-helper",
+        )
+        self._write(
+            "03-2_extract_project_age/01_result/99_default_with_age_signal_classified.jsonl",
+            "confirm-helper",
+        )
+        self._write("03-2_extract_project_age/01_result/project_age.jsonl", "age")
         self._write("04-1_fetch_skillsheets_text/01_result/.gitkeep", "")
         self._write("04-1_fetch_skillsheets_text/01_result/sheet.jsonl", "dddd")
         self._write("09-1_mail_display_format/01_result/mail_display_format_20260814/a.txt", "e")
@@ -74,6 +124,8 @@ class PrepareTestBase(unittest.TestCase):
         self._write("common/file_utils.py", "x")
         self._write("00_pipeline/01_result/pipeline_script_exec.log", "log")
         self._write("99_reference/note.md", "x")
+        self._write("99-1_multi_item_mail_lab/01_result/audit/test_output.jsonl", "test")
+        self._write("99-1_multi_item_mail_lab/01_result/replay_summary.jsonl", "test")
         (self.root / "99-9_publish_pipeline_status" / "00_tool").mkdir(parents=True)
         # step直下の01_result外ファイル（対象外）
         self._write("01-1_fetch_gmail/00_tool/fetch_gmail.py", "code")
@@ -111,9 +163,12 @@ class TestPositiveSelection(PrepareTestBase):
                 "01-1_fetch_gmail/01_result/fetch_gmail.jsonl",
                 "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl",
                 "03-10_extract_project_location/01_result/loc.jsonl",
+                "03-2_extract_project_age/01_result/project_age.jsonl",
                 "03-50_extract_project_required_skills/01_result/skills.jsonl",
                 "04-1_fetch_skillsheets_text/01_result/sheet.jsonl",
                 "06-80_duplicate_proposal_check/01_result/dup.jsonl",
+                "07-1_requirement_skill_ai_matching/01_result/"
+                "requirement_skill_ai_matching.jsonl",
                 "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
                 "99_error_restore_requirement_skill_ai_matching.jsonl",
                 "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
@@ -135,6 +190,39 @@ class TestPositiveSelection(PrepareTestBase):
         paths = self.manifest_paths()
         self.assertFalse([p for p in paths if p.endswith(".gitkeep")])
         self.assertFalse([p for p in paths if ".bak_" in p])
+
+    def test_internal_runtime_dirs_are_pruned_from_manifest(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        for dirname in target.INTERNAL_RUNTIME_DIRNAMES:
+            prefix = f"03-50_extract_project_required_skills/01_result/{dirname}/"
+            with self.subTest(dirname=dirname):
+                self.assertEqual(sum(path.startswith(prefix) for path in paths), 0)
+
+        # runtime以外の同一01_result成果物は従来どおり公開対象に残る。
+        self.assertIn(
+            "03-50_extract_project_required_skills/01_result/skills.jsonl", paths
+        )
+
+    def test_non_public_internal_test_backup_and_confirm_outputs_are_excluded(self):
+        self.assertEqual(self.run_main(), 0)
+        paths = self.manifest_paths()
+        forbidden_tokens = (
+            "/concurrent_checkpoints/",
+            "99-1_multi_item_mail_lab/",
+            "/bk_merged_",
+            "/99_default_with_age_signal",
+            "/bk_duplicate_proposal_check_diff_file.jsonl",
+        )
+        for token in forbidden_tokens:
+            with self.subTest(token=token):
+                self.assertFalse([path for path in paths if token in path])
+        self.assertIn(
+            "07-1_requirement_skill_ai_matching/01_result/"
+            "requirement_skill_ai_matching.jsonl",
+            paths,
+        )
+        self.assertIn("03-2_extract_project_age/01_result/project_age.jsonl", paths)
 
     # ---- (24) mail master included -------------------------------------
     def test_24_mail_master_is_included(self):
@@ -233,11 +321,29 @@ class TestPositiveSelection(PrepareTestBase):
         self.assertEqual(summary["excluded_counts"]["bak"], 1)
         self.assertEqual(summary["excluded_counts"]["explicit_path"], 1)
         self.assertEqual(summary["excluded_counts"]["historical_log"], 3)
+        self.assertEqual(summary["excluded_counts"]["internal_runtime"], 3)
+        self.assertEqual(summary["excluded_counts"]["concurrent_checkpoints"], 2)
+        self.assertEqual(summary["excluded_counts"]["test_step"], 2)
+        self.assertEqual(summary["excluded_counts"]["backup"], 1)
+        self.assertEqual(summary["excluded_counts"]["confirm_helper"], 2)
+        self.assertEqual(summary["excluded_counts"]["duplicate_diff_backup"], 1)
         self.assertEqual(
             summary["excluded_log_basename_globs"], list(target.EXCLUDE_LOG_BASENAME_GLOBS)
         )
         for name in target.SELF_STEP_DIRS:
             self.assertNotIn(name, summary["selected_step_dirs"])
+        for name in target.NON_PUBLIC_STEP_DIRS:
+            self.assertNotIn(name, summary["selected_step_dirs"])
+
+    def test_summary_keeps_manifest_provenance(self):
+        args = self.make_args()
+        args.run_date = "20260911"
+        args.run_id = "sfn-focused-test"
+        summary, _entries = target.run(args, self.logger)
+        self.assertEqual(summary["run_date"], "20260911")
+        self.assertEqual(summary["run_date_source"], "cli")
+        self.assertEqual(summary["run_id"], "sfn-focused-test")
+        self.assertEqual(summary["run_id_source"], "cli")
 
     def test_actual_local_sizes_match_manifest(self):
         self.assertEqual(self.run_main(), 0)
@@ -249,6 +355,13 @@ class TestPositiveSelection(PrepareTestBase):
 
 
 class TestFailureCases(PrepareTestBase):
+    def test_invalid_provenance_fails(self):
+        args = self.make_args()
+        args.run_date = "2026-09-11"
+        args.run_id = "bad/id"
+        with self.assertRaises(target.PrepareError):
+            target.run(args, self.logger)
+
     def test_symlink_file_fails(self):
         link = self.root / "03-10_extract_project_location" / "01_result" / "linked.jsonl"
         link.symlink_to(self.root / "01-1_fetch_gmail" / "01_result" / "fetch_gmail.jsonl")

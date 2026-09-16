@@ -42,13 +42,15 @@ usage:
 """
 
 import argparse
+import hashlib
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,7 +59,7 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_execution_time  # noqa: E402
-from common.json_utils import read_jsonl  # noqa: E402
+from common.json_utils import read_jsonl, write_jsonl  # noqa: E402
 from common.logger import get_logger  # noqa: E402
 from common.pipeline_s3_env import get_config_value, load_pipeline_s3_config  # noqa: E402
 
@@ -1988,6 +1990,375 @@ def compare_sets(expected: Dict[str, int], actual: Dict[str, int], logger) -> Di
 # ---------------------------------------------------------------------------
 
 
+MANUAL_METHOD = "s3_complete_list_path_size_etag_last_modified_v1"
+RECEIPT_DIR = project_root / SYNC_STEP_DIR_NAME / RESULT_DIR_NAME / "manual_recovery"
+
+
+def add_manual_recovery_arguments(parser):
+    parser.add_argument("--manual-recovery-id")
+    parser.add_argument("--manual-source-run-id")
+    parser.add_argument("--manual-source-run-date")
+    parser.add_argument("--manual-source-execution-arn")
+
+
+def manual_context(args):
+    names = ("manual_recovery_id", "manual_source_run_id", "manual_source_run_date",
+             "manual_source_execution_arn")
+    values = [getattr(args, name, None) for name in names]
+    if not any(values):
+        return None
+    if not all(isinstance(v, str) and v for v in values):
+        raise RotationError("manual recoveryにはrecovery IDと元run/date/execution ARNの全指定が必要です")
+    recovery_id, run_id, run_date, arn = values
+    if not RUN_ID_RE.fullmatch(recovery_id) or not RUN_ID_RE.fullmatch(run_id):
+        raise RotationError("manual recovery IDが不正です")
+    if recovery_id == run_id:
+        raise RotationError("recovery IDは元FAILED run IDと分離してください")
+    if not RUN_DATE_RE.fullmatch(run_date):
+        raise RotationError("manual source dateが不正です")
+    datetime.strptime(run_date, "%Y%m%d")
+    prefix = EXPECTED_STATE_MACHINE_ARN.replace(":stateMachine:", ":execution:") + ":"
+    if not arn.startswith(prefix) or not arn[len(prefix):] or ":" in arn[len(prefix):]:
+        raise RotationError("manual source execution ARNが対象State Machineではありません")
+    return {"recovery_id": recovery_id, "run_id": run_id, "run_date": run_date,
+            "execution_arn": arn}
+
+
+def receipt_path(context):
+    return RECEIPT_DIR / context["recovery_id"] / "receipt.jsonl"
+
+
+def sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def complete_fingerprints(client, prefix):
+    """Receipt専用の厳格LIST。最終ページ・token循環・metadata欠損を拒否する。"""
+    result, tokens = {}, set()
+    terminal = False
+    for page in client.get_paginator("list_objects_v2").paginate(
+            Bucket=EXPECTED_BUCKET, Prefix=prefix + "/"):
+        if terminal or type(page.get("IsTruncated")) is not bool:
+            raise RotationError("manual receipt LIST完全性を確認できません")
+        terminal = page["IsTruncated"] is False
+        if not terminal:
+            token = page.get("NextContinuationToken")
+            if not isinstance(token, str) or not token or token in tokens:
+                raise RotationError("manual receipt LIST tokenが不正です")
+            tokens.add(token)
+        contents = page.get("Contents", [])
+        if not isinstance(contents, list):
+            raise RotationError("manual receipt LIST Contentsが不正です")
+        for obj in contents:
+            key, size = obj.get("Key"), obj.get("Size")
+            modified, etag = obj.get("LastModified"), obj.get("ETag")
+            if (not isinstance(key, str) or not key.startswith(prefix + "/")
+                    or type(size) is not int or size < 0
+                    or not isinstance(etag, str) or not etag
+                    or not isinstance(modified, datetime) or modified.tzinfo is None):
+                raise RotationError("manual receipt LIST object metadataが不正です")
+            path = key[len(prefix) + 1:]
+            if not path or path in result:
+                raise RotationError("manual receipt LIST pathが空または重複しています")
+            result[path] = {"size": size, "etag": etag,
+                            "last_modified": modified.astimezone(timezone.utc).isoformat()}
+    if not terminal or not result:
+        raise RotationError("manual receipt LISTが不完全または0件です")
+    return result
+
+
+def verify_manual_source(context, s3, sfn):
+    key = (f"{EXPECTED_BASE_PREFIX}/{EXPECTED_STATUS_PREFIX}/"
+           f"{context['run_date']}/{context['run_id']}/status.json")
+    document = get_status_document(s3, EXPECTED_BUCKET, key)
+    _validate_terminal_status_document(context, document, "manual source FAILED",
+                                       finished_at_source=None, exit_code_source=None)
+    if document["status"] != "FAILED" or document["exit_code"] == 0:
+        raise RotationError("manual source runがFAILEDではありません")
+    description = sfn.describe_execution(executionArn=context["execution_arn"])
+    if (description.get("executionArn") != context["execution_arn"]
+            or description.get("stateMachineArn") != EXPECTED_STATE_MACHINE_ARN
+            or description.get("status") != "FAILED"
+            or description.get("redriveCount", 0) != 0 or description.get("redriveDate")):
+        raise RotationError("manual source executionがFAILED/非redriveではありません")
+    events, _ = _get_execution_history(sfn, context["execution_arn"])
+    identity = _prepare_run_context_identity(events, require_complete_output=True)
+    if identity != {"run_id": context["run_id"], "run_date": context["run_date"]}:
+        raise RotationError("manual source execution identity不一致")
+    if any(e["type"] == "ExecutionRedriven" for e in events):
+        raise RotationError("manual source executionはredrive済みです")
+    if not events or events[-1]["type"] != "ExecutionFailed":
+        raise RotationError("manual source FAILED historyが不完全です")
+    return key, document
+
+
+def validate_receipt_snapshot(receipt):
+    if (receipt.get("publication_kind") != "manual_recovery"
+            or receipt.get("schema_version") != 1
+            or receipt.get("verification_method") != MANUAL_METHOD
+            or receipt.get("destination") != EXPECTED_SOURCE_URI
+            or receipt.get("backup_destination") != EXPECTED_DESTINATION_URI):
+        raise RotationError("manual receipt contract/destination不一致")
+    _parse_evidence_timestamp("receipt verified_at", receipt.get("verified_at"))
+    context = manual_context(argparse.Namespace(
+        manual_recovery_id=receipt.get("recovery_id"),
+        manual_source_run_id=receipt.get("source", {}).get("run_id"),
+        manual_source_run_date=receipt.get("source", {}).get("run_date"),
+        manual_source_execution_arn=receipt.get("source", {}).get("execution_arn")))
+    if context is None or receipt["source"].get("status") != "FAILED":
+        raise RotationError("manual receipt sourceが不正です")
+    for name in ("summary", "manifest", "failed_status"):
+        raw = receipt.get(name + "_snapshot")
+        if not isinstance(raw, str) or sha256_text(raw) != receipt.get(name + "_sha256"):
+            raise RotationError(f"manual receipt {name} snapshot SHA-256不一致")
+    summary = json.loads(receipt["summary_snapshot"])
+    # managed専用validatorは変更しない。CLI出自を保持した独立contract。
+    for key, expected in REQUIRED_SYNC_SUMMARY_VALUES:
+        if summary.get(key) != expected:
+            raise RotationError(f"manual receipt summary {key}不一致")
+    if summary.get("s3_destination_locked") is not True:
+        raise RotationError("manual receipt destination lockなし")
+    if (summary.get("run_date") != context["run_date"]
+            or summary.get("run_id") not in (context["run_id"], context["recovery_id"])):
+        raise RotationError("manual receipt summary run不一致")
+    for key in ("run_id_source", "run_date_source"):
+        if summary.get(key) not in ("env", "cli"):
+            raise RotationError("manual receipt summary provenance不明")
+    for key in ("run_id", "run_date", "run_id_source", "run_date_source"):
+        if summary.get("manifest_provenance", {}).get(key) != summary.get(key):
+            raise RotationError("manual receipt summary/manifest provenance不一致")
+    if receipt["source"].get("recovery_id") != context["recovery_id"]:
+        raise RotationError("manual receipt recovery ID不一致")
+    manifest = {}
+    for line in receipt["manifest_snapshot"].splitlines():
+        row = json.loads(line)
+        if not isinstance(row, dict) or set(row) != {"relative_path", "size"}:
+            raise RotationError("manual receipt manifest schema不一致")
+        path, size = row["relative_path"], row["size"]
+        if (not isinstance(path, str) or any(p in ("", ".", "..") for p in path.split("/"))
+                or path in manifest or type(size) is not int or size < 0):
+            raise RotationError("manual receipt manifest path/size不正")
+        manifest[path] = size
+    current, backup = receipt.get("current_fingerprint"), receipt.get("bk1_fingerprint")
+    if not isinstance(current, dict) or not current or not isinstance(backup, dict) or not backup:
+        raise RotationError("manual receipt CURRENT/BK1が空です")
+    for inventory in (current, backup):
+        for path, item in inventory.items():
+            if (not isinstance(item, dict) or type(item.get("size")) is not int
+                    or item["size"] < 0 or not isinstance(item.get("etag"), str) or not item["etag"]):
+                raise RotationError("manual receipt fingerprint不正")
+            _parse_evidence_timestamp("fingerprint", item.get("last_modified"))
+    verify = summary.get("verify", {})
+    if verify.get("verified") is not True:
+        raise RotationError("manual receipt summary verify失敗")
+    for key in ("missing_count", "extra_count", "size_mismatch_count"):
+        _require_zero(verify, key, "manual receipt")
+    count, size = len(manifest), sum(manifest.values())
+    if not count or {p: f["size"] for p, f in current.items()} != manifest:
+        raise RotationError("manual receipt CURRENT path/size不一致")
+    for key, expected in (("expected_file_count", count), ("actual_file_count", count),
+                          ("expected_total_bytes", size), ("actual_total_bytes", size)):
+        if _require_count(verify, key) != expected:
+            raise RotationError("manual receipt summary count/bytes不一致")
+    expected_verification = {"verified": True, "list_complete": True,
+                             "file_count": count, "total_bytes": size,
+                             "missing_count": 0, "extra_count": 0, "size_mismatch_count": 0}
+    if receipt.get("current_verification") != expected_verification:
+        raise RotationError("manual receipt CURRENT検証記録不一致")
+    failed = json.loads(receipt["failed_status_snapshot"])
+    _validate_terminal_status_document(context, failed, "receipt FAILED", None, None)
+    if failed["status"] != "FAILED" or failed["exit_code"] == 0:
+        raise RotationError("manual receipt FAILED snapshot不一致")
+    return context, summary, manifest
+
+
+def verify_manual_receipt(path, s3, sfn):
+    records = list(read_jsonl(str(path)))
+    if len(records) != 1:
+        raise RotationError("manual receiptは1行1件が必須です")
+    receipt = records[0]
+    context, summary, manifest = validate_receipt_snapshot(receipt)
+    key, failed = verify_manual_source(context, s3, sfn)
+    if failed != json.loads(receipt["failed_status_snapshot"]):
+        raise RotationError("manual source FAILED statusがsnapshotから変更されています")
+    for field, prefix in (("current_fingerprint", EXPECTED_CURRENT_PREFIX),
+                          ("bk1_fingerprint", EXPECTED_BACKUP_PREFIX)):
+        if complete_fingerprints(s3, prefix) != receipt[field]:
+            raise RotationError(f"manual receipt {field}実体不一致")
+    provenance = {"run_date": summary["run_date"], "run_id": summary["run_id"],
+                  "run_date_source": summary["run_date_source"],
+                  "run_id_source": summary["run_id_source"],
+                  "destination": EXPECTED_SOURCE_URI, "verified": True,
+                  "sync_step": SYNC_STEP_DIR_NAME, "file_count": len(manifest),
+                  "total_bytes": sum(manifest.values())}
+    return receipt, provenance, {"status_key": key}
+
+
+def finalize_manual_receipt(context, summary, manifest_path, s3, sfn):
+    path = receipt_path(context)
+    if path.parent.exists():
+        raise RotationError("recovery IDは使用済みです。receiptは上書きできません")
+    _, failed = verify_manual_source(context, s3, sfn)
+    current = complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX)
+    backup = complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX)
+    raw_summary = json.dumps(summary, ensure_ascii=False, sort_keys=True)
+    raw_manifest = manifest_path.read_text(encoding="utf-8")
+    raw_failed = json.dumps(failed, ensure_ascii=False, sort_keys=True)
+    receipt = {"schema_version": 1, "publication_kind": "manual_recovery",
+               "recovery_id": context["recovery_id"],
+               "source": {**context, "status": "FAILED"},
+               "summary_snapshot": raw_summary, "manifest_snapshot": raw_manifest,
+               "failed_status_snapshot": raw_failed,
+               "summary_sha256": sha256_text(raw_summary),
+               "manifest_sha256": sha256_text(raw_manifest),
+               "failed_status_sha256": sha256_text(raw_failed),
+               "destination": EXPECTED_SOURCE_URI, "backup_destination": EXPECTED_DESTINATION_URI,
+               "current_fingerprint": current, "bk1_fingerprint": backup,
+               "current_verification": {"verified": True, "list_complete": True,
+                   "file_count": len(current), "total_bytes": sum(v["size"] for v in current.values()),
+                   "missing_count": 0, "extra_count": 0, "size_mismatch_count": 0},
+               "verified_at": datetime.now(timezone.utc).isoformat(),
+               "verification_method": MANUAL_METHOD}
+    validate_receipt_snapshot(receipt)
+    # 再LISTで検証中の変更を検出してから、一意のdirectoryへ原子的に確定する。
+    if (complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX) != current
+            or complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX) != backup):
+        raise RotationError("manual receipt検証中にCURRENT/BK1が変化しました")
+    path.parent.mkdir(parents=True, exist_ok=False)
+    write_jsonl(str(path), [receipt])
+    return path
+
+
+def guard_manual_lock(context, s3, sfn):
+    """tailの共有lockを継承したprocessだけ許可。statusへの書込みはしない。"""
+    lock = project_root / "00_pipeline/01_result/run_full_pipeline.lock"
+    try:
+        if os.fstat(9).st_ino != lock.stat().st_ino or os.fstat(9).st_dev != lock.stat().st_dev:
+            raise RotationError("manual recovery shared lock inode不一致")
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if lock.read_text(encoding="utf-8").strip() != context["recovery_id"]:
+            raise RotationError("manual recovery shared lock owner不一致")
+    except OSError as exc:
+        raise RotationError("manual recovery shared lockがありません") from exc
+    if os.environ.get("RUN_ID") != context["recovery_id"] or os.environ.get("RUN_DATE") != context["run_date"]:
+        raise RotationError("manual recovery env identity不一致")
+    guard_no_active_runs(s3, sfn, context["recovery_id"])
+    verify_manual_source(context, s3, sfn)
+
+
+def guard_no_active_runs(s3, sfn, recovery_id=None):
+    running, _ = _list_running_executions(sfn)
+    if running:
+        raise RotationError("active Step Functions executionと競合します")
+    # strict LISTはstatus prefixにも必要（fingerprint metadataも検査する）。
+    status_objects = complete_fingerprints(s3, f"{EXPECTED_BASE_PREFIX}/{EXPECTED_STATUS_PREFIX}")
+    for key in status_objects:
+        if not key.endswith("/status.json"):
+            continue
+        document = get_status_document(s3, EXPECTED_BUCKET,
+                                       f"{EXPECTED_BASE_PREFIX}/{EXPECTED_STATUS_PREFIX}/{key}")
+        if recovery_id is not None and (document.get("run_id") == recovery_id
+                                       or recovery_id in key.split("/")):
+            raise RotationError("recovery IDは既存managed runで使用済みです")
+        if document.get("status") not in ("SUCCEEDED", "FAILED"):
+            raise RotationError("active/判定不能pipeline statusと競合します")
+
+
+def run_manual_rotation(args, logger):
+    context = manual_context(args)
+    if args.bootstrap or resolve_recovery_target(args) is not None:
+        raise RotationError("manual receiptとbootstrap/legacy recoveryの混在は禁止です")
+    config = load_pipeline_s3_config()
+    source, destination = lock_backup_route(
+        config["PIPELINE_S3_BUCKET"], config["PIPELINE_S3_BASE_PREFIX"],
+        config["PORTAL_S3_PREFIX"], config["PORTAL_S3_BACKUP_PREFIX"])
+    lock_status_prefix(config["PIPELINE_STATUS_PREFIX"])
+    wait = parse_wait_seconds(config["PORTAL_S3_VERIFY_WAIT_SEC"])
+    s3 = build_s3_client(config["PIPELINE_AWS_REGION"])
+    sfn = build_stepfunctions_client(config["PIPELINE_AWS_REGION"])
+    if getattr(args, "create_manual_receipt", False):
+        if context is None or args.dry_run or getattr(args, "manual_recovery_receipt", None):
+            raise RotationError("receipt作成には独立したmanual contextが必要です")
+        # 過去CLI公開のreceipt作成はread-only検証 + 独立local receipt保存だけ。
+        sync_dir = Path(args.sync_dir) if args.sync_dir else project_root / SYNC_STEP_DIR_NAME
+        prepare_dir = Path(args.prepare_dir) if args.prepare_dir else project_root / PREPARE_STEP_DIR_NAME
+        summary = load_previous_sync_summary(sync_dir / RESULT_DIR_NAME / SYNC_SUMMARY_FILENAME)
+        manifest = prepare_dir / RESULT_DIR_NAME / PREVIOUS_MANIFEST_FILENAME
+        validate_recovery_manifest_reference(manifest, summary.get("manifest_path"))
+        lock = project_root / "00_pipeline/01_result/run_full_pipeline.lock"
+        with lock.open("a+") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            guard_no_active_runs(s3, sfn, context["recovery_id"])
+            path = finalize_manual_receipt(context, summary, manifest, s3, sfn)
+        return {"receipt_path": str(path), "publication_kind": "manual_recovery"}
+    path = getattr(args, "manual_recovery_receipt", None)
+    if path is None:
+        raise RotationError("明示的なmanual recovery receiptが必要です")
+    receipt, provenance, status = verify_manual_receipt(path, s3, sfn)
+    execution_guard = None
+    if context is not None:
+        if receipt_path(context).parent.exists():
+            raise RotationError("recovery IDは使用済みです")
+        guard_manual_lock(context, s3, sfn)
+    else:
+        # 通常managed callerはenv/status/execution保護を維持。receiptはpreviousだけを承認。
+        identity = resolve_current_managed_identity(args)
+        if identity is None:
+            raise RotationError("receipt使用にもcurrent managed identityが必要です")
+        runs = list_status_runs(s3, EXPECTED_BUCKET, EXPECTED_BASE_PREFIX, EXPECTED_STATUS_PREFIX)
+        complete_fingerprints(s3, f"{EXPECTED_BASE_PREFIX}/{EXPECTED_STATUS_PREFIX}")
+        current = [r for r in runs if r["run_id"] == identity["run_id"] and r["run_date"] == identity["run_date"]]
+        if len(current) != 1:
+            raise RotationError("current managed statusを一意に特定できません")
+        _validate_running_current_document(current[0], get_status_document(s3, EXPECTED_BUCKET, current[0]["key"]), identity)
+        execution_guard = guard_current_execution_history(sfn, identity, logger)
+        verified_at = _parse_evidence_timestamp("receipt", receipt["verified_at"])
+        for run_info in runs:
+            if run_info == current[0]:
+                continue
+            doc = get_status_document(s3, EXPECTED_BUCKET, run_info["key"])
+            if doc.get("status") not in ("SUCCEEDED", "FAILED"):
+                raise RotationError("other active/unknown statusがあります")
+            if _parse_evidence_timestamp("status updated_at", doc.get("updated_at")) > verified_at:
+                raise RotationError("receipt確定後に別runのstatusが更新されています")
+    before = complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX)
+    bk1 = complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX)
+    if before != receipt["current_fingerprint"] or bk1 != receipt["bk1_fingerprint"]:
+        raise RotationError("rotation前にreceipt実体が変化しました")
+    expected = {p: v["size"] for p, v in before.items()}
+    summary = {"step": STEP_NAME, "operation": "rotation",
+               "executed_at": datetime.now(timezone.utc).isoformat(),
+               "backup_method": "aws s3 sync CURRENT -> BK1 --delete (no CLI filters)",
+               "mode": "dry-run" if args.dry_run else "apply",
+               "s3_source": source, "s3_destination": destination,
+               "s3_destination_locked": True, "backup_status": "SUCCEEDED",
+               "verify_wait_sec": wait, "wait_performed": False,
+               "previous_current": {**provenance, **status},
+               "manual_recovery": {"receipt_path": str(path), "receipt": receipt,
+                                   "verified": True, "context": context},
+               "current_before": {"file_count": len(expected), "total_bytes": sum(expected.values())},
+               "backup_before": {"file_count": len(bk1), "total_bytes": sum(v["size"] for v in bk1.values())},
+               "expected_backup": {"file_count": len(expected), "total_bytes": sum(expected.values())}}
+    if execution_guard is not None:
+        summary["immutable_execution_guard_contract_version"] = IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
+        summary["current_execution_guard"] = execution_guard
+    else:
+        summary["manual_lock_verified"] = True
+    run_sync(build_sync_argv(source, destination, config["PIPELINE_AWS_REGION"], args.dry_run), logger)
+    if args.dry_run:
+        summary["verify"] = {"verified": False, "skipped_reason": "dry-run"}
+        return summary
+    time.sleep(wait)
+    summary["wait_performed"] = True
+    if complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX) != before:
+        raise RotationError("manual rotation中にCURRENTが変化しました")
+    after = complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX)
+    summary["verify"] = compare_sets(expected, {p: f["size"] for p, f in after.items()}, logger)
+    if not summary["verify"]["verified"]:
+        raise RotationError("manual rotation BK1 verify失敗")
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2022,10 +2393,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="previous verified manifestの80-8 stepディレクトリ（focused test用）",
     )
+    add_manual_recovery_arguments(parser)
+    parser.add_argument("--manual-recovery-receipt", type=Path)
+    parser.add_argument("--create-manual-receipt", action="store_true")
     return parser.parse_args()
 
 
 def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
+    if (getattr(args, "manual_recovery_receipt", None)
+            or getattr(args, "create_manual_receipt", False)
+            or manual_context(args) is not None):
+        return run_manual_rotation(args, logger)
     config = load_pipeline_s3_config()
     bucket = get_config_value(config, "PIPELINE_S3_BUCKET")
     base_prefix = get_config_value(config, "PIPELINE_S3_BASE_PREFIX")
@@ -2249,7 +2627,20 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 def main() -> int:
     logger = get_logger(STEP_NAME)
     args = parse_args()
+    if getattr(args, "create_manual_receipt", False):
+        try:
+            result = run(args, logger)
+            logger.ok(f"receipt確定: {result['receipt_path']}")
+            return 0
+        except Exception as exc:
+            logger.error(f"receipt未確定: {exc}")
+            return 1
     started = time.time()
+    if getattr(args, "manual_recovery_id", None) and Path(args.step_dir) == STEP_DIR:
+        if not RUN_ID_RE.fullmatch(args.manual_recovery_id):
+            logger.error("invalid manual recovery ID")
+            return 1
+        args.step_dir = str(STEP_DIR / RESULT_DIR_NAME / "manual_recovery_runs" / args.manual_recovery_id)
     dirs = ensure_result_dirs(args.step_dir)
     summary_path = dirs["result"] / BACKUP_SUMMARY_FILENAME
 

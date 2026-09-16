@@ -89,8 +89,7 @@
   - "Visual Basic6.0"
   - "Visual InterDev6.0"
   - JavaEE
-  - VB
-
+  - Grizzly  # Grizzlyベース自社FWを用いた開発
 
 フロントエンド:
   - JavaScript
@@ -133,12 +132,15 @@
   - CSS3
   - Vercel
   - SvelteKit
+  - LWC  # LWCでの画面開発経験(2年以上)
+  - Ajax  # Ajax
 
 インフラ:
   - AWS
   - Azure
   - GCP
   - "Google Cloud"
+  - GoogleCloud  # GoogleCloud
   - Linux
   - Unix
   - Docker
@@ -158,6 +160,7 @@
   - VMware
   - Serverless
   - ECS
+  - "Amazon ECS"  # Amazon ECS on AWS Fargate、Aurora PostgreSQLの構築経験
   - EKS
   - EC2
   - S3
@@ -268,10 +271,30 @@
   - chef
   - "Hyper-V"
   - "Ansible Playbook"
-  
+  - "BIG-IP APM"  # リバースプロキシサーバ(BIG-IP APM)の新規仮想サーバ構築
+  - AXIOLE  # LDAPサーバ(AXIOLE)の新規仮想サーバ構築
+  - 動画配信技術  # 動画配信関連技術の知見
+  - HLS  # 動画配信技術(HLS、ライブエンコード)
+  - SSAI広告  # 動画配信技術(SSAI広告)
+  - DRM  # 動画配信技術(DRM)
+  - AVAYA-PBX  # AVAYA-PBXの運用保守、または障害受付・障害対応の実務経験
+  - "Red Hat Linux"  # Red Hat Linuxを中心としたOS運用に加え
+  - Windowsバッチ  # Windowsバッチ（BAT）or PowerShell（PS1）の解析、修正経験
+  - AzureAD
+  - "Active Directory"
+  - ActiveDirectory
+  - "Azure AD"  # Microsoft 365 / Microsoft Entra ID (Azure AD)
 
 クラウドサービス:
-  - AWS Bedrock
+  - "AWS Bedrock"
+  - "IBM Cloud"  # AWS、IBM Cloud等のクラウド環境に関する経験
+  - "AWS CDK"  # Terraform、CloudFormation、AWS CDK等のIaC経験
+  - WebRTC  # WebRTCに関する業務経験
+  - "Cloud Run"  # コンテナ/サーバレス基盤の設計・構築（Cloud Run、GKE、Cloud Functions など）
+  - GKE  # コンテナ/サーバレス基盤の設計・構築（Cloud Run、GKE、Cloud Functions など）
+  - "Cloud Functions"  # コンテナ/サーバレス基盤の設計・構築（Cloud Run、GKE、Cloud Functions など）
+  - ECR  # ECR等を利用したコンテナイメージの管理・バージョン運用
+  - サーバレスアーキテクチャ  # サーバレスアーキテクチャ
 
 DB:
   - "SQL Server"
@@ -388,6 +411,10 @@ DB:
   - "Apache Airflow"
   - LookerStudio
   - ETLツール
+  - Databricks  # Databricks環境の構築
+  - PowerPlatform  # データ基盤（PowerPlatform）
+  - GA4  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
+  - "Adobe Analytics"  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
 
 AI:
   - "OpenAI API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
@@ -408,11 +435,15 @@ AI:
   - AI技術
   - 生成AI
   - AIの知見
-  - AI
   - AI駆動開発
   - "Codex CLI"
+  - OpenAI  # 生成AI/LLM/API（例: OpenAI, Azure OpenAI など）を用いた実装または検証経験
+  - Dify  # Difyを用いたAIエージェントの設計、テスト、リリース、効果測定
+  - Notebooklm  # 主要技術スタックに記載
+  - AIエージェント  # AIエージェントで開発スピードを高められる方
 
 セキュリティ:
+  - Prisma Access
   - OAuth
   - SAML
   - JWT
@@ -428,6 +459,9 @@ AI:
   - "Trend Vision One"
   - DeepSecurity
   - サイバーセキュリティ
+  - EDR  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
+  - WAF  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
+  - メールセキュリティ  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
 
 テスト/品質:
   - JUnit
@@ -537,12 +571,14 @@ AI:
   - "SAP S/4HANA"
   - ShareGate
   - "AvePoint Fly"
-
+  - "S/4HANA"  # S/4HANA導入プロジェクトにおいて
 
 ミドルウェア・基盤:
   - Postfix
   - Dovecot
   - XMAP
+  - FJMW  # FJMW系の構築・運用作業経験
+  - MIDMOST  # MIDMOST
 
 営業系:
   - 法人営業
@@ -575,7 +611,6 @@ CAD系:
   - Windows11パソコン
   - 一次対応
   - アカウント管理
-  - 営業支援
   - 事務経験
   - 定期メンテナンス
   - エスカレーション
@@ -594,6 +629,7 @@ CAD系:
   - ポストエフェクト
   - GLSL
   - HLSL
+  - UnrealEngine  # 主な開発環境・ツールにUnrealEngineが含まれている
 
 デザイン系:
   - Figma
@@ -646,6 +682,7 @@ VBA系:
   - "Excel VBA"
   - ExcelVBA
   - AccessVBA
+  - "Access VBA"  # Excel VBAおよびAccess VBAの設計・実装・改修経験
 
 M365系:
   - "Microsoft 365"
@@ -653,14 +690,12 @@ M365系:
   - "Microsoft Configuration Manager"
   - "Dynamics 365"
   - "Power Platform"
+  - PowerPlatform  # データ基盤（PowerPlatform）
   - PowerQuery
   - Outlook
   - Teams
   - "Microsoft Office製品"
   - M365
-  - AzureAD
-  - "Active Directory"
-  - ActiveDirectory
   - "Microsoft Intune"
   - MDM
   - "Microsoft Entra"
@@ -678,6 +713,7 @@ Google系:
   - GoogleApps
   - GoogleWorkspace
   - "Google Workspace"
+  - "Google Apps Script"  # GAS(Google Apps Script)開発経験
 
 ブロックチェーン:
   - Geth
@@ -689,8 +725,8 @@ CMS系:
   - CMS
 
 #ネットワークのファイアーウォールとバックエンドのフレームワークと混在する恐れがあるので独立
-FW:
-  - FW
+#FW:
+#  - FW
 
 #分類不可の為
 その他:
@@ -760,3 +796,9 @@ FW:
 #  - Mac
 #  - Tomcat
 #  - VirtualBox
+
+#文字数が少なすぎ複数のカテゴリ一致してしまうため除外
+#  - VB
+#  - FW
+#  - API
+#  - AI

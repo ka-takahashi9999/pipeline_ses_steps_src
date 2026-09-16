@@ -95,7 +95,7 @@ class TestRunnerWiring(unittest.TestCase):
             self.text,
         )
         self.assertIn(
-            "08-5_high_score_required_skill_recheck/00_tool/high_score_required_skill_recheck.py",
+            "08-5_high_score_required_skill_recheck/00_tool/run_high_score_required_skill_recheck.py",
             self.text,
         )
 
@@ -235,6 +235,16 @@ class TestProductionContracts(unittest.TestCase):
                     "09-5_generate_sales_reply_draft",
                     "file",
                     r"^generate_sales_reply_draft_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-5_generate_sales_reply_draft",
+                    "file",
+                    r"^proposal_ready_(\d{8})\.jsonl$",
+                ),
+                (
+                    "09-5_generate_sales_reply_draft",
+                    "file",
+                    r"^human_review_(\d{8})\.jsonl$",
                 ),
                 (
                     "09-5_generate_sales_reply_draft",

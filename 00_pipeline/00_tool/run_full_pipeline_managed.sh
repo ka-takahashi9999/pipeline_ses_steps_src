@@ -22,6 +22,11 @@ fi
 # shellcheck source=pipeline_s3_config.env
 source "$CONFIG_FILE"
 
+if [[ -z "${STEP_08_5_EXECUTION_MODE:-}" ]]; then
+  echo "STEP_08_5_EXECUTION_MODE must be set by pipeline S3 config or launcher" >&2
+  exit 2
+fi
+
 : "${RUN_ID:?RUN_ID is required}"
 : "${RUN_DATE:?RUN_DATE is required}"
 
@@ -42,6 +47,13 @@ if [[ ! -x "$PYTHON_BIN" || ! -r "$STATUS_WRITER" ]]; then
   echo "python3 or status writer is unavailable; FAILED status cannot be published" >&2
   exit 2
 fi
+
+MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
+if ! STEP_08_5_EXECUTION_MODE="$($PYTHON_BIN "$MODE_CONFIG" --print-mode)"; then
+  echo "invalid 08-5 execution mode configuration" >&2
+  exit 2
+fi
+export STEP_08_5_EXECUTION_MODE
 
 STATE_DIR="$ROOT/00_pipeline/01_result/managed/$RUN_DATE/$RUN_ID"
 LOCAL_LOG="$STATE_DIR/pipeline.log"
@@ -338,10 +350,11 @@ export PIPELINE_SUSPEND_EXIT_CODE="$SUSPEND_EXIT_CODE"
 export PIPELINE_STATUS_WRITER="$STATUS_WRITER"
 export PIPELINE_S3_BUCKET PIPELINE_S3_BASE_PREFIX PIPELINE_STATUS_PREFIX
 export PIPELINE_LOG_PREFIX PIPELINE_AWS_REGION
+export STEP_08_5_EXECUTION_MODE
 export ENABLE_08_5_BATCH_ORCHESTRATION
 export AWS_DEFAULT_REGION="$PIPELINE_AWS_REGION"
 
-managed_log "managed pipeline start (phase=$PIPELINE_PHASE, RUN_DATE=$RUN_DATE, RUN_ID=$RUN_ID)"
+managed_log "managed pipeline start (phase=$PIPELINE_PHASE, mode=$STEP_08_5_EXECUTION_MODE, RUN_DATE=$RUN_DATE, RUN_ID=$RUN_ID)"
 if [[ "$PIPELINE_PHASE" == "B" ]]; then
   publish_status "RUNNING" "INITIALIZING_PHASE_B"
 else

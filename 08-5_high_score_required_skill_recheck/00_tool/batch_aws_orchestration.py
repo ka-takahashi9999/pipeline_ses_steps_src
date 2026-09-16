@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import boto3
 
@@ -564,6 +564,7 @@ def phase_b(
     s3: Optional[Any] = None,
     runtime_root: Path = ENGINE.RUNTIME_ROOT,
     client: Optional[Any] = None,
+    publish_owner_check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Restore completed state, collect/publish, and enforce the marker gate."""
     _required_identity(pipeline_run_id, run_date)
@@ -583,9 +584,13 @@ def phase_b(
         )
     manifest_sha256 = str(state.get("manifest_sha256") or "")
     batch_client = client or ENGINE.OpenAIHttpBatchClient()
-    result = ENGINE.collect_run(
-        batch_run_id, batch_client, runtime_root=runtime_root, publish=True
-    )
+    collect_kwargs: Dict[str, Any] = {
+        "runtime_root": runtime_root,
+        "publish": True,
+    }
+    if publish_owner_check is not None:
+        collect_kwargs["publish_owner_check"] = publish_owner_check
+    result = ENGINE.collect_run(batch_run_id, batch_client, **collect_kwargs)
     marker = ENGINE.validate_commit_marker(
         expected_run_id=batch_run_id,
         expected_manifest_sha256=manifest_sha256,
@@ -620,12 +625,34 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     try:
+        import config as mode_config
+        import run_high_score_required_skill_recheck as entrypoint
+
+        mode = mode_config.resolve_execution_mode()
+        if mode != "batch":
+            raise OrchestrationError(
+                f"Batch orchestrationはbatch modeでのみ実行できます: {mode}"
+            )
         if args.command == "phase-a":
+            context = entrypoint.prepare_execution_context(
+                args.pipeline_run_id, args.run_date, mode
+            )
             result = phase_a(args.pipeline_run_id, args.run_date)
         elif args.command == "phase-recovery":
+            context = entrypoint.require_execution_context(
+                args.pipeline_run_id, args.run_date, mode
+            )
             result = phase_recovery(args.pipeline_run_id, args.run_date)
         else:
-            result = phase_b(args.pipeline_run_id, args.run_date)
+            context = entrypoint.require_execution_context(
+                args.pipeline_run_id, args.run_date, mode
+            )
+            result = phase_b(
+                args.pipeline_run_id,
+                args.run_date,
+                publish_owner_check=lambda: entrypoint.assert_publish_owner(context),
+            )
+            entrypoint.mark_context_committed(context)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except Exception as error:

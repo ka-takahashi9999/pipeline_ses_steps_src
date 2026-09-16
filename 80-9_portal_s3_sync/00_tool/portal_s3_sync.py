@@ -14,11 +14,14 @@
 - staging tree方式: 80-8 manifestに載っているファイルだけで一時staging treeを構築し、
   AWS CLIのinclude/excludeフィルタを使わずに `aws s3 sync --delete` する。
   staging集合 = manifest集合 = S3に存在すべき集合 を保証する。
+- manifestに内部runtime prefixが1件でもあれば、staging・sync開始前にFAILする。
+- 80-8 summaryのrun_id / run_dateと80-9実行値が欠落・不一致なら、staging前にFAILする。
 - AWS CLI は argv 配列で subprocess 実行する（eval / bash -c / sh -c は使わない）
 - sync成功後 PORTAL_S3_VERIFY_WAIT_SEC 秒待ってから完全性verifyを行う
 - verify は manifest を期待値とし、S3を全ページLISTして path集合とsizeを比較する。
   directory markerを含め、prefix自身を除く全objectをactual集合に含める。
 - missing / extra / size mismatch / LIST失敗 はすべて異常終了
+- dry-runはAWS出力とS3 LISTを照合し、追加・更新・削除をstep別にsummaryへ保持する。
 - summaryへ provenance（run_date / run_id / s3_destination / sync_status / verified /
   expected・actual の count/bytes / missing / extra / size mismatch）を保持する。
   この情報を 80-75（CURRENT -> bk1 rotation）の previous CURRENT 正常性guardが参照する。
@@ -30,6 +33,8 @@ usage:
 """
 
 import argparse
+import fnmatch
+import importlib.util
 import json
 import os
 import re
@@ -70,6 +75,19 @@ EXPECTED_PORTAL_PREFIX = f"{EXPECTED_BASE_PREFIX}/{EXPECTED_PORTAL_LEAF}"
 EXPECTED_DESTINATION_URI = f"s3://{EXPECTED_BUCKET}/{EXPECTED_PORTAL_PREFIX}/"
 
 STAGE_DIR_PREFIX = ".portal_s3_stage_"
+INTERNAL_RUNTIME_DIRNAMES = (
+    "_batch_runtime",
+    "_legacy_runtime",
+    "_execution_context",
+)
+NON_PUBLIC_STEP_DIRS = ("99-1_multi_item_mail_lab",)
+FORBIDDEN_RELATIVE_PATHS = (
+    "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+    "success_cache_requirement_skill_ai_matching.jsonl",
+    "06-80_duplicate_proposal_check/01_result/"
+    "bk_duplicate_proposal_check_diff_file.jsonl",
+)
+FORBIDDEN_BASENAME_GLOBS = ("*.bak_*", "error_*.log", "nohup*.log")
 
 SAMPLE_LIMIT = 3
 
@@ -181,6 +199,46 @@ def validate_relative_path(relative_path: Any) -> None:
         raise SyncError(f"不正なpath componentを検出しました: {relative_path}")
 
 
+def validate_publish_target(relative_path: str) -> None:
+    """80-8/80-9契約上、Portal公開を禁止するpathを拒否する。"""
+    components = relative_path.split("/")
+    basename = components[-1]
+    if (
+        len(components) >= 4
+        and components[1] == RESULT_DIR_NAME
+        and components[2] in INTERNAL_RUNTIME_DIRNAMES
+    ):
+        raise SyncError(
+            "manifestにPortal公開禁止の内部runtime prefixが含まれています: "
+            f"{relative_path}"
+        )
+    if components[0] in NON_PUBLIC_STEP_DIRS:
+        raise SyncError(f"manifestにPortal公開禁止のtest stepが含まれています: {relative_path}")
+    if len(components) >= 3:
+        step = components[0]
+        result_child = components[2]
+        if step == "07-1_requirement_skill_ai_matching" and result_child == "concurrent_checkpoints":
+            raise SyncError(
+                "manifestにPortal公開禁止のconcurrent checkpointが含まれています: "
+                f"{relative_path}"
+            )
+        if (
+            step == "08-1_restore_and_merge_requirement_skill_ai_matching"
+            and fnmatch.fnmatch(result_child, "bk_merged_*")
+        ):
+            raise SyncError(f"manifestにPortal公開禁止のbackupが含まれています: {relative_path}")
+        if step == "03-2_extract_project_age" and fnmatch.fnmatch(
+            result_child, "99_default_with_age_signal*"
+        ):
+            raise SyncError(
+                f"manifestにPortal公開禁止のconfirm補助出力が含まれています: {relative_path}"
+            )
+    if relative_path in FORBIDDEN_RELATIVE_PATHS or basename == ".gitkeep" or any(
+        fnmatch.fnmatch(basename, pattern) for pattern in FORBIDDEN_BASENAME_GLOBS
+    ):
+        raise SyncError(f"manifestにPortal公開禁止の成果物が含まれています: {relative_path}")
+
+
 def load_manifest(manifest_path: Path) -> Dict[str, int]:
     if not manifest_path.is_file():
         raise SyncError(f"80-8 manifestが存在しません: {manifest_path}")
@@ -189,6 +247,7 @@ def load_manifest(manifest_path: Path) -> Dict[str, int]:
         relative_path = record.get("relative_path")
         size = record.get("size")
         validate_relative_path(relative_path)
+        validate_publish_target(relative_path)
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise SyncError(f"manifestのsizeが不正です: {record!r}")
         if relative_path in expected:
@@ -199,8 +258,8 @@ def load_manifest(manifest_path: Path) -> Dict[str, int]:
     return expected
 
 
-def load_selected_step_dirs(summary_path: Path) -> List[str]:
-    """80-8が選定したstep一覧（summary記録用）。"""
+def load_prepare_summary(summary_path: Path) -> Dict[str, Any]:
+    """80-8 summaryを読み、manifest件数・bytes・step一覧の契約を検証する。"""
     if not summary_path.is_file():
         raise SyncError(f"80-8 summaryが存在しません: {summary_path}")
     with open(summary_path, "r", encoding="utf-8") as f:
@@ -211,7 +270,48 @@ def load_selected_step_dirs(summary_path: Path) -> List[str]:
     for name in step_dirs:
         if not isinstance(name, str) or not name or "/" in name or name.startswith("."):
             raise SyncError(f"80-8 summaryのstep名が不正です: {name!r}")
-    return list(step_dirs)
+    return summary
+
+
+def validate_prepare_contract(
+    prepare_summary: Dict[str, Any], expected: Dict[str, int], execution_provenance: Dict[str, str]
+) -> Dict[str, str]:
+    """80-8 manifest summaryと80-9実行provenanceを同期開始前にfail-closed検証する。"""
+    if prepare_summary.get("file_count") != len(expected):
+        raise SyncError(
+            "80-8 summaryとmanifestのfile_countが一致しません "
+            f"({prepare_summary.get('file_count')!r} != {len(expected)})"
+        )
+    expected_bytes = sum(expected.values())
+    if prepare_summary.get("total_bytes") != expected_bytes:
+        raise SyncError(
+            "80-8 summaryとmanifestのtotal_bytesが一致しません "
+            f"({prepare_summary.get('total_bytes')!r} != {expected_bytes})"
+        )
+
+    manifest_provenance: Dict[str, str] = {}
+    for key, pattern in (("run_date", RUN_DATE_RE), ("run_id", RUN_ID_RE)):
+        manifest_value = prepare_summary.get(key)
+        manifest_source = prepare_summary.get(f"{key}_source")
+        execution_value = execution_provenance[key]
+        execution_source = execution_provenance[f"{key}_source"]
+        if (
+            not isinstance(manifest_value, str)
+            or manifest_value == UNKNOWN_PROVENANCE
+            or not pattern.match(manifest_value)
+            or manifest_source not in ("cli", "env")
+        ):
+            raise SyncError(f"80-8 manifest provenanceが不正です: {key}={manifest_value!r}")
+        if execution_value == UNKNOWN_PROVENANCE or execution_source == "default":
+            raise SyncError(f"80-9実行provenanceが未指定です: {key}")
+        if manifest_value != execution_value:
+            raise SyncError(
+                f"80-8 manifest provenanceと80-9実行値が一致しません: "
+                f"{key}={manifest_value!r} != {execution_value!r}"
+            )
+        manifest_provenance[key] = manifest_value
+        manifest_provenance[f"{key}_source"] = manifest_source
+    return manifest_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -354,16 +454,17 @@ def build_sync_argv(stage_root: Path, destination_uri: str, region: str, dry_run
         destination_uri,
         "--delete",
         "--no-follow-symlinks",
-        "--only-show-errors",
         "--region",
         region,
     ]
     if dry_run:
         argv.append("--dryrun")
+    else:
+        argv.append("--only-show-errors")
     return argv
 
 
-def run_sync(argv: List[str], logger) -> None:
+def run_sync(argv: List[str], logger) -> List[str]:
     if argv[4] != EXPECTED_DESTINATION_URI:
         raise SyncError(f"destination安全ロック違反: {argv[4]!r}")
     if "--include" in argv or "--exclude" in argv:
@@ -383,6 +484,75 @@ def run_sync(argv: List[str], logger) -> None:
     if completed.returncode != 0:
         raise SyncError(f"aws s3 sync が失敗しました (exit={completed.returncode})")
     logger.ok("aws s3 sync 成功")
+    return output.splitlines() if output else []
+
+
+def summarize_dry_run_diff(
+    output_lines: Optional[List[str]],
+    destination_uri: str,
+    expected: Dict[str, int],
+    actual: Dict[str, int],
+) -> Dict[str, Any]:
+    """aws s3 sync --dryrun出力を追加・更新・削除へ分類し、step別に集計する。"""
+    actions: Dict[str, Dict[str, int]] = {"add": {}, "update": {}, "delete": {}}
+    for raw_line in output_lines or []:
+        line = raw_line.strip()
+        upload_prefix = "(dryrun) upload:"
+        delete_prefix = "(dryrun) delete:"
+        if line.startswith(upload_prefix):
+            fields = line[len(upload_prefix) :].strip().rsplit(" to ", 1)
+            if len(fields) != 2 or not fields[1].startswith(destination_uri):
+                raise SyncError(f"dry-run upload出力を解釈できません: {line}")
+            relative_path = fields[1][len(destination_uri) :]
+            validate_relative_path(relative_path)
+            if relative_path not in expected:
+                raise SyncError(f"dry-run uploadがmanifest外を指しています: {relative_path}")
+            kind = "update" if relative_path in actual else "add"
+            actions[kind][relative_path] = expected[relative_path]
+        elif line.startswith(delete_prefix):
+            uri = line[len(delete_prefix) :].strip()
+            if not uri.startswith(destination_uri):
+                raise SyncError(f"dry-run delete出力が同期先prefix外です: {line}")
+            relative_path = uri[len(destination_uri) :]
+            validate_relative_path(relative_path)
+            if relative_path not in actual or relative_path in expected:
+                raise SyncError(f"dry-run delete対象がS3差分と一致しません: {relative_path}")
+            actions["delete"][relative_path] = actual[relative_path]
+
+    missing_uploads = sorted((set(expected) - set(actual)) - set(actions["add"]))
+    missing_deletes = sorted((set(actual) - set(expected)) - set(actions["delete"]))
+    if missing_uploads or missing_deletes:
+        raise SyncError(
+            "dry-run出力とS3 LIST差分が一致しません "
+            f"(missing_uploads={missing_uploads[:SAMPLE_LIMIT]} / "
+            f"missing_deletes={missing_deletes[:SAMPLE_LIMIT]})"
+        )
+
+    result: Dict[str, Any] = {"by_step": {}}
+    for kind in ("add", "update", "delete"):
+        paths = actions[kind]
+        result[kind] = {
+            "file_count": len(paths),
+            "total_bytes": sum(paths.values()),
+            "samples": sorted(paths)[:SAMPLE_LIMIT],
+        }
+        for relative_path, size in paths.items():
+            step = relative_path.split("/", 1)[0]
+            step_result = result["by_step"].setdefault(
+                step,
+                {
+                    "add": {"file_count": 0, "total_bytes": 0, "samples": []},
+                    "update": {"file_count": 0, "total_bytes": 0, "samples": []},
+                    "delete": {"file_count": 0, "total_bytes": 0, "samples": []},
+                },
+            )
+            step_result[kind]["file_count"] += 1
+            step_result[kind]["total_bytes"] += size
+            if len(step_result[kind]["samples"]) < SAMPLE_LIMIT:
+                step_result[kind]["samples"].append(relative_path)
+    result["by_step"] = dict(sorted(result["by_step"].items()))
+    result["unchanged_file_count"] = len(set(expected) & set(actual)) - len(actions["update"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +644,15 @@ def verify(expected: Dict[str, int], actual: Dict[str, int], logger) -> Dict[str
 # ---------------------------------------------------------------------------
 
 
+def recovery_module():
+    # 運用証跡contractの正本を80-75で共有。business JSONLの逆参照は行わない。
+    path = project_root / "80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py"
+    spec = importlib.util.spec_from_file_location("portal_recovery_contract", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -486,6 +665,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-dir", default=None, help="80-8 stepディレクトリ（focused test用）")
     parser.add_argument("--run-date", default=None, help="RUN_DATE（既定は環境変数RUN_DATE）")
     parser.add_argument("--run-id", default=None, help="RUN_ID（既定は環境変数RUN_ID）")
+    recovery_module().add_manual_recovery_arguments(parser)
     return parser.parse_args()
 
 
@@ -510,7 +690,24 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     provenance = resolve_provenance(args)
 
     expected = load_manifest(manifest_path)
-    step_dirs = load_selected_step_dirs(prepare_summary_path)
+    prepare_summary = load_prepare_summary(prepare_summary_path)
+    step_dirs = list(prepare_summary["selected_step_dirs"])
+    manifest_provenance = validate_prepare_contract(prepare_summary, expected, provenance)
+
+    recovery = recovery_module()
+    context = recovery.manual_context(args)
+    recovery_s3 = recovery_sfn = bk1_before = None
+    if context is not None:
+        if args.dry_run:
+            raise SyncError("manual recovery publishはdry-runでreceiptを確定できません")
+        if provenance["run_id"] != context["recovery_id"] or provenance["run_date"] != context["run_date"]:
+            raise SyncError("manual recovery publication identity不一致")
+        if recovery.receipt_path(context).parent.exists():
+            raise SyncError("recovery IDは使用済みです")
+        recovery_s3 = build_s3_client(region)
+        recovery_sfn = recovery.build_stepfunctions_client(region)
+        recovery.guard_manual_lock(context, recovery_s3, recovery_sfn)
+        bk1_before = recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX)
 
     logger.info(f"同期先(lock済): {destination_uri} (region={region})")
     logger.info(f"expected files={len(expected)} / bytes={sum(expected.values())}")
@@ -528,6 +725,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "run_date_source": provenance["run_date_source"],
         "run_id": provenance["run_id"],
         "run_id_source": provenance["run_id_source"],
+        "manifest_provenance": manifest_provenance,
         "pipeline_root": str(root),
         "s3_destination": destination_uri,
         "s3_destination_locked": True,
@@ -550,11 +748,22 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             "copied": staging["copied"],
         }
         argv = build_sync_argv(stage_root, destination_uri, region, args.dry_run)
-        run_sync(argv, logger)
+        sync_output = run_sync(argv, logger)
     finally:
         cleanup_staging(stage_root, logger)
 
     if args.dry_run:
+        s3_client = build_s3_client(region)
+        actual = list_portal_objects(s3_client, bucket, portal_prefix)
+        summary["dry_run_diff"] = summarize_dry_run_diff(
+            sync_output, destination_uri, expected, actual
+        )
+        logger.info(
+            "dry-run差分: "
+            f"add={summary['dry_run_diff']['add']['file_count']} / "
+            f"update={summary['dry_run_diff']['update']['file_count']} / "
+            f"delete={summary['dry_run_diff']['delete']['file_count']}"
+        )
         logger.warn("dry-runのため wait / verify は実施しません（S3未変更）")
         summary["verify"] = {"verified": False, "skipped_reason": "dry-run"}
         return summary
@@ -579,6 +788,14 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         f"verify成功: files={verify_result['actual_file_count']} / "
         f"bytes={verify_result['actual_total_bytes']}"
     )
+    if context is not None:
+        recovery.guard_manual_lock(context, recovery_s3, recovery_sfn)
+        if recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX) != bk1_before:
+            raise SyncError("manual recovery公開中にBK1が変化しました")
+        summary["publication_kind"] = "manual_recovery"
+        summary["recovery_id"] = context["recovery_id"]
+        path = recovery.finalize_manual_receipt(context, summary, manifest_path, recovery_s3, recovery_sfn)
+        summary["manual_recovery_receipt"] = str(path)
     return summary
 
 
@@ -613,6 +830,11 @@ def main() -> int:
     logger = get_logger(STEP_NAME)
     args = parse_args()
     started = time.time()
+    if getattr(args, "manual_recovery_id", None) and Path(args.step_dir) == STEP_DIR:
+        if not RUN_ID_RE.fullmatch(args.manual_recovery_id):
+            logger.error("invalid manual recovery ID")
+            return 1
+        args.step_dir = str(STEP_DIR / RESULT_DIR_NAME / "manual_recovery_runs" / args.manual_recovery_id)
     dirs = ensure_result_dirs(args.step_dir)
     summary_path = dirs["result"] / SYNC_SUMMARY_FILENAME
 

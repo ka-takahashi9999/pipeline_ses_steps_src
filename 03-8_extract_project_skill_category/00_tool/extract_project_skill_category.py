@@ -129,22 +129,29 @@ def extract_skills(
         (skills, skills_by_category, skills_raw)
     """
     text = _n(body)
-    # 既にマッチした範囲を記録して重複マッチを防ぐ
+    # 既にマッチした範囲を記録して完全包含マッチの重複を防ぐ
     matched_spans: List[Tuple[int, int]] = []
     found_order: List[Tuple[str, str]] = []  # (skill_name, category) 出現順
 
-    def _overlaps(start: int, end: int) -> bool:
+    def _is_contained(start: int, end: int) -> bool:
         for s, e in matched_spans:
-            if start < e and end > s:
+            if s <= start and end <= e:
                 return True
         return False
 
-    for category, entries in skill_dict.items():
-        for skill_name, pattern in entries:
-            for m in pattern.finditer(text):
-                if not _overlaps(m.start(), m.end()):
-                    matched_spans.append((m.start(), m.end()))
-                    found_order.append((canonicalize_skill_name(skill_name), category))
+    all_entries = [
+        (skill_name, pattern, category)
+        for category, entries in skill_dict.items()
+        for skill_name, pattern in entries
+    ]
+    # 全カテゴリ横断で長いスキルを優先。同じ長さは従来の辞書順を維持する。
+    all_entries.sort(key=lambda x: len(x[0]), reverse=True)
+
+    for skill_name, pattern, category in all_entries:
+        for m in pattern.finditer(text):
+            if not _is_contained(m.start(), m.end()):
+                matched_spans.append((m.start(), m.end()))
+                found_order.append((canonicalize_skill_name(skill_name), category))
 
     if not found_order:
         return [], {}, None

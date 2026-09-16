@@ -524,6 +524,10 @@ def parse_location(
     if not body:
         return "unknown", None, ""
 
+    # 全地方横断のstable sort。同開始位置では長語、同長なら従来順を優先する。
+    # 各検索の開始位置比較は維持し、後方の長語より左端の地名を優先する。
+    entries = sorted(entries, key=lambda entry: len(entry[1]), reverse=True)
+
     lines = body.splitlines()
 
     # ── フェーズ1: ラベル行 + 次行からの抽出（最優先） ──────

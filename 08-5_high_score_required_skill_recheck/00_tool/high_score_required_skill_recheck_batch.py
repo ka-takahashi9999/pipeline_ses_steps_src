@@ -1814,6 +1814,10 @@ def confirm_stage(staged: Dict[str, Path]) -> Dict[str, int]:
             raise CollectorIntegrityError(
                 f"stage required_skill_checks件数不一致: ordinal={index}"
             )
+    try:
+        SHARED_CORE.validate_output_contract(rows, DIRECT._skill_text)
+    except ValueError as error:
+        raise CollectorIntegrityError(str(error)) from error
     return {name: len(value) for name, value in rows.items()}
 
 
@@ -1984,6 +1988,7 @@ def collect_run(
     client: Any,
     runtime_root: Path = RUNTIME_ROOT,
     publish: bool = False,
+    publish_owner_check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     run_dir = _run_dir(run_id, runtime_root)
     validation = validate_prepared(run_dir)
@@ -2043,6 +2048,8 @@ def collect_run(
 
     marker = None
     if publish:
+        if publish_owner_check is not None:
+            publish_owner_check()
         marker = transactional_publish(
             staged,
             run_id,

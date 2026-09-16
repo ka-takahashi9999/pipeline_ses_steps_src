@@ -71,6 +71,8 @@ class SyncTestBase(unittest.TestCase):
         self.logger = get_logger("test_80-9")
         self.sleep_calls = []
         self.sync_calls = []
+        os.environ["RUN_DATE"] = "20260911"
+        os.environ["RUN_ID"] = "sfn-fixture"
 
         self.expected = {
             "01-1_fetch_gmail/01_result/fetch_gmail.jsonl": 10,
@@ -122,15 +124,30 @@ class SyncTestBase(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("noise", encoding="utf-8")
 
-    def _write_prepare_outputs(self):
+    def _write_prepare_outputs(
+        self, run_date=None, run_id=None, run_date_source="env", run_id_source="env"
+    ):
         result_dir = self.prepare_dir / "01_result"
         result_dir.mkdir(parents=True, exist_ok=True)
         write_jsonl(
             str(result_dir / target.MANIFEST_FILENAME),
             [{"relative_path": p, "size": s} for p, s in sorted(self.expected.items())],
         )
+        manifest_run_date = run_date if run_date is not None else os.environ.get("RUN_DATE")
+        manifest_run_id = run_id if run_id is not None else os.environ.get("RUN_ID")
         with open(result_dir / target.PREPARE_SUMMARY_FILENAME, "w", encoding="utf-8") as f:
-            json.dump({"selected_step_dirs": self.step_dirs}, f)
+            json.dump(
+                {
+                    "selected_step_dirs": self.step_dirs,
+                    "file_count": len(self.expected),
+                    "total_bytes": sum(self.expected.values()),
+                    "run_date": manifest_run_date,
+                    "run_date_source": run_date_source,
+                    "run_id": manifest_run_id,
+                    "run_id_source": run_id_source,
+                },
+                f,
+            )
 
     def make_args(self, dry_run=False, run_date=None, run_id=None):
         return argparse.Namespace(
@@ -142,7 +159,7 @@ class SyncTestBase(unittest.TestCase):
             run_id=run_id,
         )
 
-    def stub_sync(self, fail=False, capture_tree=False):
+    def stub_sync(self, fail=False, capture_tree=False, output_lines=None):
         def _run_sync(argv, logger):
             record = {"argv": argv}
             if capture_tree:
@@ -157,6 +174,7 @@ class SyncTestBase(unittest.TestCase):
             self.sync_calls.append(record)
             if fail:
                 raise target.SyncError("aws s3 sync が失敗しました (exit=1)")
+            return list(output_lines or [])
 
         target.run_sync = _run_sync
 
@@ -378,6 +396,55 @@ class TestStagingTree(SyncTestBase):
             target.run(self.make_args(), self.logger)
         self.assertEqual(self.sync_calls, [])
 
+    def test_internal_runtime_manifest_paths_fail_before_sync(self):
+        for dirname in target.INTERNAL_RUNTIME_DIRNAMES:
+            with self.subTest(dirname=dirname):
+                self._write_prepare_outputs()
+                manifest = self.prepare_dir / "01_result" / target.MANIFEST_FILENAME
+                with open(manifest, "a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "relative_path": (
+                                    "03-50_extract_project_required_skills/01_result/"
+                                    f"{dirname}/run-1/runtime.file"
+                                ),
+                                "size": 1,
+                            }
+                        )
+                        + "\n"
+                    )
+                self.stub_sync()
+                self.stub_s3(self.expected)
+                with self.assertRaisesRegex(target.SyncError, dirname):
+                    target.run(self.make_args(), self.logger)
+                self.assertEqual(self.sync_calls, [])
+                self.assertEqual(self._stage_dirs(), [])
+
+    def test_other_non_public_manifest_paths_fail_before_sync(self):
+        forbidden = (
+            "07-1_requirement_skill_ai_matching/01_result/"
+            "concurrent_checkpoints/run-1/checkpoint.jsonl",
+            "99-1_multi_item_mail_lab/01_result/replay_summary.jsonl",
+            "08-1_restore_and_merge_requirement_skill_ai_matching/01_result/"
+            "bk_merged_requirement_skill_ai_matching.jsonl",
+            "03-2_extract_project_age/01_result/99_default_with_age_signal.jsonl",
+            "06-80_duplicate_proposal_check/01_result/"
+            "bk_duplicate_proposal_check_diff_file.jsonl",
+        )
+        for relative_path in forbidden:
+            with self.subTest(relative_path=relative_path):
+                self._write_prepare_outputs()
+                manifest = self.prepare_dir / "01_result" / target.MANIFEST_FILENAME
+                with open(manifest, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"relative_path": relative_path, "size": 1}) + "\n")
+                self.stub_sync()
+                self.stub_s3(self.expected)
+                with self.assertRaises(target.SyncError):
+                    target.run(self.make_args(), self.logger)
+                self.assertEqual(self.sync_calls, [])
+                self.assertEqual(self._stage_dirs(), [])
+
 
 # ---------------------------------------------------------------------------
 # 5. verify（directory marker含む）
@@ -486,6 +553,7 @@ class TestProvenance(SyncTestBase):
     def test_31_provenance_fields_are_present_from_env(self):
         os.environ["RUN_DATE"] = "20260818"
         os.environ["RUN_ID"] = "sfn-9b6ab8c1-6089-4121-8ffc-e460affae951"
+        self._write_prepare_outputs()
         self.stub_sync()
         self.stub_s3(self.expected)
         summary = target.run(self.make_args(), self.logger)
@@ -514,18 +582,20 @@ class TestProvenance(SyncTestBase):
         ):
             self.assertIn(key, verify)
 
-    def test_31b_missing_env_uses_default_source(self):
+    def test_31b_missing_execution_provenance_fails_closed(self):
+        os.environ.pop("RUN_DATE")
+        os.environ.pop("RUN_ID")
         self.stub_sync()
         self.stub_s3(self.expected)
-        summary = target.run(self.make_args(), self.logger)
-        self.assertEqual(summary["run_date"], target.UNKNOWN_PROVENANCE)
-        self.assertEqual(summary["run_date_source"], "default")
-        self.assertEqual(summary["run_id"], target.UNKNOWN_PROVENANCE)
-        self.assertEqual(summary["run_id_source"], "default")
-        with self.assertRaises(rotation_target.RotationError):
-            rotation_target.validate_previous_sync_summary(summary)
+        with self.assertRaises(target.SyncError):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
 
     def test_finding_provenance_cli_only_uses_cli_source(self):
+        self._write_prepare_outputs(
+            run_date="20260819", run_id="sfn-cli-only",
+            run_date_source="cli", run_id_source="cli"
+        )
         self.stub_sync()
         self.stub_s3(self.expected)
         summary = target.run(
@@ -541,6 +611,10 @@ class TestProvenance(SyncTestBase):
     def test_finding_provenance_cli_precedes_env_and_records_cli(self):
         os.environ["RUN_DATE"] = "20260818"
         os.environ["RUN_ID"] = "sfn-env"
+        self._write_prepare_outputs(
+            run_date="20260819", run_id="sfn-cli",
+            run_date_source="cli", run_id_source="cli"
+        )
         self.stub_sync()
         self.stub_s3(self.expected)
         summary = target.run(
@@ -554,6 +628,10 @@ class TestProvenance(SyncTestBase):
     def test_finding_provenance_mixed_sources_record_adopted_side(self):
         os.environ["RUN_DATE"] = "20260818"
         os.environ["RUN_ID"] = "sfn-env"
+        self._write_prepare_outputs(
+            run_date="20260819", run_id="sfn-env",
+            run_date_source="cli", run_id_source="env"
+        )
         self.stub_sync()
         self.stub_s3(self.expected)
         summary = target.run(self.make_args(run_date="20260819"), self.logger)
@@ -587,10 +665,38 @@ class TestProvenance(SyncTestBase):
         self.assertEqual(summary["run_date"], "20260818")
         self.assertEqual(summary["run_id"], "sfn-x")
 
+    def test_manifest_provenance_mismatch_fails_before_staging_and_sync(self):
+        self._write_prepare_outputs(run_id="sfn-other")
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        with self.assertRaisesRegex(target.SyncError, "一致しません"):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+        self.assertFalse(
+            [p for p in self.step_dir.iterdir() if p.name.startswith(target.STAGE_DIR_PREFIX)]
+        )
+
+    def test_manifest_provenance_missing_fails_before_staging_and_sync(self):
+        self._write_prepare_outputs(
+            run_date=target.UNKNOWN_PROVENANCE,
+            run_id=target.UNKNOWN_PROVENANCE,
+            run_date_source="default",
+            run_id_source="default",
+        )
+        self.stub_sync()
+        self.stub_s3(self.expected)
+        with self.assertRaisesRegex(target.SyncError, "provenance"):
+            target.run(self.make_args(), self.logger)
+        self.assertEqual(self.sync_calls, [])
+        self.assertFalse(
+            [p for p in self.step_dir.iterdir() if p.name.startswith(target.STAGE_DIR_PREFIX)]
+        )
+
     def test_32_existing_verify_behaviour_is_unchanged(self):
         """provenance追加でverify判定・destination lockが変わっていないこと。"""
         os.environ["RUN_DATE"] = "20260818"
         os.environ["RUN_ID"] = "sfn-x"
+        self._write_prepare_outputs()
         self.stub_sync()
         self.stub_s3(self.expected)
         summary = target.run(self.make_args(), self.logger)
@@ -699,6 +805,37 @@ class TestExitCodes(SyncTestBase):
         self.assertEqual(self.sleep_calls, [])
         self.assertEqual(len(self.sync_calls), 1)
         self.assertIn("--dryrun", self.sync_calls[0]["argv"])
+        self.assertNotIn("--only-show-errors", self.sync_calls[0]["argv"])
+
+    def test_dry_run_diff_is_aggregated_by_step(self):
+        actual = {
+            "01-1_fetch_gmail/01_result/fetch_gmail.jsonl": 9,
+            "09-1_mail_display_format/01_result/old/a.txt": 7,
+        }
+        output_lines = [
+            "(dryrun) upload: local-a to "
+            f"{DESTINATION}01-1_fetch_gmail/01_result/fetch_gmail.jsonl",
+            "(dryrun) upload: local-b to "
+            f"{DESTINATION}06-80_duplicate_proposal_check/01_result/dup.jsonl",
+            "(dryrun) upload: local-c to "
+            f"{DESTINATION}09-1_mail_display_format/01_result/"
+            "mail_display_format_20260814/a.txt",
+            "(dryrun) delete: "
+            f"{DESTINATION}09-1_mail_display_format/01_result/old/a.txt",
+        ]
+        self.stub_sync(output_lines=output_lines)
+        self.stub_s3(actual)
+        summary = target.run(self.make_args(dry_run=True), self.logger)
+        diff = summary["dry_run_diff"]
+        self.assertEqual(diff["add"]["file_count"], 2)
+        self.assertEqual(diff["update"]["file_count"], 1)
+        self.assertEqual(diff["delete"]["file_count"], 1)
+        self.assertEqual(
+            diff["by_step"]["06-80_duplicate_proposal_check"]["add"]["file_count"], 1
+        )
+        self.assertEqual(
+            diff["by_step"]["09-1_mail_display_format"]["delete"]["file_count"], 1
+        )
 
 
 if __name__ == "__main__":

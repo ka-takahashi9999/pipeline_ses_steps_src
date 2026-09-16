@@ -22,7 +22,7 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common.file_utils import ensure_result_dirs, write_execution_time
-from common.json_utils import append_jsonl, read_jsonl, read_jsonl_as_list
+from common.json_utils import append_jsonl, read_jsonl, read_jsonl_as_list, write_jsonl
 from common.llm_client import call_llm
 from common.logger import get_logger
 from common.skillsheet_ai_context import build_skillsheet_ai_context
@@ -837,6 +837,100 @@ def _write_result(record: Dict[str, Any]) -> None:
         append_jsonl(str(OUTPUT_HUMAN_REVIEW), record)
 
 
+def run_legacy_to_stage(stage_dir: Path, limit: Optional[int] = None) -> Dict[str, Any]:
+    """Run the existing synchronous evaluator and write only validated stage files."""
+    if limit is not None and limit < 0:
+        raise ValueError("limitは0以上で指定してください")
+    for _, path in configured_input_score_files():
+        if not path.exists():
+            raise FileNotFoundError(f"入力ファイルが見つかりません: {path}")
+    if not INPUT_SKILLSHEETS.exists():
+        raise FileNotFoundError(f"入力ファイルが見つかりません: {INPUT_SKILLSHEETS}")
+    if not INPUT_CLEANED_EMAILS.exists():
+        raise FileNotFoundError(f"入力ファイルが見つかりません: {INPUT_CLEANED_EMAILS}")
+
+    skillsheet_map = _load_skillsheet_map()
+    cleaned_email_map = _load_cleaned_email_map()
+    selected: List[Tuple[str, Dict[str, Any]]] = []
+    skipped_no_match_count = 0
+    for source_score_band, record in iter_input_records():
+        if _is_no_match_record(record):
+            skipped_no_match_count += 1
+            continue
+        if limit is not None and len(selected) >= limit:
+            break
+        selected.append((source_score_band, record))
+
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for source_score_band, record in selected:
+        try:
+            result_record, error_record = _process_record(
+                record, source_score_band, skillsheet_map, cleaned_email_map
+            )
+        except Exception as error:
+            result_record = _add_recheck_result(
+                record,
+                source_score_band,
+                _fallback_checks(
+                    _required_skills_from_record(record),
+                    "予期しないエラーのため人間確認",
+                ),
+                0,
+            )
+            error_record = _make_error(
+                record, source_score_band, "unexpected_error", str(error)
+            )
+        results.append(result_record)
+        if error_record is not None:
+            errors.append(error_record)
+
+    partitions: Dict[str, List[Dict[str, Any]]] = {
+        "confirmed": [],
+        "human_review": [],
+        "not_confirmed": [],
+    }
+    for result in results:
+        status = result.get("recheck_info", {}).get("recheck_status")
+        if status == STATUS_CONFIRMED:
+            partitions["confirmed"].append(result)
+        elif status == STATUS_HUMAN_REVIEW:
+            partitions["human_review"].append(result)
+        elif status == STATUS_NOT_CONFIRMED:
+            partitions["not_confirmed"].append(result)
+        else:
+            raise ValueError(f"legacy recheck_status不正: {status!r}")
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    staged = {
+        "all": stage_dir / OUTPUT_ALL.name,
+        "confirmed": stage_dir / OUTPUT_CONFIRMED.name,
+        "human_review": stage_dir / OUTPUT_HUMAN_REVIEW.name,
+        "not_confirmed": stage_dir / OUTPUT_NOT_CONFIRMED.name,
+        "error": stage_dir / OUTPUT_ERROR.name,
+    }
+    write_jsonl(str(staged["all"]), results)
+    write_jsonl(str(staged["confirmed"]), partitions["confirmed"])
+    write_jsonl(str(staged["human_review"]), partitions["human_review"])
+    write_jsonl(str(staged["not_confirmed"]), partitions["not_confirmed"])
+    write_jsonl(str(staged["error"]), errors)
+    rows = {
+        name: read_jsonl_as_list(str(path)) for name, path in staged.items()
+    }
+    counts = SHARED_CORE.validate_output_contract(
+        rows,
+        _skill_text,
+        expected_source_records=[record for _, record in selected],
+    )
+    return {
+        "staged": staged,
+        "counts": counts,
+        "processed_count": len(results),
+        "error_count": len(errors),
+        "skipped_no_match_count": skipped_no_match_count,
+    }
+
+
 def _run_postprocessing_replay(
     replay_source: Path,
     logger: Any,
@@ -990,4 +1084,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Keep the historical executable path as a compatibility alias while all
+    # production starts use the canonical mode/context entrypoint.
+    from run_high_score_required_skill_recheck import main as entrypoint_main
+
+    sys.exit(entrypoint_main())

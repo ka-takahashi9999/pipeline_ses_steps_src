@@ -5,6 +5,9 @@ set -euo pipefail
 
 ROOT="/home/ec2-user/pipeline_ses_steps"
 LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
+MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
+STEP_08_5_EXECUTION_MODE="$(python3 "$MODE_CONFIG" --print-mode)" || exit 2
+export STEP_08_5_EXECUTION_MODE
 
 : "${RUN_DATE:?RUN_DATE is required}"
 : "${RUN_ID:?RUN_ID is required}"
@@ -57,8 +60,8 @@ log "RUN_DATE=$RUN_DATE / RUN_ID=$RUN_ID"
 # transactional publish、expected run/manifest commit marker検証まで完了する。
 run_step \
   "08-5_batch_collect_commit_gate" \
-  "$ROOT/08-5_high_score_required_skill_recheck/00_tool/batch_aws_orchestration.py" \
-  phase-b --pipeline-run-id "$RUN_ID" --run-date "$RUN_DATE"
+  "$ROOT/08-5_high_score_required_skill_recheck/00_tool/run_high_score_required_skill_recheck.py" \
+  --phase phase-b --pipeline-run-id "$RUN_ID" --run-date "$RUN_DATE"
 
 # marker gate成功後だけ09系と既存CURRENT/BK1 publication contractへ進む。
 run_step "09-1_mail_display_format(RUN_DATE=$RUN_DATE)" "$ROOT/09-1_mail_display_format/00_tool/mail_display_format.py" --target-date "$RUN_DATE"

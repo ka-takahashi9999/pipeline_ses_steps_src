@@ -1208,18 +1208,22 @@ class WiringAndAslTest(unittest.TestCase):
         self.assertLess(first_09, current)
         self.assertNotIn('run_step "01-', text)
         self.assertNotIn('run_step "08-4_', text)
-        self.assertNotIn("high_score_required_skill_recheck.py\"", text)
+        self.assertIn("run_high_score_required_skill_recheck.py", text)
+        self.assertIn("--phase phase-b", text)
+        self.assertNotIn("batch_aws_orchestration.py", text)
 
-    def test_nightly_batch_activation_is_deployed_disabled(self):
+    def test_nightly_mode_resolution_uses_canonical_entrypoint(self):
         config = (ROOT / "00_pipeline/00_tool/pipeline_s3_config.env").read_text(
             encoding="utf-8"
         )
         phase_a = (ROOT / "00_pipeline/00_tool/run_full_pipeline.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("ENABLE_08_5_BATCH_ORCHESTRATION:=0", config)
-        self.assertIn('== "1"', phase_a)
-        self.assertIn("high_score_required_skill_recheck.py", phase_a)
+        self.assertIn("STEP_08_5_EXECUTION_MODE", config)
+        self.assertNotIn("ENABLE_08_5_BATCH_ORCHESTRATION:=", config)
+        self.assertIn("config.py", phase_a)
+        self.assertIn("run_high_score_required_skill_recheck.py", phase_a)
+        self.assertNotIn('== "1"', phase_a)
 
     def test_lambda_iam_has_no_ec2_send_command_or_wide_s3(self):
         policy = json.loads(
@@ -1251,7 +1255,8 @@ class WiringAndAslTest(unittest.TestCase):
                 'PIPELINE_STATUS_PREFIX="pipeline-status"\n'
                 'PIPELINE_LOG_PREFIX="pipeline-logs"\n'
                 'PIPELINE_AWS_REGION="ap-northeast-1"\n'
-                'PIPELINE_SYSTEMD_USER=""\n',
+                'PIPELINE_SYSTEMD_USER=""\n'
+                'STEP_08_5_EXECUTION_MODE="batch"\n',
                 encoding="utf-8",
             )
             child = temp / "child.sh"

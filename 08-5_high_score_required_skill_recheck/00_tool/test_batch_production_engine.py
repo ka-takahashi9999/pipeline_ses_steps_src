@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -822,6 +822,21 @@ class CollectorRetryAndPublishTest(unittest.TestCase):
         second = batch.collect_run("run1", client, runtime, publish=False)
         self.assertEqual(first["record_count"], second["record_count"])
         self.assertEqual(batch.STATE_COLLECTED, second["state"])
+
+    def test_publish_owner_guard_runs_before_batch_transactional_publish(self):
+        runtime, _, client = self._completed_run()
+        owner_guard = Mock(side_effect=RuntimeError("stale Batch owner"))
+        with patch.object(batch, "transactional_publish") as publish:
+            with self.assertRaisesRegex(RuntimeError, "stale Batch owner"):
+                batch.collect_run(
+                    "run1",
+                    client,
+                    runtime,
+                    publish=True,
+                    publish_owner_check=owner_guard,
+                )
+        owner_guard.assert_called_once_with()
+        publish.assert_not_called()
 
     def test_partial_batch_never_reaches_stage_or_publish(self):
         runtime, actual, client = self._completed_run()

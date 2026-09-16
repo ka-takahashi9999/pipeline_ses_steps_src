@@ -1,102 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 既知の80-7 FAILED runだけを復旧する薄いtail entrypoint。
-# run_full_pipeline_managed.sh の PIPELINE_SCRIPT として使用し、managed lock/statusを再利用する。
-
+# 20260914成果物専用。managed wrapperでは起動しない。FAILED statusはread-only。
 ROOT="/home/ec2-user/pipeline_ses_steps"
-LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
+: "${RECOVERY_ID:?new RECOVERY_ID is required}"
+: "${RECOVERY_SOURCE_EXECUTION_ARN:?source execution ARN is required}"
+: "${PREVIOUS_MANUAL_RECOVERY_RECEIPT:?September 11 publication receipt is required}"
 
-: "${RUN_DATE:?RUN_DATE is required}"
-: "${RUN_ID:?RUN_ID is required}"
-: "${RECOVERY_FAILED_RUN_DATE:?RECOVERY_FAILED_RUN_DATE is required}"
-: "${RECOVERY_FAILED_RUN_ID:?RECOVERY_FAILED_RUN_ID is required}"
-
-if [[ ! "$RUN_DATE" =~ ^[0-9]{8}$ ]] || ! date -d "$RUN_DATE" '+%Y%m%d' >/dev/null 2>&1; then
-  echo "RUN_DATE must be a valid YYYYMMDD date: $RUN_DATE" >&2
+SOURCE_RUN_ID="sfn-6e454f73-4f5c-46b4-bfa1-e3c633b52b3f"
+if [[ ! "$RECOVERY_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ || "$RECOVERY_ID" == "$SOURCE_RUN_ID" ]]; then
+  echo "invalid or reused source RECOVERY_ID" >&2
   exit 2
 fi
-if [[ "$RUN_DATE" != "$RECOVERY_FAILED_RUN_DATE" ]]; then
-  echo "RUN_DATE must match RECOVERY_FAILED_RUN_DATE" >&2
+if [[ -n "${PIPELINE_STATUS_WRITER:-}" || -n "${PIPELINE_CURRENT_STEP_FILE:-}" ]]; then
+  echo "tail recovery must run independently of the managed status writer" >&2
   exit 2
 fi
-if [[ ! "$RECOVERY_FAILED_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
-  echo "RECOVERY_FAILED_RUN_ID contains unsupported characters" >&2
+if [[ "${1:-}" != "--apply" || "$#" != 1 ]]; then
+  echo "Explicit --apply is required. Steps: 80-75 -> 80-8 -> 80-9; RUN_DATE=20260914" >&2
   exit 2
 fi
-if [[ "$RUN_ID" == "$RECOVERY_FAILED_RUN_ID" ]]; then
-  echo "recovery managed RUN_ID must differ from the historical FAILED RUN_ID" >&2
-  exit 2
-fi
-
-mkdir -p "$ROOT/00_pipeline/01_result"
-
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
-}
-
-publish_current_step() {
-  local step="$1"
-  if [[ -n "${PIPELINE_CURRENT_STEP_FILE:-}" ]]; then
-    printf '%s\n' "$step" > "${PIPELINE_CURRENT_STEP_FILE}.tmp.$$"
-    mv "${PIPELINE_CURRENT_STEP_FILE}.tmp.$$" "$PIPELINE_CURRENT_STEP_FILE"
-  fi
-  if [[ -n "${PIPELINE_STATUS_WRITER:-}" ]]; then
-    python3 "$PIPELINE_STATUS_WRITER" --status RUNNING --current-step "$step"
-  fi
-}
-
+export RUN_DATE=20260914
+export RUN_ID="$RECOVERY_ID"
+STATE_DIR="$ROOT/00_pipeline/01_result/manual_recovery/$RECOVERY_ID"
+LOCK_FILE="$ROOT/00_pipeline/01_result/run_full_pipeline.lock"
+exec 9<>"$LOCK_FILE"
+/usr/bin/flock -n 9 || { echo "another pipeline run is active" >&2; exit 1; }
+mkdir -p "$ROOT/00_pipeline/01_result/manual_recovery"
+mkdir "$STATE_DIR" || { echo "recovery ID already used" >&2; exit 1; }
+# lock file is already locked; truncate through the inherited descriptor.
+: > "$LOCK_FILE"
+printf '%s\n' "$RECOVERY_ID" >&9
+# fd9は継承。各stepのread-only preflightでもowner/active runを再照合する。
+MANUAL_ARGS=(--manual-recovery-id "$RECOVERY_ID"
+  --manual-source-run-date "$RUN_DATE" --manual-source-run-id "$SOURCE_RUN_ID"
+  --manual-source-execution-arn "$RECOVERY_SOURCE_EXECUTION_ARN")
+log="$STATE_DIR/tail.log"
 run_step() {
-  local step="$1"
-  shift
-  publish_current_step "$step"
-  log "=== START $step ==="
-  local start_ts
-  local exit_code
-  local -a pipeline_status
-  start_ts=$(date +%s)
-  set +e
-  python3 "$@" 2>&1 | tee -a "$LOG"
-  pipeline_status=("${PIPESTATUS[@]}")
-  set -e
-  exit_code="${pipeline_status[0]}"
-  if [[ "$exit_code" -eq 0 && "${pipeline_status[1]}" -ne 0 ]]; then
-    exit_code="${pipeline_status[1]}"
-  fi
-  if [[ "$exit_code" -ne 0 ]]; then
-    log "=== FAILED $step (exit=$exit_code, elapsed=$(( $(date +%s) - start_ts ))s) ==="
-    exit "$exit_code"
-  fi
-  log "=== DONE $step (elapsed=$(( $(date +%s) - start_ts ))s) ==="
+  python3 "$@" 2>&1 | tee -a "$log"
 }
-
-log "########## tail recovery start ##########"
-log "RUN_DATE=$RUN_DATE / failed_run=$RECOVERY_FAILED_RUN_DATE/$RECOVERY_FAILED_RUN_ID"
-
-run_step \
-  "80-75_portal_s3_backup_rotation_preflight(recovery=$RECOVERY_FAILED_RUN_DATE/$RECOVERY_FAILED_RUN_ID)" \
-  "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
-  --dry-run \
-  --recovery-run-date "$RECOVERY_FAILED_RUN_DATE" \
-  --recovery-run-id "$RECOVERY_FAILED_RUN_ID"
-
-run_step \
-  "80-7_manage_09_result_retention(RUN_DATE=$RUN_DATE)" \
-  "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" \
-  --apply --run-date "$RUN_DATE"
-
-run_step \
-  "80-75_portal_s3_backup_rotation(recovery=$RECOVERY_FAILED_RUN_DATE/$RECOVERY_FAILED_RUN_ID)" \
-  "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
-  --recovery-run-date "$RECOVERY_FAILED_RUN_DATE" \
-  --recovery-run-id "$RECOVERY_FAILED_RUN_ID"
-
-run_step \
-  "80-8_portal_s3_prepare" \
-  "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py"
-
-run_step \
-  "80-9_portal_s3_sync" \
-  "$ROOT/80-9_portal_s3_sync/00_tool/portal_s3_sync.py"
-
-log "########## tail recovery end ##########"
+run_step "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
+  --step-dir "$STATE_DIR/80-75" \
+  --manual-recovery-receipt "$PREVIOUS_MANUAL_RECOVERY_RECEIPT" "${MANUAL_ARGS[@]}"
+run_step "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py" \
+  --step-dir "$STATE_DIR/80-8" --run-date "$RUN_DATE" --run-id "$RECOVERY_ID"
+run_step "$ROOT/80-9_portal_s3_sync/00_tool/portal_s3_sync.py" \
+  --step-dir "$STATE_DIR/80-9" --prepare-dir "$STATE_DIR/80-8" \
+  --run-date "$RUN_DATE" --run-id "$RECOVERY_ID" "${MANUAL_ARGS[@]}"

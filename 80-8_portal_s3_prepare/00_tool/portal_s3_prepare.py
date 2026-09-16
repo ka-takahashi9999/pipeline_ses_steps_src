@@ -11,6 +11,14 @@ Portal向けS3同期の対象fileを確定し、manifestを作成する。
 
 除外:
   80-7 / 80-75 / 80-8 / 80-9 自身の 01_result
+  */01_result/_batch_runtime/**
+  */01_result/_legacy_runtime/**
+  */01_result/_execution_context/**
+  07-1_requirement_skill_ai_matching/01_result/concurrent_checkpoints/**
+  99-1_multi_item_mail_lab/**
+  08-1_restore_and_merge_requirement_skill_ai_matching/01_result/bk_merged_*
+  03-2_extract_project_age/01_result/99_default_with_age_signal*
+  06-80_duplicate_proposal_check/01_result/bk_duplicate_proposal_check_diff_file.jsonl
   */01_result/.gitkeep
   */01_result/*.bak_*
   historical log（error_*.log / nohup*.log）
@@ -64,8 +72,26 @@ SELF_STEP_DIRS: Tuple[str, ...] = (
     "80-9_portal_s3_sync",
 )
 
+# Portal公開対象ではない検証専用step。01_result全体を除外する。
+NON_PUBLIC_STEP_DIRS: Tuple[str, ...] = ("99-1_multi_item_mail_lab",)
+
 EXCLUDE_BASENAMES: Tuple[str, ...] = (".gitkeep",)
 EXCLUDE_BASENAME_GLOBS: Tuple[str, ...] = ("*.bak_*",)
+
+# Pipeline内部の排他・再実行制御用であり、Portal公開成果物ではない。
+# os.walk の dirnames から除外し、配下を走査しない。
+INTERNAL_RUNTIME_DIRNAMES: Tuple[str, ...] = (
+    "_batch_runtime",
+    "_legacy_runtime",
+    "_execution_context",
+)
+
+# 特定step配下の内部実行成果物。os.walkのdirnamesから除外し、配下を公開しない。
+EXCLUDE_RESULT_DIRNAMES_BY_STEP: Dict[str, Dict[str, str]] = {
+    "07-1_requirement_skill_ai_matching": {
+        "concurrent_checkpoints": "concurrent_checkpoints",
+    },
+}
 
 # historical log の中央basename rule。
 # `.log` 拡張子に限定するため、error JSONL（99_error_*.jsonl / *_error_*.jsonl 等）や
@@ -95,6 +121,10 @@ SECRET_NAME_TOKENS: Tuple[str, ...] = (
     ".pfx",
 )
 
+UNKNOWN_PROVENANCE = "unknown"
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RUN_DATE_RE = re.compile(r"^\d{8}$")
+
 
 class PrepareError(Exception):
     """manifestを作らずに異常終了すべき状態。"""
@@ -120,7 +150,7 @@ def select_step_dirs(root: Path) -> List[str]:
             continue
         if not STEP_DIR_RE.match(entry.name):
             continue
-        if entry.name in SELF_STEP_DIRS:
+        if entry.name in SELF_STEP_DIRS or entry.name in NON_PUBLIC_STEP_DIRS:
             continue
         result_dir = entry / RESULT_DIR_NAME
         if not result_dir.is_dir() or result_dir.is_symlink():
@@ -131,6 +161,27 @@ def select_step_dirs(root: Path) -> List[str]:
 
 def is_excluded(relative_path: str, basename: str) -> str:
     """除外理由を返す。除外対象でなければ空文字を返す。"""
+    parts = relative_path.split("/")
+    if parts[0] in NON_PUBLIC_STEP_DIRS:
+        return "test_step"
+    if len(parts) >= 3:
+        step = parts[0]
+        result_child = parts[2]
+        if (
+            step == "08-1_restore_and_merge_requirement_skill_ai_matching"
+            and fnmatch.fnmatch(result_child, "bk_merged_*")
+        ):
+            return "backup"
+        if step == "03-2_extract_project_age" and fnmatch.fnmatch(
+            result_child, "99_default_with_age_signal*"
+        ):
+            return "confirm_helper"
+    if (
+        relative_path
+        == "06-80_duplicate_proposal_check/01_result/"
+        "bk_duplicate_proposal_check_diff_file.jsonl"
+    ):
+        return "duplicate_diff_backup"
     if relative_path in EXCLUDE_RELATIVE_PATHS:
         return "explicit_path"
     if basename in EXCLUDE_BASENAMES:
@@ -142,6 +193,51 @@ def is_excluded(relative_path: str, basename: str) -> str:
         if fnmatch.fnmatch(basename, pattern):
             return "historical_log"
     return ""
+
+
+def count_tree_files(path: Path) -> int:
+    """公開対象外tree内のregular file数を数える。走査失敗・symlinkはFAILする。"""
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(str(path), followlinks=False, onerror=walk_error):
+        current = Path(dirpath)
+        for name in sorted(dirnames):
+            child = current / name
+            if child.is_symlink():
+                raise PrepareError(f"公開対象外treeにsymlinkディレクトリがあります: {child}")
+        for name in sorted(filenames):
+            child = current / name
+            if child.is_symlink() or not child.is_file():
+                raise PrepareError(f"公開対象外treeにregular file以外があります: {child}")
+            count += 1
+    return count
+
+
+def resolve_provenance(args: argparse.Namespace) -> Dict[str, str]:
+    """CLI引数、環境変数、既定値の順にrun_date/run_idを解決する。"""
+    provenance: Dict[str, str] = {}
+    for key, cli_value, env_name, pattern in (
+        ("run_date", getattr(args, "run_date", None), "RUN_DATE", RUN_DATE_RE),
+        ("run_id", getattr(args, "run_id", None), "RUN_ID", RUN_ID_RE),
+    ):
+        env_value = os.environ.get(env_name)
+        if cli_value is not None and str(cli_value).strip():
+            raw = str(cli_value).strip()
+            source = "cli"
+        elif env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            source = "env"
+        else:
+            raw = ""
+            source = "default"
+        if not raw:
+            provenance[key] = UNKNOWN_PROVENANCE
+            provenance[f"{key}_source"] = source
+            continue
+        if not pattern.match(raw):
+            raise PrepareError(f"{env_name} の形式が不正です: {raw!r}")
+        provenance[key] = raw
+        provenance[f"{key}_source"] = source
+    return provenance
 
 
 def validate_relative_path(relative_path: str) -> None:
@@ -171,7 +267,18 @@ def collect_entries(root: Path, step_dirs: List[str], logger) -> Tuple[List[Dict
         "bak": 0,
         "explicit_path": 0,
         "historical_log": 0,
+        "internal_runtime": 0,
+        "concurrent_checkpoints": 0,
+        "test_step": 0,
+        "backup": 0,
+        "confirm_helper": 0,
+        "duplicate_diff_backup": 0,
     }
+
+    for step in NON_PUBLIC_STEP_DIRS:
+        result_dir = root / step / RESULT_DIR_NAME
+        if result_dir.is_dir() and not result_dir.is_symlink():
+            excluded_counts["test_step"] += count_tree_files(result_dir)
 
     for step in step_dirs:
         result_dir = root / step / RESULT_DIR_NAME
@@ -179,6 +286,14 @@ def collect_entries(root: Path, step_dirs: List[str], logger) -> Tuple[List[Dict
             str(result_dir), followlinks=False, onerror=walk_error
         ):
             current = Path(dirpath)
+            if current == result_dir:
+                excluded_dir_reasons = {
+                    name: "internal_runtime" for name in INTERNAL_RUNTIME_DIRNAMES
+                }
+                excluded_dir_reasons.update(EXCLUDE_RESULT_DIRNAMES_BY_STEP.get(step, {}))
+                for name in sorted(set(dirnames) & set(excluded_dir_reasons)):
+                    excluded_counts[excluded_dir_reasons[name]] += count_tree_files(current / name)
+                dirnames[:] = [name for name in dirnames if name not in excluded_dir_reasons]
             for name in sorted(dirnames):
                 if (current / name).is_symlink():
                     raise PrepareError(f"symlinkディレクトリを検出しました: {current / name}")
@@ -250,6 +365,8 @@ def parse_args() -> argparse.Namespace:
         default=str(STEP_DIR),
         help="出力先stepディレクトリ（focused test用）",
     )
+    parser.add_argument("--run-date", default=None, help="RUN_DATE（既定は環境変数RUN_DATE）")
+    parser.add_argument("--run-id", default=None, help="RUN_ID（既定は環境変数RUN_ID）")
     return parser.parse_args()
 
 
@@ -257,6 +374,8 @@ def run(args: argparse.Namespace, logger) -> Tuple[Dict[str, Any], List[Dict[str
     root = Path(args.pipeline_root).resolve()
     if not root.is_dir():
         raise PrepareError(f"pipeline rootが存在しません: {root}")
+
+    provenance = resolve_provenance(args)
 
     step_dirs = select_step_dirs(root)
     if not step_dirs:
@@ -275,12 +394,17 @@ def run(args: argparse.Namespace, logger) -> Tuple[Dict[str, Any], List[Dict[str
     summary = {
         "step": STEP_NAME,
         "executed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "run_date": provenance["run_date"],
+        "run_date_source": provenance["run_date_source"],
+        "run_id": provenance["run_id"],
+        "run_id_source": provenance["run_id_source"],
         "pipeline_root": str(root),
         "selected_step_dirs": step_dirs,
         "selected_step_dir_count": len(step_dirs),
         "file_count": len(entries),
         "total_bytes": total_bytes,
         "excluded_counts": excluded_counts,
+        "excluded_step_dirs": list(NON_PUBLIC_STEP_DIRS),
         "excluded_relative_paths": list(EXCLUDE_RELATIVE_PATHS),
         "excluded_basename_globs": list(EXCLUDE_BASENAME_GLOBS),
         "excluded_log_basename_globs": list(EXCLUDE_LOG_BASENAME_GLOBS),
