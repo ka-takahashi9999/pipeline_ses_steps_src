@@ -1010,14 +1010,43 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
     optional: List[str] = []
     state = STATE_NONE
     pseudo_parent_header = ''
+    consumed_until = -1
 
-    for raw_line in lines:
+    for line_index, raw_line in enumerate(lines):
+        if line_index <= consumed_until:
+            continue
         if state == STATE_DONE:
             break
 
         line = raw_line.strip()
         if not line:
             continue
+
+        # 必須の選択条件直下にある○子行だけを、親の工程文脈と一体で保持する。
+        # 通常bulletや尚可の抽出規則には○を追加しない。
+        parent = _strip_bullet(line)
+        context = _extract_pseudo_parent_context(parent)
+        if (state == STATE_REQUIRED and context
+                and re.match(r'^(?:以下|下記|次の)(?:の)?いずれかの', parent)):
+            children = []
+            child_index = line_index + 1
+            while child_index < len(lines):
+                child_line = lines[child_index].strip()
+                if not child_line.startswith('○'):
+                    break
+                child = child_line[1:].strip()
+                if (not child or _classify_line(child)[0] != 'content'
+                        or _is_section_stop(child)
+                        or _REJECT_CONTENT_RE.search(child)
+                        or _is_non_skill_explanatory_line(child)):
+                    break
+                children.append(child)
+                child_index += 1
+            if children:
+                required.append(f"({'、または'.join(children)})の{context}")
+                consumed_until = child_index - 1
+                pseudo_parent_header = ''
+                continue
 
         kind, inline = _classify_line(line)
 
