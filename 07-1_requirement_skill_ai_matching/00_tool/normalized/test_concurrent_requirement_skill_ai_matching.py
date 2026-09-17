@@ -445,6 +445,106 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
         self.assertEqual(checkpoint["status"], "success")
         self.assertTrue(captured["use_bounded_retry_backoff"])
 
+    def test_http_200_invalid_schema_is_pair_error_not_api_failure(self):
+        def fake_call(**kwargs):
+            kwargs["response_observer"]({
+                "attempt": 1, "status_code": 200, "success": True,
+                "error_type": "", "rate_limit_headers": {},
+            })
+            response = success_response(kwargs)
+            response["required_skills"][0]["skill"] = "変更されたskill"
+            return response
+
+        with patch.object(target, "call_llm", side_effect=fake_call):
+            checkpoint = target._concurrent_worker(
+                self.items[0], self.projects, self.skillsheets, Logger(), 1
+            )
+        self.assertEqual(checkpoint["status"], "error")
+        self.assertIsNone(checkpoint["result"])
+        self.assertEqual(checkpoint["error"]["error_type"], "invalid_output_schema")
+        self.assertFalse(checkpoint["telemetry"]["api_failure"])
+        self.assertEqual(checkpoint["telemetry"]["attempts"][0]["status_code"], 200)
+        controller = target.AdaptiveConcurrency(2, 4)
+        controller.observe(checkpoint)
+        self.assertEqual(controller.current, 2)
+
+    def test_worker_error_does_not_stop_or_block_same_project_followers(self):
+        called = []
+
+        def worker(item, *_args):
+            called.append(item["request_identity"])
+            if item["ordinal"] == 0:
+                raise RuntimeError("individual worker failure")
+            return success_checkpoint(item)
+
+        with patch.object(target, "_concurrent_worker", side_effect=worker):
+            checkpoints, _, stopped = target.run_concurrent_scheduler(
+                self.items, self.projects, self.skillsheets, Logger(), self.checkpoint
+            )
+        self.assertFalse(stopped)
+        self.assertEqual(len(called), len(self.items))
+        self.assertEqual(len(checkpoints), len(self.items))
+        first = next(row for row in checkpoints if row["ordinal"] == 0)
+        self.assertEqual(first["status"], "error")
+        self.assertEqual(first["error"]["error_type"], "llm_call_error")
+        self.assertTrue(first["telemetry"]["api_failure"])
+        self.assertIn(self.items[1]["request_identity"], called)
+
+    def test_legacy_validation_error_checkpoint_does_not_block_resume(self):
+        leader = self.items[0]
+        follower = self.items[1]
+        old_error = success_checkpoint(leader)
+        old_error["status"] = "error"
+        old_error["result"] = None
+        old_error["error"] = target._make_error(
+            leader["project_message_id"], leader["resource_message_id"],
+            "invalid_output_schema", "skill changed",
+        )
+        old_error["telemetry"]["api_failure"] = True
+        called = []
+
+        def worker(item, *_args):
+            called.append(item["request_identity"])
+            return success_checkpoint(item)
+
+        with patch.object(target, "_concurrent_worker", side_effect=worker):
+            checkpoints, _, stopped = target.run_concurrent_scheduler(
+                [leader, follower], self.projects, self.skillsheets, Logger(),
+                self.checkpoint, [old_error],
+            )
+        self.assertFalse(stopped)
+        self.assertEqual(called, [follower["request_identity"]])
+        self.assertEqual(len(checkpoints), 2)
+
+    def test_retry_limit_still_stops_scheduler(self):
+        def worker(item, *_args):
+            checkpoint = success_checkpoint(item)
+            checkpoint["telemetry"]["retry_count"] = 3
+            return checkpoint
+
+        with patch.object(target, "_concurrent_worker", side_effect=worker):
+            checkpoints, _, stopped = target.run_concurrent_scheduler(
+                self.items, self.projects, self.skillsheets, Logger(), self.checkpoint
+            )
+        self.assertTrue(stopped)
+        self.assertLess(len(checkpoints), len(self.items))
+
+    def test_api_failure_checkpoint_still_blocks_resume(self):
+        item = self.items[0]
+        failed = success_checkpoint(item)
+        failed["status"] = "error"
+        failed["result"] = None
+        failed["error"] = target._make_error(
+            item["project_message_id"], item["resource_message_id"],
+            "llm_call_error", "API request failed",
+        )
+        failed["telemetry"]["api_failure"] = True
+        with self.assertRaisesRegex(ValueError, "API error checkpoint"):
+            target.run_concurrent_scheduler(
+                [item], self.projects, self.skillsheets, Logger(),
+                self.checkpoint, [failed],
+            )
+
     def test_scheduler_never_writes_canonical_output(self):
         result_path = Path(self.temporary.name) / "canonical.jsonl"
         result_path.write_text("sentinel\n", encoding="utf-8")
@@ -463,6 +563,108 @@ class SchedulerAndCheckpointTest(unittest.TestCase):
                 self.checkpoint,
             )
         self.assertEqual(result_path.read_text(encoding="utf-8"), "sentinel\n")
+
+
+class ConcurrentOutputTest(unittest.TestCase):
+    def run_isolated_main(self, invalid_leader):
+        pairs, projects, skillsheets = fixture_inputs(2, 3)
+        with tempfile.TemporaryDirectory(prefix="07_1_pair_error_") as temporary:
+            root = Path(temporary)
+            result_dir = root / "01_result"
+            pair_path = root / "pairs.jsonl"
+            project_path = root / "projects.jsonl"
+            skillsheet_path = root / "skillsheets.jsonl"
+            result_path = result_dir / "requirement_skill_ai_matching.jsonl"
+            error_path = result_dir / "99_error_requirement_skill_ai_matching.jsonl"
+            metadata_path = result_dir / "run_metadata.json"
+            checkpoint_path = result_dir / "concurrent_checkpoints/fixture/checkpoint.jsonl"
+            confirm_path = root / "02_confirm/confirm_result.txt"
+            target.write_jsonl(str(pair_path), pairs)
+            target.write_jsonl(str(project_path), list(projects.values()))
+            target.write_jsonl(str(skillsheet_path), list(skillsheets.values()))
+
+            def fake_llm(**kwargs):
+                kwargs["response_observer"]({
+                    "attempt": 1, "status_code": 200, "success": True,
+                    "error_type": "", "rate_limit_headers": {
+                        "x-ratelimit-remaining-requests": "1000",
+                        "x-ratelimit-remaining-tokens": "1000000",
+                    },
+                })
+                response = success_response(kwargs)
+                if invalid_leader and "resource-0-0" in kwargs["user_prompt"]:
+                    response["required_skills"][0]["skill"] = "変更されたskill"
+                return response
+
+            with patch.object(target, "STEP_DIR", root), patch.object(
+                target, "INPUT_PAIRS", pair_path
+            ), patch.object(target, "INPUT_PROJECT_SKILLS", project_path), patch.object(
+                target, "INPUT_SKILLSHEETS", skillsheet_path
+            ), patch.object(target, "OUTPUT_RESULT", result_path), patch.object(
+                target, "OUTPUT_ERROR", error_path
+            ), patch.object(target, "OUTPUT_RUN_METADATA", metadata_path), patch.object(
+                target, "OUTPUT_RETENTION_SIDECAR", result_dir / "retention.jsonl"
+            ), patch.object(
+                target, "CONCURRENT_CHECKPOINT_ROOT", result_dir / "concurrent_checkpoints"
+            ), patch.object(target, "ENABLE_07_1_CONCURRENT", True), patch.object(
+                target, "cache_hit_results_for_run", return_value=[]
+            ), patch.object(target, "call_llm", side_effect=fake_llm), patch.object(
+                target, "get_logger", return_value=Logger()
+            ), patch.object(sys, "argv", ["requirement_skill_ai_matching.py", "--concurrent-run-id", "fixture"]):
+                self.assertIsNone(target.main())  # process-equivalent exit code 0
+
+            results = list(target.read_jsonl(str(result_path)))
+            errors = list(target.read_jsonl(str(error_path)))
+            checkpoints = list(target.read_jsonl(str(checkpoint_path)))
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(checkpoints), 6)
+            self.assertEqual(metadata["input_count"], 6)
+            self.assertEqual(metadata["processed_count"], 6)
+            self.assertGreaterEqual(metadata["peak_concurrency"], 2)
+            self.assertEqual(len(results) + len(errors), 6)
+            self.assertEqual(
+                target.collect_concurrent_checkpoints(
+                    list(target.read_jsonl(str(result_dir / "concurrent_checkpoints/fixture/manifest.jsonl"))),
+                    checkpoints,
+                )["missing"], []
+            )
+            if invalid_leader:
+                self.assertEqual((len(results), len(errors)), (5, 1))
+                self.assertEqual(errors[0]["error_type"], "invalid_output_schema")
+                self.assertEqual(errors[0]["resource_info"]["message_id"], "resource-0-0")
+                self.assertTrue(any(
+                    row["resource_info"]["message_id"] == "resource-0-1"
+                    for row in results
+                ))
+                leader = next(row for row in checkpoints if row["ordinal"] == 0)
+                self.assertEqual(leader["status"], "error")
+                self.assertFalse(leader["telemetry"]["api_failure"])
+            else:
+                self.assertEqual((len(results), len(errors)), (6, 0))
+                self.assertTrue(all(row["status"] == "success" for row in checkpoints))
+
+            confirm_script = STEP_DIR / "02_confirm/confirm_requirement_skill_ai_matching.py"
+            spec = importlib.util.spec_from_file_location("isolated_07_1_confirm", confirm_script)
+            confirm = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(confirm)
+            with patch.object(confirm, "INPUT_PAIRS", pair_path), patch.object(
+                confirm, "INPUT_PROJECT_SKILLS", project_path
+            ), patch.object(confirm, "OUTPUT_RESULT", result_path), patch.object(
+                confirm, "OUTPUT_ERROR", error_path
+            ), patch.object(confirm, "RUN_METADATA", metadata_path), patch.object(
+                confirm, "CONFIRM_RESULT", confirm_path
+            ), patch.object(confirm, "get_logger", return_value=Logger()):
+                confirm.main()
+            confirm_text = confirm_path.read_text(encoding="utf-8")
+            self.assertIn("【結果】OK", confirm_text)
+            if invalid_leader:
+                self.assertIn("invalid_output_schema: 1件", confirm_text)
+
+    def test_validation_error_continues_and_exits_zero(self):
+        self.run_isolated_main(invalid_leader=True)
+
+    def test_all_success_concurrent_output_unchanged(self):
+        self.run_isolated_main(invalid_leader=False)
 
 
 class RetentionProductionRegressionTest(unittest.TestCase):

@@ -655,9 +655,12 @@ class AdaptiveConcurrency:
             self.success_streak = 0
             self.current = max(1, self.current - 1)
             return
-        if telemetry.get("api_failure") or checkpoint.get("status") != "success":
+        if telemetry.get("api_failure"):
             self.success_streak = 0
             self.current = max(1, self.current - 1)
+            return
+        if checkpoint.get("status") != "success":
+            self.success_streak = 0
             return
         if float(telemetry.get("latency_seconds", 0.0)) > 45.0:
             self.success_streak = 0
@@ -738,7 +741,10 @@ def _concurrent_worker(
             "rate_limit_429_count": sum(
                 attempt.get("status_code") == 429 for attempt in attempts
             ),
-            "api_failure": status != "success",
+            "api_failure": (
+                status != "success"
+                and (error or {}).get("error_type") != "invalid_output_schema"
+            ),
             "rate_limit_headers": final_headers,
             "request_body_mismatch": request_body_mismatch,
         },
@@ -904,7 +910,9 @@ def run_concurrent_scheduler(
     )
     completed: Dict[str, Dict[str, Any]] = dict(resume_state["seen"])
     if any(
-        row.get("api_request") is True and row.get("status") != "success"
+        row.get("api_request") is True
+        and row.get("telemetry", {}).get("api_failure")
+        and (row.get("error") or {}).get("error_type") != "invalid_output_schema"
         for row in completed.values()
     ):
         raise ValueError("API error checkpointを含むrunは安全のためresumeしません")
@@ -1009,7 +1017,7 @@ def run_concurrent_scheduler(
                 completed[checkpoint["request_identity"]] = checkpoint
                 controller.observe(checkpoint)
                 project_mid = item["project_message_id"]
-                if item["is_project_warm_one"] and checkpoint["status"] == "success":
+                if item["is_project_warm_one"]:
                     warmed.add(project_mid)
                     ready.extend(followers[project_mid])
                     followers[project_mid].clear()
@@ -1018,9 +1026,7 @@ def run_concurrent_scheduler(
                     for row in completed.values()
                 )
                 retry_limit = max(3, int(math.ceil(len(items) * 0.10)))
-                if checkpoint["status"] != "success":
-                    stopped = True
-                elif total_retries >= retry_limit:
+                if total_retries >= retry_limit:
                     stopped = True
 
     return list(completed.values()), controller, stopped

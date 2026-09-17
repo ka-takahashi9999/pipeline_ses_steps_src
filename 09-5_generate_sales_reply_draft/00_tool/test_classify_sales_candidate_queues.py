@@ -1,15 +1,21 @@
 """09-5 pair queue分類のfocused test。"""
 
 import copy
+import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 TOOL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOL_DIR))
 
+import classify_sales_candidate_queues as target
 from classify_sales_candidate_queues import (
     classify_candidate_pairs,
+    generate_candidate_queues,
     has_explicit_review_reason,
 )
 
@@ -490,6 +496,89 @@ class SalesCandidateQueueClassifierTest(unittest.TestCase):
         self.assertEqual([], proposal)
         self.assertTrue(human[0]["previous_candidate"])
         self.assertEqual("20260819", human[0]["previous_candidate_date"])
+
+    def test_empty_subject_candidate_uses_common_identity_and_continues(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_dir = root / "candidates"
+            result_dir = root / "01_result"
+            candidate_dir.mkdir()
+            result_dir.mkdir()
+            current = candidate()
+            current.update({
+                "project_from": "p@example.com",
+                "project_subject": "案件",
+                "resource_from": "r@example.com",
+                "resource_subject": "",
+                "pair_file_name": "project-1_resource-1_前回出力済.json",
+            })
+            previous = dict(current)
+            paths_and_rows = (
+                (candidate_dir / "sales_proposal_candidates_20260915.jsonl", [previous]),
+                (candidate_dir / "sales_proposal_candidates_20260916.jsonl", [current]),
+                (result_dir / "generate_sales_reply_draft_20260916.jsonl", both_drafts()),
+                (root / "recheck.jsonl", [recheck()]),
+            )
+            for path, rows in paths_and_rows:
+                path.write_text(
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+
+            class CaptureLogger:
+                def __init__(self):
+                    self.warnings = []
+                    self.infos = []
+                def warn(self, message):
+                    self.warnings.append(message)
+                def info(self, message):
+                    self.infos.append(message)
+                def ok(self, _message):
+                    pass
+                def error(self, _message):
+                    pass
+
+            logger = CaptureLogger()
+            with patch.object(target, "INPUT_09_4_DIR", candidate_dir), \
+                 patch.object(target, "STEP_DIR", root), \
+                 patch.object(target, "RECHECK_ALL_PATH", root / "recheck.jsonl"), \
+                 patch.object(target, "RECHECK_ERROR_PATH", root / "no_errors.jsonl"), \
+                 patch.object(target, "get_logger", return_value=logger):
+                summary = generate_candidate_queues("20260916")
+            proposal = [
+                json.loads(line)
+                for line in (result_dir / "proposal_ready_20260916.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(summary["subject_fallback_count"], 2)
+            self.assertEqual(summary["proposal_ready"], 1)
+            self.assertTrue(proposal[0]["previous_candidate"])
+            self.assertEqual(current["resource_subject"], "")
+            self.assertEqual(previous["resource_subject"], "")
+            self.assertEqual(len(logger.warnings), 2)
+            self.assertTrue(all("side=resource" in message and "resource-1" in message for message in logger.warnings))
+            self.assertTrue(any("fallback件数=2 project=0 resource=2" in message for message in logger.infos))
+
+            confirm_path = TOOL_DIR.parents[0] / "02_confirm/confirm_sales_candidate_queues.py"
+            spec = importlib.util.spec_from_file_location("isolated_09_5_confirm", confirm_path)
+            confirm = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(confirm)
+            result_path = root / "confirm_result.txt"
+            with patch.object(confirm, "INPUT_09_4_DIR", candidate_dir), \
+                 patch.object(confirm, "STEP_DIR", root), \
+                 patch.object(confirm, "RECHECK_ALL_PATH", root / "recheck.jsonl"), \
+                 patch.object(confirm, "RECHECK_ERROR_PATH", root / "no_errors.jsonl"), \
+                 patch.object(confirm, "CONFIRM_RESULT", result_path), \
+                 patch.object(confirm, "get_logger", return_value=logger), \
+                 patch.object(sys, "argv", ["confirm_sales_candidate_queues.py", "--target-date", "20260916"]):
+                try:
+                    self.assertIsNone(confirm.main())
+                except SystemExit:
+                    failed_lines = [
+                        line for line in result_path.read_text(encoding="utf-8").splitlines()
+                        if "[NG]" in line
+                    ]
+                    self.fail("isolated confirm NG: " + " / ".join(failed_lines))
+            self.assertIn("【結果】OK", result_path.read_text(encoding="utf-8"))
 
     def test_success_cache_marker_pair_file_name_is_preserved(self):
         marked = candidate()

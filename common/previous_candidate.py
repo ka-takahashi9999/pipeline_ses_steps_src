@@ -14,6 +14,7 @@ PREVIOUS_CANDIDATE_DATE_FIELD = "previous_candidate_date"
 CANDIDATE_FILE_PATTERN = re.compile(r"^sales_proposal_candidates_(\d{8})\.jsonl$")
 
 CandidateIdentity = Tuple[str, str, str, str]
+SubjectFallback = Tuple[str, str, str, str]  # side, message_id, project_id, resource_id
 
 
 class PreviousCandidateError(ValueError):
@@ -47,18 +48,51 @@ def _require_complete_identity(identity: CandidateIdentity, label: str) -> Candi
     return identity
 
 
-def candidate_identity(record: Dict[str, Any]) -> CandidateIdentity:
+def _subject_identity(
+    value: Any,
+    message_id: str,
+    side: str,
+    project_id: str,
+    resource_id: str,
+    fallbacks: Optional[List[SubjectFallback]],
+) -> str:
+    subject = _normalize_text(value)
+    if subject:
+        return subject
+    if not message_id:
+        raise PreviousCandidateError(f"{side}_subjectが空でmessage_idもありません")
+    if fallbacks is not None:
+        fallbacks.append((side, message_id, project_id, resource_id))
+    return f"gmail_mid:{message_id}"
+
+
+def candidate_identity(
+    record: Dict[str, Any],
+    fallbacks: Optional[List[SubjectFallback]] = None,
+) -> CandidateIdentity:
     """09-4 final candidateからfrom+subjectの4-field identityを作る。"""
+    project_id = _normalize_text(record.get("project_message_id"))
+    resource_id = _normalize_text(record.get("resource_message_id"))
     identity = (
         _normalize_from(record.get("project_from") or record.get("project_sender_email")),
-        _normalize_text(record.get("project_subject")),
+        _subject_identity(
+            record.get("project_subject"), project_id, "project",
+            project_id, resource_id, fallbacks,
+        ),
         _normalize_from(record.get("resource_from") or record.get("resource_sender_email")),
-        _normalize_text(record.get("resource_subject")),
+        _subject_identity(
+            record.get("resource_subject"), resource_id, "resource",
+            project_id, resource_id, fallbacks,
+        ),
     )
     return _require_complete_identity(identity, "final candidate")
 
 
-def pair_identity(pair: Dict[str, Any], mail_master: Dict[str, Dict[str, Any]]) -> CandidateIdentity:
+def pair_identity(
+    pair: Dict[str, Any],
+    mail_master: Dict[str, Dict[str, Any]],
+    fallbacks: Optional[List[SubjectFallback]] = None,
+) -> CandidateIdentity:
     """09-1 pairとmail masterからfinal candidate互換の4-field identityを作る。"""
     project_id = _normalize_text((pair.get("project_info") or {}).get("message_id"))
     resource_id = _normalize_text((pair.get("resource_info") or {}).get("message_id"))
@@ -73,9 +107,15 @@ def pair_identity(pair: Dict[str, Any], mail_master: Dict[str, Dict[str, Any]]) 
         )
     identity = (
         _normalize_from(project_mail.get("from")),
-        _normalize_text(project_mail.get("subject")),
+        _subject_identity(
+            project_mail.get("subject"), project_id, "project",
+            project_id, resource_id, fallbacks,
+        ),
         _normalize_from(resource_mail.get("from")),
-        _normalize_text(resource_mail.get("subject")),
+        _subject_identity(
+            resource_mail.get("subject"), resource_id, "resource",
+            project_id, resource_id, fallbacks,
+        ),
     )
     return _require_complete_identity(identity, "09-1 pair")
 
@@ -99,21 +139,27 @@ def resolve_previous_candidate_path(
     return previous_path, previous_date
 
 
-def build_previous_identity_set(records: Iterable[Dict[str, Any]]) -> Set[CandidateIdentity]:
-    return {candidate_identity(record) for record in records}
+def build_previous_identity_set(
+    records: Iterable[Dict[str, Any]],
+    fallbacks: Optional[List[SubjectFallback]] = None,
+) -> Set[CandidateIdentity]:
+    return {candidate_identity(record, fallbacks) for record in records}
 
 
 def mark_candidate_records(
     current_records: Iterable[Dict[str, Any]],
     previous_records: Iterable[Dict[str, Any]],
     previous_date: str,
+    fallbacks: Optional[List[SubjectFallback]] = None,
 ) -> List[Dict[str, Any]]:
     """入力順・件数を変えずに営業向けprevious candidate fieldを加える。"""
-    previous_identities = build_previous_identity_set(previous_records)
+    previous_identities = build_previous_identity_set(previous_records, fallbacks)
     marked: List[Dict[str, Any]] = []
     for record in current_records:
         output = dict(record)
-        output[PREVIOUS_CANDIDATE_FIELD] = candidate_identity(record) in previous_identities
+        output[PREVIOUS_CANDIDATE_FIELD] = (
+            candidate_identity(record, fallbacks) in previous_identities
+        )
         output[PREVIOUS_CANDIDATE_DATE_FIELD] = previous_date
         marked.append(output)
     return marked
@@ -123,9 +169,13 @@ def load_and_mark_candidate_records(
     current_records: Iterable[Dict[str, Any]],
     candidate_dir: Path,
     current_date: str,
+    fallbacks: Optional[List[SubjectFallback]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     previous_path, previous_date = resolve_previous_candidate_path(candidate_dir, current_date)
     previous_records = (
         read_jsonl_as_list(str(previous_path)) if previous_path is not None else []
     )
-    return mark_candidate_records(current_records, previous_records, previous_date), previous_date
+    return (
+        mark_candidate_records(current_records, previous_records, previous_date, fallbacks),
+        previous_date,
+    )

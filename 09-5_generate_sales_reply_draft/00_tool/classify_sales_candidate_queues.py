@@ -497,11 +497,26 @@ def resolve_paths(date_part: str) -> Tuple[Path, Path, Path, Path]:
     return candidate_path, draft_path, proposal_path, human_path
 
 
-def generate_candidate_queues(date_part: str) -> Dict[str, Any]:
+def generate_candidate_queues(date_part: str, logger: Any = None) -> Dict[str, Any]:
+    logger = logger or get_logger(STEP_NAME)
     candidate_path, draft_path, proposal_path, human_path = resolve_paths(date_part)
     candidates = read_jsonl_as_list(str(candidate_path))
+    subject_fallbacks = []
     candidates, previous_date = load_and_mark_candidate_records(
-        candidates, INPUT_09_4_DIR, date_part
+        candidates, INPUT_09_4_DIR, date_part, subject_fallbacks
+    )
+    for side, message_id, project_id, resource_id in subject_fallbacks:
+        logger.warn(
+            "Subject identity fallback: side={} message_id={} pair={} / {}".format(
+                side, message_id, project_id, resource_id
+            )
+        )
+    logger.info(
+        "Subject identity fallback件数={} project={} resource={}".format(
+            len(subject_fallbacks),
+            sum(side == "project" for side, *_ in subject_fallbacks),
+            sum(side == "resource" for side, *_ in subject_fallbacks),
+        )
     )
     drafts = read_jsonl_as_list(str(draft_path))
     rechecks = read_jsonl_as_list(str(RECHECK_ALL_PATH))
@@ -528,6 +543,7 @@ def generate_candidate_queues(date_part: str) -> Dict[str, Any]:
             record[PREVIOUS_CANDIDATE_FIELD] for record in all_queues
         ),
         "previous_candidate_date": previous_date,
+        "subject_fallback_count": len(subject_fallbacks),
     }
 
 
@@ -541,7 +557,7 @@ def main() -> None:
     logger = get_logger(STEP_NAME)
     args = parse_args()
     try:
-        summary = generate_candidate_queues(args.target_date)
+        summary = generate_candidate_queues(args.target_date, logger)
         logger.ok(
             "queue分類完了: "
             f"final={summary['final_candidates']} "
@@ -554,6 +570,7 @@ def main() -> None:
             f"OTHER={summary['review_priority_other']} "
             f"initial_review={summary['initial_review']} "
             f"previous_candidate={summary['previous_candidate']} "
+            f"subject_fallback={summary['subject_fallback_count']} "
             f"comparison_date={summary['previous_candidate_date'] or 'none'}"
         )
     except Exception as error:

@@ -34,6 +34,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict, List, Tuple
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -42,6 +43,7 @@ from common.success_cache import (  # noqa: E402
     SuccessCacheError,
     build_cache_entry,
     build_comparison_key,
+    comparison_key_from_dict,
     load_success_cache,
     upsert_success_cache,
 )
@@ -51,6 +53,12 @@ MERGE_TOOL = (
     PROJECT_ROOT
     / "08-1_restore_and_merge_requirement_skill_ai_matching/00_tool"
     / "restore_and_merge_requirement_skill_ai_matching.py"
+)
+CONFIRM_DUP_TOOL = PROJECT_ROOT / "06-80_duplicate_proposal_check/02_confirm/confirm_duplicate_proposal_check.py"
+CONFIRM_MERGE_TOOL = (
+    PROJECT_ROOT
+    / "08-1_restore_and_merge_requirement_skill_ai_matching/02_confirm"
+    / "confirm_restore_and_merge_requirement_skill_ai_matching.py"
 )
 
 
@@ -63,6 +71,8 @@ def load_module(name: str, path: Path):
 
 dup_mod = load_module("dup_tool_under_test", DUP_TOOL)
 merge_mod = load_module("merge_tool_under_test", MERGE_TOOL)
+confirm_dup_mod = load_module("confirm_dup_under_test", CONFIRM_DUP_TOOL)
+confirm_merge_mod = load_module("confirm_merge_under_test", CONFIRM_MERGE_TOOL)
 
 
 def write_jsonl(path: Path, records: List[dict]) -> None:
@@ -161,6 +171,24 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         merge_mod.OUTPUT_RESTORED = self.restored_file
         merge_mod.OUTPUT_ERROR = self.error_file
         merge_mod.DIAGNOSTICS_OUTPUT = self.merge_dir / "02_confirm/diagnostics.txt"
+
+        confirm_dup_mod.INPUT_PAIRS = self.pairs_file
+        confirm_dup_mod.OUTPUT_NEW = self.new_file
+        confirm_dup_mod.OUTPUT_DUPLICATE = self.duplicate_file
+        confirm_dup_mod.OUTPUT_DIFF_FILE = self.diff_file
+        confirm_dup_mod.OUTPUT_BK_DIFF_FILE = self.bk_diff_file
+        confirm_dup_mod.SUCCESS_CACHE_FILE = self.cache_file
+        confirm_dup_mod.CONFIRM_RESULT = self.dup_dir / "02_confirm/confirm_result.txt"
+
+        confirm_merge_mod.INPUT_NEW_PAIRS = self.new_file
+        confirm_merge_mod.INPUT_DUPLICATE_PAIRS = self.duplicate_file
+        confirm_merge_mod.INPUT_DIFF_FILE = self.diff_file
+        confirm_merge_mod.INPUT_NEW_AI_RESULT = self.ai_result_file
+        confirm_merge_mod.OUTPUT_RESTORED = self.restored_file
+        confirm_merge_mod.OUTPUT_MERGED = self.merged_file
+        confirm_merge_mod.OUTPUT_ERROR = self.error_file
+        confirm_merge_mod.SUCCESS_CACHE_FILE = self.cache_file
+        confirm_merge_mod.CONFIRM_RESULT = self.merge_dir / "02_confirm/confirm_result.txt"
 
     def tearDown(self) -> None:
         logging.disable(logging.NOTSET)
@@ -433,8 +461,13 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         self.assertEqual(merged_keys | error_keys, set(diff_key_map.values()))
 
 
-    def test_9_empty_comparison_key_fails_fast_in_06_80(self):
-        """A. comparison_keyの1項目が空 → 06-80でfail-fast / 07-1入力へ入らない"""
+    def test_9_empty_resource_subject_uses_message_id_and_reaches_08_1(self):
+        """空Subjectは元値を保持し、06-80のMISSと08-1のupsertで同じキーを使う。"""
+        normal_key = build_comparison_key("p0@x.com", "案件0", "r0@y.com", "要員0")
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(normal_key, "OLD_P", "OLD_R", skills("cached"), [], {})],
+        )
         self.setup_inputs(
             [
                 mail("P0", "p0@x.com", "案件0"),
@@ -444,30 +477,74 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
             ],
             [pair("P0", "R0"), pair("P1", "R1")],
         )
-
-        with self.assertRaises(SystemExit) as ctx:
+        with patch.object(dup_mod, "get_logger") as get_logger:
             self.run_06_80()
-        self.assertEqual(ctx.exception.code, 1)
+        warning_text = "\n".join(str(call) for call in get_logger.return_value.warn.call_args_list)
+        self.assertIn("project=0 resource=1 ペア=1", warning_text)
 
-        # 07-1入力（新規出力）も diff_file も書き進めない
-        self.assertFalse(self.new_file.exists())
-        self.assertFalse(self.duplicate_file.exists())
-        self.assertFalse(self.diff_file.exists())
+        diff = read_jsonl(self.diff_file)
+        self.assertEqual(len(diff), 2)
+        self.assertEqual(diff[0]["comparison_key"], {
+            "project_from": "p0@x.com", "project_subject": "案件0",
+            "resource_from": "r0@y.com", "resource_subject": "要員0",
+        })
+        self.assertEqual(diff[1]["resource_info"]["subject"], "")
+        fallback_key = build_comparison_key("p1@x.com", "案件1", "r1@y.com", "gmail_mid:R1")
+        self.assertEqual(comparison_key_from_dict(diff[1]["comparison_key"]), fallback_key)
+        self.assertEqual(len(read_jsonl(self.duplicate_file)), 1)
+        self.assertEqual(len(read_jsonl(self.new_file)), 1)
+        self.assertEqual(message_key(read_jsonl(self.new_file)[0]), ("P1", "R1"))
+        self.assertEqual(len(diff), len(read_jsonl(self.duplicate_file)) + len(read_jsonl(self.new_file)))
+        confirm_dup_mod.main()
+        self.assertIn("【結果】OK", confirm_dup_mod.CONFIRM_RESULT.read_text(encoding="utf-8"))
 
-        # ロジック単体: 空keyは同一identity扱いしない
-        self.assertFalse(
-            dup_mod.is_complete_comparison_key(build_comparison_key("p", "s", "r", ""))
+        self.simulate_07_1("new")
+        self.run_08_1()
+        confirm_merge_mod.main()
+        self.assertIn("【結果】OK", confirm_merge_mod.CONFIRM_RESULT.read_text(encoding="utf-8"))
+        self.assertEqual(len(read_jsonl(self.merged_file)), 2)
+        self.assertIn(fallback_key, self.cache_map())
+        self.assertEqual(read_jsonl(self.error_file), [])
+
+    def test_10_empty_project_subject_uses_message_id(self):
+        self.setup_inputs(
+            [mail("P1", "p@x.com", ""), mail("R1", "r@y.com", "要員")],
+            [pair("P1", "R1")],
         )
-        incomplete = dup_mod.find_incomplete_comparison_keys(
-            [
-                {
-                    "project_info": {"message_id": "P1", "from": "p1@x.com", "subject": "案件1"},
-                    "resource_info": {"message_id": "R1", "from": "r1@y.com", "subject": ""},
-                }
-            ]
+        self.run_06_80()
+        diff = read_jsonl(self.diff_file)[0]
+        self.assertEqual(diff["project_info"]["subject"], "")
+        self.assertEqual(diff["comparison_key"]["project_subject"], "gmail_mid:P1")
+        self.assertEqual(len(read_jsonl(self.new_file)), 1)
+
+    def test_11_empty_subject_key_is_stable_and_distinguishes_message_ids(self):
+        self.setup_inputs(
+            [mail("P1", "p@x.com", "案件"), mail("R1", "r@y.com", "")],
+            [pair("P1", "R1")],
         )
-        self.assertEqual(len(incomplete), 1)
-        self.assertEqual(incomplete[0]["empty_fields"], ["resource_subject"])
+        self.run_06_80()
+        first_key = read_jsonl(self.diff_file)[0]["comparison_key"]
+        self.run_06_80()
+        self.assertEqual(read_jsonl(self.diff_file)[0]["comparison_key"], first_key)
+        self.setup_inputs(
+            [mail("P1", "p@x.com", "案件"), mail("R2", "r@y.com", "")],
+            [pair("P1", "R2")],
+        )
+        self.run_06_80()
+        self.assertNotEqual(read_jsonl(self.diff_file)[0]["comparison_key"], first_key)
+
+    def test_12_legacy_diff_without_comparison_key_is_supported(self):
+        self.setup_inputs(
+            [mail("P1", "p@x.com", "案件"), mail("R1", "r@y.com", "要員")],
+            [pair("P1", "R1")],
+        )
+        self.run_06_80()
+        old_diff = read_jsonl(self.diff_file)
+        del old_diff[0]["comparison_key"]
+        write_jsonl(self.diff_file, old_diff)
+        self.simulate_07_1("new")
+        self.run_08_1()
+        self.assertIn(build_comparison_key("p@x.com", "案件", "r@y.com", "要員"), self.cache_map())
 
 
 class SuccessCacheValidationTestCase(unittest.TestCase):

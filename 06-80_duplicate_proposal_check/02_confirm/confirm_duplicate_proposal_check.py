@@ -19,6 +19,7 @@ from common.json_utils import count_jsonl, read_jsonl_as_list
 from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
+    comparison_key_from_dict,
     comparison_key_from_diff_record,
     is_complete_comparison_key,
     load_success_cache,
@@ -52,6 +53,12 @@ def message_id_key(record: dict) -> Tuple[str, str]:
         record.get("project_info", {}).get("message_id", ""),
         record.get("resource_info", {}).get("message_id", ""),
     )
+
+
+def diff_comparison_key(record: dict) -> tuple:
+    if "comparison_key" in record:
+        return comparison_key_from_dict(record["comparison_key"])
+    return comparison_key_from_diff_record(record)
 
 
 def main() -> None:
@@ -127,12 +134,12 @@ def main() -> None:
     incomplete_key_count = sum(
         1
         for record in diff_records
-        if not is_complete_comparison_key(comparison_key_from_diff_record(record))
+        if not is_complete_comparison_key(diff_comparison_key(record))
     )
     if incomplete_key_count:
         msg = (
             f"[NG] comparison_key空件数 = {incomplete_key_count}"
-            "（06-80はfail-fastするため0件でなければならない）"
+            "（Subject fallback後も空値が残る）"
         )
         lines.append(msg)
         errors.append(msg)
@@ -142,7 +149,7 @@ def main() -> None:
     # diff_file から message_id ペア -> comparison_key を引く
     diff_key_map: Dict[Tuple[str, str], tuple] = {}
     for record in diff_records:
-        diff_key_map[message_id_key(record)] = comparison_key_from_diff_record(record)
+        diff_key_map[message_id_key(record)] = diff_comparison_key(record)
 
     hit_keys = [diff_key_map.get(message_id_key(r)) for r in duplicate_records]
     miss_keys = [diff_key_map.get(message_id_key(r)) for r in new_records]
@@ -186,7 +193,7 @@ def main() -> None:
     else:
         lines.append("[OK] HIT + MISS = 今回pair集合（message_idペア）")
 
-    diff_comparison_keys = {comparison_key_from_diff_record(r) for r in diff_records}
+    diff_comparison_keys = {diff_comparison_key(r) for r in diff_records}
     union_comparison_keys = {k for k in hit_keys + miss_keys if k is not None}
     if union_comparison_keys != diff_comparison_keys:
         msg = (

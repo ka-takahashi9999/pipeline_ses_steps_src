@@ -168,7 +168,8 @@ def main():
         previous_records = (
             read_jsonl_as_list(str(previous_path)) if previous_path is not None else []
         )
-        previous_identities = build_previous_identity_set(previous_records)
+        subject_fallbacks = []
+        previous_identities = build_previous_identity_set(previous_records, subject_fallbacks)
         if previous_path is None:
             logger.info("直前final candidateなし: previous candidateは全件false")
         else:
@@ -194,7 +195,7 @@ def main():
             for seq, pair in enumerate(records, 1):
                 display_pair = dict(pair)
                 display_pair[PREVIOUS_CANDIDATE_FIELD] = (
-                    pair_identity(pair, mail_master) in previous_identities
+                    pair_identity(pair, mail_master, subject_fallbacks) in previous_identities
                 )
                 display_pair[PREVIOUS_CANDIDATE_DATE_FIELD] = previous_date
                 previous_candidate_count += int(display_pair[PREVIOUS_CANDIDATE_FIELD])
@@ -207,6 +208,19 @@ def main():
             logger.info(f"{label}: {len(records)}件出力")
 
         logger.info(f"テキストファイル出力完了: {total_pairs}件 → {output_dir}")
+        for side, message_id, project_id, resource_id in subject_fallbacks:
+            logger.warn(
+                "Subject identity fallback: side={} message_id={} pair={} / {}".format(
+                    side, message_id, project_id, resource_id
+                )
+            )
+        logger.info(
+            "Subject identity fallback件数={} project={} resource={}".format(
+                len(subject_fallbacks),
+                sum(side == "project" for side, *_ in subject_fallbacks),
+                sum(side == "resource" for side, *_ in subject_fallbacks),
+            )
+        )
         logger.info(
             f"previous candidate badge={previous_candidate_count}件 "
             f"comparison_date={previous_date or 'none'}"

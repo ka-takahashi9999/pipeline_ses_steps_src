@@ -22,6 +22,7 @@ from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
     build_cache_entry,
+    comparison_key_from_dict,
     comparison_key_from_diff_record,
     comparison_key_to_dict,
     format_comparison_key,
@@ -240,7 +241,11 @@ def main() -> None:
 
         for diff_record in diff_records:
             message_key = build_message_id_key(diff_record)
-            comparison_key = comparison_key_from_diff_record(diff_record)
+            comparison_key = (
+                comparison_key_from_dict(diff_record["comparison_key"])
+                if "comparison_key" in diff_record
+                else comparison_key_from_diff_record(diff_record)
+            )
 
             if message_key in hit_message_keys:
                 cache_entry = success_cache.get(comparison_key)

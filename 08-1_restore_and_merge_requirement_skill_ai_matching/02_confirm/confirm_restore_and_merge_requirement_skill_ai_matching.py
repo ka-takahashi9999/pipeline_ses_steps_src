@@ -18,6 +18,7 @@ from common.json_utils import count_jsonl, read_jsonl_as_list
 from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
+    comparison_key_from_dict,
     comparison_key_from_diff_record,
     load_success_cache,
 )
@@ -60,6 +61,12 @@ def message_id_key(record: dict) -> Tuple[str, str]:
         record.get("project_info", {}).get("message_id", ""),
         record.get("resource_info", {}).get("message_id", ""),
     )
+
+
+def diff_comparison_key(record: dict) -> tuple:
+    if "comparison_key" in record:
+        return comparison_key_from_dict(record["comparison_key"])
+    return comparison_key_from_diff_record(record)
 
 
 def read_if_exists(path: Path) -> List[dict]:
@@ -162,7 +169,7 @@ def main() -> None:
         lines.append("[OK] merged と error のペア重複なし")
 
     diff_key_map: Dict[Tuple[str, str], tuple] = {
-        message_id_key(r): comparison_key_from_diff_record(r) for r in diff_records
+        message_id_key(r): diff_comparison_key(r) for r in diff_records
     }
     merged_comparison_keys = {
         diff_key_map[k] for k in merged_message_keys if k in diff_key_map

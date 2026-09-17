@@ -21,7 +21,10 @@ from common.logger import get_logger
 from common.success_cache import (
     COMPARISON_KEY_FIELDS,
     SUCCESS_CACHE_PATH,
+    build_comparison_key,
+    comparison_key_from_dict,
     comparison_key_from_diff_record,
+    comparison_key_to_dict,
     is_complete_comparison_key,
     load_success_cache,
 )
@@ -51,7 +54,7 @@ def build_compare_key_record(pair: dict, mail_master: Dict[str, dict]) -> dict:
     project_mail = mail_master.get(project_mid, {})
     resource_mail = mail_master.get(resource_mid, {})
 
-    return {
+    record = {
         "project_info": {
             "message_id": project_mid,
             "from": project_mail.get("from", ""),
@@ -63,14 +66,28 @@ def build_compare_key_record(pair: dict, mail_master: Dict[str, dict]) -> dict:
             "subject": resource_mail.get("subject", ""),
         },
     }
+    project_subject = record["project_info"]["subject"]
+    resource_subject = record["resource_info"]["subject"]
+    project_subject_key = project_subject or (f"gmail_mid:{project_mid}" if project_mid else "")
+    resource_subject_key = resource_subject or (f"gmail_mid:{resource_mid}" if resource_mid else "")
+    key = build_comparison_key(
+        record["project_info"]["from"],
+        project_subject_key,
+        record["resource_info"]["from"],
+        resource_subject_key,
+    )
+    record["comparison_key"] = comparison_key_to_dict(key)
+    return record
 
 
 def build_compare_key(diff_record: dict) -> Tuple[str, str, str, str]:
+    if "comparison_key" in diff_record:
+        return comparison_key_from_dict(diff_record["comparison_key"])
     return comparison_key_from_diff_record(diff_record)
 
 
 def find_incomplete_comparison_keys(diff_records: List[dict]) -> List[dict]:
-    """comparison_keyの4項目に空値があるレコードを抽出する（空key同士を同一identityにしない）。"""
+    """fallback後もcomparison_keyに空値が残るレコードを抽出する。"""
     incomplete: List[dict] = []
     for diff_record in diff_records:
         key = build_compare_key(diff_record)
@@ -103,8 +120,27 @@ def main() -> None:
 
         diff_records = [build_compare_key_record(pair, mail_master) for pair in pairs]
 
-        # 空comparison_keyは遅延失敗（07-1評価 → 08-1 upsert時のSuccessCacheError）を招くため、
-        # 出力・diff_fileローテーションを行う前にfail-fastする。
+        project_fallback_count = sum(not record["project_info"]["subject"] for record in diff_records)
+        resource_fallback_count = sum(not record["resource_info"]["subject"] for record in diff_records)
+        fallback_records = [
+            record for record in diff_records
+            if not record["project_info"]["subject"] or not record["resource_info"]["subject"]
+        ]
+        fallback_pair_count = len(fallback_records)
+        if fallback_pair_count:
+            logger.warn(
+                "Subject空のためmessage_id fallbackを使用: "
+                f"project={project_fallback_count} resource={resource_fallback_count} "
+                f"ペア={fallback_pair_count}"
+            )
+            for record in fallback_records[:3]:
+                logger.warn(
+                    "Subject fallback対象: "
+                    f"message_id_pair={record['project_info']['message_id']} / "
+                    f"{record['resource_info']['message_id']}"
+                )
+
+        # Subject空はfallback済み。その他の空値は従来どおり出力前に検出する。
         incomplete_items = find_incomplete_comparison_keys(diff_records)
         if incomplete_items:
             for item in incomplete_items[:3]:
@@ -116,7 +152,7 @@ def main() -> None:
             raise RuntimeError(
                 "comparison_keyに空値があるため停止します（07-1へは流しません）: "
                 f"{len(incomplete_items)}件 / 入力{len(pairs)}件。"
-                "01-1メールマスタのfrom/subject欠落を確認してください"
+                "メールマスタのfromまたはmessage_id欠落を確認してください"
             )
 
         if OUTPUT_DIFF_FILE.exists():
@@ -169,7 +205,9 @@ def main() -> None:
         logger.info(
             "判定内訳: "
             f"Cache HIT(重複)={len(duplicate_records)} Cache MISS(新規)={len(new_records)} "
-            "comparison_key空値=0（空値ありは事前にfail-fast） "
+            f"Subject fallback: project={project_fallback_count} "
+            f"resource={resource_fallback_count} pairs={fallback_pair_count} "
+            "comparison_key空値=0 "
             f"前回diffにも存在={previous_diff_overlap_count}（監査用途 / 判定未使用）"
         )
 
