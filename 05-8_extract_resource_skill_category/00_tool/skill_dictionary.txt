@@ -5,6 +5,7 @@
 # ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
 
 バックエンド:
+  - VBScript
   - Java
   - Python
   - "C#"
@@ -136,6 +137,9 @@
   - Ajax  # Ajax
 
 インフラ:
+  - CentOS
+  - Hinemos
+  - Splunk
   - WSUS
   - AWS
   - Azure
@@ -658,6 +662,7 @@ CAD系:
   - 中国語
 
 汎用機系:
+  - JCL
   - IBM汎用機
   - "PL/I"
   - IBMメインフレーム

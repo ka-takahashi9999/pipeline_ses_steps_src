@@ -107,6 +107,11 @@ RX_DAILY_RANGE = re.compile(
 )
 RX_DAILY_MAN  = re.compile(r"日給\s*(\d{1,2})\s*万[円]?")
 RX_DAILY_YEN  = re.compile(r"日給\s*(\d{3,6})\s*円")
+# 価格欄の同一行に固定日額だけがある場合に限定（段階表・範囲は対象外）。
+RX_FIXED_DAILY_YEN = re.compile(
+    r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
+    + r"[ \t】\]:：]*(?P<yen>\d{1,3}(?:,\d{3})+|\d{3,6})[ \t]*円[ \t]*/[ \t]*日[ \t]*"
+)
 RX_HOURLY_YEN = re.compile(r"時給\s*(\d{3,5})\s*円")
 RX_HOURLY_MAN = re.compile(r"時給\s*(\d{1,2})\s*万[円]?")
 # 時給記号なし: 1900円/h / 2000円/時
@@ -161,6 +166,7 @@ def _get_segments(text: str) -> List[str]:
             or RX_DAILY_RANGE.search(line)
             or RX_DAILY_MAN.search(line)
             or RX_DAILY_YEN.search(line)
+            or RX_FIXED_DAILY_YEN.fullmatch(line)
             or RX_HOURLY_YEN.search(line)
             or RX_HOURLY_YEN_SLASH.search(line)
             or RX_HOURLY_YEN_SLASH_FLEX.search(line)
@@ -273,6 +279,11 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
     if m:
         v = int(m.group(1)) * DAILY_TO_MONTHLY
         return v, None, "daily-yen", 0.80, "monthly", m.group(0)
+
+    m = RX_FIXED_DAILY_YEN.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
+        return v, None, "daily-yen-slash", 0.80, "monthly", m.group(0)
 
     m = RX_HOURLY_YEN.search(seg)
     if m:

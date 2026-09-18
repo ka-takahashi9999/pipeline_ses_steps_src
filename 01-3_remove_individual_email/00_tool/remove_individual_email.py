@@ -22,6 +22,8 @@ Step 01-3: 個別除外処理スクリプト
 
 出力①: 01_result/remove_individual_emails_raw.jsonl  （除外後の message_id）
 出力②: 01_result/99_removed_individual_emails_raw.jsonl （除外された message_id）
+出力③: 01_result/99_removed_individual_emails_detail.jsonl
+       （限定テンプレートで追加除外したメールの元全項目 + reason / rule_id）
 """
 
 import fnmatch
@@ -55,6 +57,104 @@ EXCLUDE_LIST_PATH = str(_STEP_DIR / "10_assistance_tool" / "exclude_list.txt")
 
 OUTPUT_FILTERED = "remove_individual_emails_raw.jsonl"
 OUTPUT_REMOVED = "99_removed_individual_emails_raw.jsonl"
+OUTPUT_DETAIL = "99_removed_individual_emails_detail.jsonl"
+
+# 2026-09-17レビューの実例に限定。汎用の複数要員・非SES判定には広げない。
+TEMPLATE_REASONS = {"multi_item_mail", "list_or_portal_notice", "service_notification"}
+_PROFILE_OR_PROJECT_RE = re.compile(
+    r"氏\s*名|名\s*前|年\s*齢|最\s*寄|単\s*価|単\s*金|"
+    r"案件名|案件概要|業務内容|作業内容|必須スキル|【案件】"
+)
+_CHO_LINK_URL = r"https://u29046571\.ct\.sendgrid\.net/ls/click\?\S+"
+_CHO_INVITE_BODY_RE = re.compile(
+    r"(?P<company>[^\n]+?)の(?P<person>[^\n]+?)様より、チョータツでの連携のご依頼です\n+"
+    r"チョータツにご登録いただくと、メールでお送りしている案件に加えて、会員限定で公開している案件・人材もご覧いただけます。\n"
+    r"さらに(?P=company)と連携いただくと、案件・人材の一覧がまとまり、お互いに提案できるようになります。\n+"
+    r"チョータツは基本無料です。会社のメールアドレスがあれば1分で登録できます。\n+"
+    r"▼ (?P=company)と連携する\n" + _CHO_LINK_URL + r"\n+"
+    r"- - -\nチョータツでできること\n"
+    r"・会員限定の案件・人材を検索・閲覧\n"
+    r"・自社の案件・人材を、登録済みの配信先へワンクリックで一斉配信\n"
+    r"・3000社以上の登録企業とつながる\n- - -\n+---\n"
+    r"このメールアドレスは送信専用のため、ご返信いただけません。\n"
+    r"ご不明な点・ご質問はお問い合わせください。\n" + _CHO_LINK_URL
+)
+_IDENTITY_LIST_MAIN_RE = re.compile(
+    r"株式会社テクノヴァース\nご担当者様\n+お世話になっております。\n"
+    r"アイデンティティーのビジネスパートナーチームです。\n+"
+    r"本日時点で弊社で営業中のPython人材にマッチする案件を探しております。\n+"
+    r"見合う案件がございましたら、ぜひご提案いただけますと幸いです。\n+"
+    r"※スキルシートは、下記URL内のリンクからご確認くださいませ。\n"
+    r"※ご提案いただく際は、商流をご教示いただくようお願い申し上げます。\n+"
+    r"※ご提案いただきました案件はすべて確認させていただいておりますが、\n"
+    r"弊社から2営業日以内に連絡がない場合は、お見送りとご判断くださいませ。\n+"
+    r"■人材一覧リスト\n[—]+\n+https://info\.techcareer\.jp/e/998201/"
+    r"MU-edit-gid-969571495-range-A1/\S+\n+[—]+\n+"
+    r"以上、ご提案をお待ちしております。"
+)
+
+
+def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
+    """送信元・件名・本文構造が揃う確認済みテンプレートのみ退避する。
+
+    正規化は比較用コピーだけ。欠損・型不明は新規ルールで除外しない。
+    一覧/通知は添付が一つでもあれば残す（処理対象添付を取りこぼさない）。
+    """
+    if not all(isinstance(record.get(k), str) for k in ("from", "subject", "body_text")):
+        return None
+    if not all(isinstance(record.get(k), list) for k in ("attachments", "html_links")):
+        return None
+    sender = extract_email(record["from"])
+    subject = unicodedata.normalize("NFKC", record["subject"]).strip()
+    body = unicodedata.normalize("NFKC", record["body_text"]).replace("\r\n", "\n").strip()
+
+    if (sender == "feng-h@aliplaza.co.jp"
+            and re.fullmatch(r"【[0-9]{2}/[0-9]{2}】【JAVA\s+SE3名】【要件定義~】.+", subject)):
+        blocks = re.split(r"(?m)^要員情報([123])\s*$", body)
+        if (len(blocks) == 7 and blocks[1::2] == ["1", "2", "3"]
+                and all(re.search(r"■\s*スキル\s*:", b)
+                        and re.search(r"■\s*所\s*属\s*:", b)
+                        and re.search(r"■\s*稼\s*働\s*:", b) for b in blocks[2::2])):
+            return "multi_item_mail", "aliplaza_three_resource_blocks_v1"
+
+    if (sender == "masaya.hayashi@hyperlinksolution.co.jp"
+            and subject.startswith("【人材情報一覧】開発経験者3名のご紹介/")
+            and "弊社プロパー人材情報のリストをお送り致します。" in body
+            and re.search(r"【営業中プロパーリスト】\nhttps://x\.bmd\.jp/70/2209/\d+/255", body)):
+        three = re.search(r"下記の3名を営業中。\s*\n(?P<rows>(?:・[^\n]+\n){3})", body)
+        if three and all(re.search(r"要員\s+[0-9]+月~", row)
+                         for row in three.group("rows").splitlines()):
+            return "multi_item_mail", "hyperlink_three_resource_list_v1"
+
+    if record["attachments"] or _PROFILE_OR_PROJECT_RE.search(body):
+        return None
+
+    if sender == "noreply@cho-tatsu.com":
+        invite = _CHO_INVITE_BODY_RE.fullmatch(body)
+        if (invite and subject == "{}の{}様よりチョータツでの連携のご依頼".format(
+                invite.group("company"), invite.group("person"))):
+            return "service_notification", "chotatsu_connection_invitation_v1"
+
+    if (sender == "noreply@driven-x.com"
+            and re.fullmatch(r"【チョータツブースト】 新着案件・人材\([0-9]{2}月[0-9]{2}日\)", subject)
+            and body == "チョータツブーストの新着案件・人材情報"):
+        hrefs = {link.get("href") for link in record["html_links"]
+                 if isinstance(link, dict) and isinstance(link.get("href"), str)}
+        if {"https://cho-tatsu.com/boost/talents", "https://cho-tatsu.com/boost/projects"} <= hrefs:
+            return "service_notification", "chotatsu_boost_digest_v1"
+
+    if (sender == "bp@id-entity.jp"
+            and subject == "ご提案可能な営業中Python人材のご紹介"
+            and _IDENTITY_LIST_MAIN_RE.fullmatch(body.partition("━━")[0].strip())):
+        return "list_or_portal_notice", "identity_python_list_portal_v1"
+    return None
+
+
+def build_detail_record(record: Dict, reason: str, rule_id: str) -> Dict:
+    """元レコード全項目を保持する。監査キー衝突時は上書きせず停止する。"""
+    if "reason" in record or "rule_id" in record:
+        raise ValueError("mail master contains reserved audit keys: reason / rule_id")
+    return dict(record, reason=reason, rule_id=rule_id)
 
 RESOURCE_NOUN_PATTERN = r"(?:要員|人材|エンジニア|技術者|プロパー)"
 RESOURCE_COUNT_PATTERNS = (
@@ -269,10 +369,14 @@ def determine_exclusion_reason(
     from_only_set: Set[str],
     from_subj_rules: List[Tuple[str, str]],
 ) -> Optional[str]:
-    """manualを先に評価し、manual survivorだけをP1 detectorへ渡す。"""
+    """manual → P1 → 限定テンプレートの順で評価し、既存除外理由を保つ。"""
     if is_excluded(record, from_only_set, from_subj_rules):
         return "manual_exclude_list"
-    return detect_p1_exclusion_reason(record.get("subject") or "")
+    p1_reason = detect_p1_exclusion_reason(record.get("subject") or "")
+    if p1_reason:
+        return p1_reason
+    template = detect_template_exclusion(record)
+    return template[0] if template else None
 
 
 def main() -> None:
@@ -282,6 +386,7 @@ def main() -> None:
     start_time = time.time()
     filtered_records: List[Dict] = []
     removed_records: List[Dict] = []
+    detail_records: List[Dict] = []
     exclusion_reason_counts: Dict[str, int] = {}
 
     try:
@@ -315,6 +420,9 @@ def main() -> None:
             )
             if exclusion_reason:
                 removed_records.append({"message_id": mid})
+                if exclusion_reason in TEMPLATE_REASONS:
+                    reason, rule_id = detect_template_exclusion(master_rec)
+                    detail_records.append(build_detail_record(master_rec, reason, rule_id))
                 exclusion_reason_counts[exclusion_reason] = (
                     exclusion_reason_counts.get(exclusion_reason, 0) + 1
                 )
@@ -339,6 +447,10 @@ def main() -> None:
         out_removed = str(dirs["result"] / OUTPUT_REMOVED)
         write_jsonl(out_removed, removed_records)
         logger.ok(f"出力②書き込み完了: {out_removed} ({len(removed_records)}件)")
+
+        out_detail = str(dirs["result"] / OUTPUT_DETAIL)
+        write_jsonl(out_detail, detail_records)
+        logger.ok(f"出力③書き込み完了: {out_detail} ({len(detail_records)}件)")
 
     except Exception as e:
         write_error_log(result_dir, e, context=f"input={INPUT_PREV}")

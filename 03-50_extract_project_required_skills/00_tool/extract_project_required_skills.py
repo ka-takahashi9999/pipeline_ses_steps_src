@@ -58,8 +58,8 @@ def _n(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "")
 
 
-_HDR_STRIP_LEAD_RE = re.compile(r'^[\s【■□◆◇●○◎▶▼◾〈★☆~\[<「『《※*＊\-ー=－]+')
-_HDR_STRIP_TAIL_RE = re.compile(r'[\s】■◆~\]>〉」』》:：*＊!！\-ー=－]+$')
+_HDR_STRIP_LEAD_RE = re.compile(r'^[\s【■□◆◇●○◎▶▼▽◾〈★☆~\[<「『《※*＊\-ー=－]+')
+_HDR_STRIP_TAIL_RE = re.compile(r'[\s】■◆☆▽~\]>〉」』》:：*＊!！\-ー=－]+$')
 _HDR_INNER_SPACE_RE = re.compile(r'[\s　\t_＿]+')  # 全角スペース・半角スペース・タブ・アンダースコア
 # 絵文字バリエーションセレクタ（U+FE00-FE0F: ◾️ の ️ 部分等）を除去
 _VARIATION_SELECTOR_RE = re.compile('[\ufe00-\ufe0f]')
@@ -280,6 +280,11 @@ def _is_section_stop(line: str) -> bool:
     s = _n(line.strip())
     if not s:
         return False
+    # 箇条書きの「キー:値」だけ、既存STOP語への完全一致で終了する（空値も可）。
+    if _has_bullet(line):
+        key, separator, _ = _n(_strip_bullet(line.strip())).partition(':')
+        if separator and _STOP_HDR_CORE_RE.fullmatch(_normalize_hdr(key)):
+            return True
     # 先頭装飾を除去して停止語前方一致を確認
     s_stripped = _HDR_STRIP_LEAD_RE.sub('', s)
     if _SECTION_STOP_PREFIX_RE.match(s_stripped):
@@ -305,7 +310,7 @@ _REQUIRED_HDR_NORM_RE = re.compile(
     r'|応募資格|求めるスキル|スキル要件|技術要件'
     r'|実務経験|現場要望'
     r'|スキル|スキルセット|スキル条件'
-    r'|Required|MUST|Must'
+    r'|Required|MUST(?:スキル)?'
     r')$',
     re.IGNORECASE
 )
@@ -319,7 +324,7 @@ _OPTIONAL_HDR_NORM_RE = re.compile(
     r'|以下[、，]?あると(?:良い|望ましい|尚可|嬉しい)(?:スキル(?:[・/／]経験)?)?'  # 以下、あると嬉しいスキル
     r'|望ましい(?:スキル|条件|経験)?|プラス要素'
     r'|希望(?:スキル|条件|要件)?'
-    r'|Preferred|WANT|Want'
+    r'|Preferred|WANT(?:スキル)?'
     r')$',
     re.IGNORECASE
 )
