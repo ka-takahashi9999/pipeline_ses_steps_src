@@ -7,6 +7,7 @@ LLM使用禁止。
   案件のremote_typeがfullremote → 要員のlocationに関係なくtrue
   それ以外                      → 案件locationと要員locationが完全一致ならtrue
   locationが不明/null           → true（デフォルト通過）
+  案件locationがremote          → 地理的location未確定としてデフォルト通過
 """
 
 import sys
@@ -37,10 +38,13 @@ def judge_location_match(remote_type: str, project_location: str, resource_locat
     locationマッチ判定。
     案件がfullremoteの場合はlocationに関係なくtrue。
     案件・要員のいずれかのlocationがnull/空の場合はtrue（デフォルト通過）。
+    案件locationのremoteは地理的location未確定として同じ経路で扱う。
     それ以外は完全一致でtrue。
     """
     if remote_type == "fullremote":
         return True
+    if project_location == "remote":
+        project_location = None
     if not project_location or not resource_location:
         return True
     return project_location == resource_location

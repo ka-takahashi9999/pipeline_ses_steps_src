@@ -92,6 +92,21 @@ _IDENTITY_LIST_MAIN_RE = re.compile(
     r"MU-edit-gid-969571495-range-A1/\S+\n+[—]+\n+"
     r"以上、ご提案をお待ちしております。"
 )
+_IDENTITY_WEB_DIRECTOR_LIST_RE = re.compile(
+    r"株式会社テクノヴァース\nご担当者様\nお世話になっております。\n"
+    r"アイデンティティーのビジネスパートナーチームです。\n"
+    r"本日時点で弊社で営業中のWebディレクターにマッチする案件を探しております。\n"
+    r"見合う案件がございましたら、ぜひご提案いただけますと幸いです。\n"
+    r"※スキルシートは、下記URL内のリンクからご確認くださいませ。\n"
+    r"※ご提案いただく際は、商流をご教示いただくようお願い申し上げます。\n"
+    r"※ご提案いただきました案件はすべて確認させていただいておりますが、\n"
+    r"弊社から2営業日以内に連絡がない場合は、お見送りとご判断くださいませ。\n"
+    r"■人材一覧リスト\n[—]+\n"
+    r"(?P<url>https://info\.techcareer\.jp/e/998201/"
+    r"[A-Za-z0-9_-]+-edit-gid-[0-9]+(?:-range-[A-Za-z0-9]+)?/"
+    r"[A-Za-z0-9_-]+/[0-9]+/h/[A-Za-z0-9_-]+)\n[—]+\n"
+    r"以上、ご提案をお待ちしております。"
+)
 
 
 def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
@@ -128,6 +143,19 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
 
     if record["attachments"] or _PROFILE_OR_PROJECT_RE.search(body):
         return None
+
+    if (sender == "bp@id-entity.jp"
+            and subject == "ご提案可能な営業中Webディレクターのご紹介"):
+        # 比較用コピーのみ空行・行頭末空白を正規化する。職種の汎用化はしない。
+        main_body = "\n".join(line.strip() for line in body.partition("━━")[0].splitlines()
+                              if line.strip())
+        template = _IDENTITY_WEB_DIRECTOR_LIST_RE.fullmatch(main_body)
+        if template and any(
+            isinstance(link, dict) and link.get("source") == "text/html"
+            and link.get("href") == template.group("url")
+            for link in record["html_links"]
+        ):
+            return "list_or_portal_notice", "identity_web_director_list_portal_v1"
 
     if sender == "noreply@cho-tatsu.com":
         invite = _CHO_INVITE_BODY_RE.fullmatch(body)

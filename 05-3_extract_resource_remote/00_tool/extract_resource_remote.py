@@ -107,6 +107,14 @@ RX_HYBRID = re.compile(
     r"|不定期\s*(?:リモート|在宅)"
 )
 
+# 明示的な週1～4日の出社上限だけを補完する（週5日・一般的な出社可は対象外）。
+# 改行をまたがず、否定文や「までなら相談」等へ前方一致を広げない。
+RX_ONSITE_LIMIT = re.compile(
+    r"(?:週[ \t]*[1-4][ \t]*(?:日[ \t]*)?まで[ \t]*出社可能"
+    r"|出社[ \t]*(?:は[ \t]*)?週[ \t]*[1-4][ \t]*(?:日[ \t]*)?まで)"
+    r"(?=[ \t]*(?:$|[\r\n、。,.()【】/／]))"
+)
+
 
 # ── セグメント抽出 ────────────────────────────────────────
 def _get_segments(text: str) -> List[str]:
@@ -142,8 +150,6 @@ def rule_extract_remote(body: str) -> Tuple[str, str, Optional[str]]:
     if not segments:
         if len(text) <= 300:
             segments = [text]
-        else:
-            return REMOTE_DEFAULT, "default", None
 
     # fullremote を先に評価（hybrid より優先）
     for seg in segments:
@@ -155,6 +161,11 @@ def rule_extract_remote(body: str) -> Tuple[str, str, Optional[str]]:
         m = RX_HYBRID.search(seg)
         if m:
             return "hybrid", "extracted", m.group(0)
+
+    # 既存の明示リモート判定を優先し、未抽出時だけ出社上限を本文から拾う。
+    m = RX_ONSITE_LIMIT.search(text)
+    if m:
+        return "hybrid", "extracted", m.group(0)
 
     return REMOTE_DEFAULT, "default", None
 

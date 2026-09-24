@@ -5,6 +5,7 @@
 # ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
 
 バックエンド:
+  - Celery
   - VBScript
   - Java
   - Python
@@ -392,6 +393,7 @@ DB:
   - 機械学習基盤
 
 データ分析:
+  - Fivetran
   - Pandas
   - NumPy
   - Tableau
@@ -471,6 +473,7 @@ AI:
   - メールセキュリティ  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
 
 テスト/品質:
+  - Vitest
   - JUnit
   - pytest
   - RSpec

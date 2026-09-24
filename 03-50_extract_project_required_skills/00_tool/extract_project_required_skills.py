@@ -302,7 +302,7 @@ def _is_section_stop(line: str) -> bool:
 
 _REQUIRED_HDR_NORM_RE = re.compile(
     r'^(?:'
-    r'必須(?:スキル(?:[・/／]経験)?|条件|要件(?:[/／]スキル)?|資格)?'  # 必須スキル / 必須スキル・経験 / 必須要件/スキル
+    r'必須(?:スキル(?:[・/／]経験)?|経験|条件|要件(?:[/／]スキル)?|資格)?'  # 必須経験 / 必須スキル・経験 / 必須要件/スキル
     r'|必要(?:スキル(?:[・/／]経験)?|条件)?'              # 必要スキル / 必要スキル・経験 / 必要(単体)
     r'|要求(?:スキル(?:[・/／]経験)?|条件|要件)?'          # 要求スキル / 要求条件
     r'|要望(?:スキル(?:[・/／]経験)?|条件|要件)?'          # 要望スキル / 要望条件
@@ -317,7 +317,7 @@ _REQUIRED_HDR_NORM_RE = re.compile(
 
 _OPTIONAL_HDR_NORM_RE = re.compile(
     r'^(?:'
-    r'尚可(?:スキル(?:[・/／]経験)?|条件|要件)?'
+    r'尚可(?:スキル(?:[・/／]経験)?|経験|条件|要件)?'
     r'|歓迎(?:スキル(?:[/／]経験)?|条件|要件|する経験)?'  # 歓迎スキル / 歓迎スキル/経験 / 歓迎要件
     r'|優遇(?:スキル|条件)'                               # 優遇スキル 追加
     r'|あれば尚可|あると(?:望ましい|尚可|嬉しい(?:スキル(?:[/／]経験)?)?)'  # あると嬉しいスキル(/経験)
@@ -1016,6 +1016,8 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
     state = STATE_NONE
     pseudo_parent_header = ''
     consumed_until = -1
+    in_person_skill_requirements = False
+    in_experience_section = False
 
     for line_index, raw_line in enumerate(lines):
         if line_index <= consumed_until:
@@ -1054,6 +1056,28 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                 continue
 
         kind, inline = _classify_line(line)
+
+        # 確認済みの人材スキル要件ブロック内だけ、必須宣言と加点切替を扱う。
+        norm = _normalize_hdr(line)
+        if norm in ('必須経験', '尚可経験'):
+            in_experience_section = True
+        elif in_experience_section and norm == '稼働詳細':
+            kind, inline = 'stop', ''
+        if norm == '人材スキル要件':
+            in_person_skill_requirements = True
+            state = STATE_NONE
+            pseudo_parent_header = ''
+            continue
+        if in_person_skill_requirements:
+            if norm in ('以下すべて必須', '以下すべて必須となります。'):
+                kind, inline = 'required_header', ''
+            elif state in (STATE_REQUIRED, STATE_OPTIONAL) and norm in (
+                '加点', '加点要素', '加点項目', '以下はあれば加点対象です',
+            ):
+                kind, inline = 'optional_header', ''
+            elif norm == '発注条件' or _is_section_stop(line):
+                kind, inline = 'stop', ''
+                in_person_skill_requirements = False
 
         # one-shot スキル抽出: (必須) skill / (尚可) skill 形式
         # ラベルで種別が確定しているため _is_skill_line の文脈チェックを省略し、
@@ -1103,6 +1127,8 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
             continue
 
         if kind == 'stop':
+            in_person_skill_requirements = False
+            in_experience_section = False
             if state in (STATE_REQUIRED, STATE_OPTIONAL):
                 # ソフト停止 → STATE_NONE（後続の Must/Want 見出しを処理可能にする）
                 # ハード停止 → STATE_DONE（メール末尾確定、ループ終了）
