@@ -290,6 +290,7 @@
   - "Active Directory"
   - ActiveDirectory
   - "Azure AD"  # Microsoft 365 / Microsoft Entra ID (Azure AD)
+  - Nutanix
 
 クラウドサービス:
   - CloudFront
@@ -302,6 +303,7 @@
   - "Cloud Functions"  # コンテナ/サーバレス基盤の設計・構築（Cloud Run、GKE、Cloud Functions など）
   - ECR  # ECR等を利用したコンテナイメージの管理・バージョン運用
   - サーバレスアーキテクチャ  # サーバレスアーキテクチャ
+  - Supabase
 
 DB:
   - "SQL Server"
@@ -346,6 +348,7 @@ DB:
   - "Oracle Database"
   - Realm
   - Symfoware
+  - Firestore
 
 モバイル:
   - iOS
@@ -500,6 +503,7 @@ AI:
   - "CAT-TCM"
   - TestRail
   - TDD
+  - Postman
 
 プロジェクト管理:
   - Agile
@@ -591,6 +595,7 @@ AI:
   - XMAP
   - FJMW  # FJMW系の構築・運用作業経験
   - MIDMOST  # MIDMOST
+  - Cosminexus
 
 営業系:
   - 法人営業

@@ -287,25 +287,26 @@ _PROJECT_STRUCT_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
 # 要員単人構造ラベル: 4種類以上ヒット → resource 確定
 # 個人プロフィール行（氏名:, 【氏名】, 年齢:, 【年齢】, 所属:等）が4つ以上
 # = 要員紹介メール固有の構造
+_RESOURCE_LABEL_HORIZONTAL_SPACE = r'[ \t\u3000]*'
 _RESOURCE_SINGLE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
-    r'氏名[：:]',
+    rf'氏名{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【氏名[】]',
-    r'年齢[：:]',
+    rf'年齢{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【年齢[】]',
-    r'所属[：:]',
+    rf'所属{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【所属[】]',
-    r'最寄.{0,1}駅[：:]',  # 「最寄駅：」「最寄り駅：」両方に対応
+    rf'最寄.{{0,1}}駅{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「最寄駅：」「最寄り駅：」両方に対応
     r'【最寄.{0,2}[】]',
-    r'入場日[：:]',
+    rf'入場日{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【入場日[】]',
-    r'単金[：:]',
+    rf'単金{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【単金[】]',
-    r'単価[：:]',           # 「単価：80万」形式（括弧なし）
+    rf'単価{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「単価：80万」形式（括弧なし）
     r'【単価[】]',
-    r'名前[：:]',           # 「名前：Y.T」形式（氏名の代替）
+    rf'名前{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「名前：Y.T」形式（氏名の代替）
     r'【名前[】]',
-    r'稼働[：:]',           # 「稼働：4月～」形式
-    r'稼動[：:]',
+    rf'稼働{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「稼働：4月～」形式
+    rf'稼動{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【稼働[】]',
     r'【稼動[】]',
 ]]

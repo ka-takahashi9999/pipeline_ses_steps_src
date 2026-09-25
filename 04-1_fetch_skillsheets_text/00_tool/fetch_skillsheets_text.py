@@ -36,6 +36,7 @@ from dataclasses import dataclass
 import requests
 import warnings
 import logging
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -81,6 +82,13 @@ CTSU_PUBLIC_DOMAINS = {"ctsu.jp", "cho-tatsu.com"}
 
 # スキルシートらしいファイル拡張子
 SKILLSHEET_EXTENSIONS = {"pdf", "xlsx", "xls", "docx", "doc"}
+UNKNOWN_ATTACHMENT_MIME_TYPES = {
+    "",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
+MAX_OOXML_SNIFF_BASE64_CHARS = 40 * 1024 * 1024
+MAX_OOXML_ZIP_ENTRIES = 4096
 
 SHORTENER_DOMAINS = {
     "bit.ly",
@@ -784,6 +792,44 @@ def build_url_candidates(
     return ordered, html_urls, eligible_body_urls
 
 
+def detect_ooxml_attachment_type(attachment: Dict[str, Any]) -> Optional[str]:
+    """形式不明の取得済み添付をOOXML内部構造だけでxlsx/docx相当へ限定判定する。"""
+    filename = unicodedata.normalize(
+        "NFKC", attachment.get("filename", "") or ""
+    ).casefold()
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    mime = (attachment.get("mime_type", "") or "").lower().strip()
+    data_b64 = attachment.get("data", "")
+
+    if ext in SKILLSHEET_EXTENSIONS:
+        return None
+    if mime not in UNKNOWN_ATTACHMENT_MIME_TYPES:
+        return None
+    if not isinstance(data_b64, str) or not data_b64:
+        return None
+    if len(data_b64) > MAX_OOXML_SNIFF_BASE64_CHARS:
+        return None
+
+    try:
+        padded = data_b64 + "=" * (-len(data_b64) % 4)
+        raw_bytes = base64.b64decode(padded, altchars=b"-_", validate=True)
+        with zipfile.ZipFile(BytesIO(raw_bytes)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_OOXML_ZIP_ENTRIES:
+                return None
+            names = {entry.filename for entry in entries if not entry.is_dir()}
+    except (ValueError, OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return None
+
+    if "[Content_Types].xml" not in names:
+        return None
+    has_excel = "xl/workbook.xml" in names
+    has_word = "word/document.xml" in names
+    if has_excel == has_word:
+        return None
+    return "xlsx" if has_excel else "docx"
+
+
 def is_eligible_attachment(attachment: Dict[str, Any]) -> bool:
     """現行対応形式のうち、明示的に無関係な添付をskillsheet候補外にする。"""
     filename = unicodedata.normalize(
@@ -795,6 +841,8 @@ def is_eligible_attachment(attachment: Dict[str, Any]) -> bool:
         keyword in mime
         for keyword in ("pdf", "excel", "word", "spreadsheet", "document", "officedocument")
     )
+    if not is_supported:
+        is_supported = detect_ooxml_attachment_type(attachment) is not None
     if not is_supported:
         return False
 

@@ -92,10 +92,21 @@ _IDENTITY_LIST_MAIN_RE = re.compile(
     r"MU-edit-gid-969571495-range-A1/\S+\n+[—]+\n+"
     r"以上、ご提案をお待ちしております。"
 )
-_IDENTITY_WEB_DIRECTOR_LIST_RE = re.compile(
+_IDENTITY_WEB_LIST_RULE_IDS = {
+    "Webディレクター": "identity_web_director_list_portal_v1",
+    "Webデザイナー": "identity_web_designer_list_portal_v1",
+}
+_IDENTITY_WEB_LIST_ROLE_PATTERN = "(?:{})".format(
+    "|".join(re.escape(role) for role in _IDENTITY_WEB_LIST_RULE_IDS)
+)
+_IDENTITY_WEB_LIST_SUBJECT_RE = re.compile(
+    r"ご提案可能な営業中(?P<role>" + _IDENTITY_WEB_LIST_ROLE_PATTERN + r")のご紹介"
+)
+_IDENTITY_WEB_LIST_RE = re.compile(
     r"株式会社テクノヴァース\nご担当者様\nお世話になっております。\n"
     r"アイデンティティーのビジネスパートナーチームです。\n"
-    r"本日時点で弊社で営業中のWebディレクターにマッチする案件を探しております。\n"
+    r"本日時点で弊社で営業中の(?P<role>" + _IDENTITY_WEB_LIST_ROLE_PATTERN + r")"
+    r"にマッチする案件を探しております。\n"
     r"見合う案件がございましたら、ぜひご提案いただけますと幸いです。\n"
     r"※スキルシートは、下記URL内のリンクからご確認くださいませ。\n"
     r"※ご提案いただく際は、商流をご教示いただくようお願い申し上げます。\n"
@@ -106,6 +117,180 @@ _IDENTITY_WEB_DIRECTOR_LIST_RE = re.compile(
     r"[A-Za-z0-9_-]+-edit-gid-[0-9]+(?:-range-[A-Za-z0-9]+)?/"
     r"[A-Za-z0-9_-]+/[0-9]+/h/[A-Za-z0-9_-]+)\n[—]+\n"
     r"以上、ご提案をお待ちしております。"
+)
+_RADSTATE_MULTI_RESOURCE_SUBJECT_RE = re.compile(
+    r"更新しました!☆彡【直人材】.+\(ラッドステイト株式会社\)"
+)
+_RADSTATE_PROFILE_NUMBER_RE = re.compile(r"(?m)^[1-9][0-9]*[ \t]*$")
+_RADSTATE_NAME_RE = re.compile(r"(?m)^氏名[ \t]*:")
+_RADSTATE_STATION_RE = re.compile(r"(?m)^最寄駅[ \t]*:")
+_RADSTATE_PRICE_RE = re.compile(r"(?m)^単価[ \t]*:")
+_RADSTATE_SKILL_SHEET_RE = re.compile(r"(?m)^●スキルシート[ \t]*:?[ \t]*$")
+_RADSTATE_SKILL_SHEET_URL_RE = re.compile(
+    r"(?m)^●スキルシート[ \t]*:?[ \t]*\n[ \t]*https?://[^\s]+[ \t]*$"
+)
+_WEBBOLT_EMPLOYEE_INTRO_SUBJECT_RE = re.compile(
+    r"◎◎弊社社員\([^()\n]+\)の紹介です。"
+)
+_WEBBOLT_EMPLOYEE_INTRO_RE = re.compile(
+    r"\A\(BCCでご案内しております。\)\n+"
+    r"お世話になります。ウェブボルトの増山です。\n+"
+    r"標題の件、弊社要員をご紹介させていただきます。\n+"
+    r"見合う案件がございましたら、[^\n]+\n+"
+    r"ご紹介くださいますよう、よろしくお願い申しあげます。"
+)
+_WEBBOLT_NAME_RE = re.compile(r"(?m)^[ \t]*【名[ \t]+前】.+$")
+_WEBBOLT_AFFILIATION_RE = re.compile(r"(?m)^[ \t]*【所[ \t]*属】.+$")
+_WEBBOLT_STATION_RE = re.compile(r"(?m)^[ \t]*【最寄駅】.+$")
+_WEBBOLT_AVAILABLE_RE = re.compile(r"(?m)^[ \t]*【就業時期】.+$")
+_WEBBOLT_PRICE_RE = re.compile(r"(?m)^[ \t]*【単[ \t]+金】.+$")
+_EXCEL_SKILL_SHEET_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb"}
+_TECHNICATION_INTRO_RE = re.compile(
+    r"\A株式会社テクノヴァース\n+"
+    r"ご担当者様\n+"
+    r"お世話になっております。\n+"
+    r"株式会社テクニケーションシードの[^\n]+です。\n+"
+    r"[^\n]*をご紹介いたします。"
+)
+_TECHNICATION_NAME_RE = re.compile(r"(?m)^[ \t]*【氏[ \t]*名】.+$")
+_TECHNICATION_AGE_RE = re.compile(r"(?m)^[ \t]*【年[ \t]*齢】.+$")
+_TECHNICATION_AFFILIATION_RE = re.compile(r"(?m)^[ \t]*【所[ \t]*属】.+$")
+_TECHNICATION_AVAILABLE_RE = re.compile(r"(?m)^[ \t]*【稼[ \t]*働】.+$")
+_TECHNICATION_PRICE_RE = re.compile(r"(?m)^[ \t]*【単[ \t]*価】.+$")
+_TECHNICATION_PHASE_RE = re.compile(r"(?m)^[ \t]*【工[ \t]*程】.+$")
+_TECHNICATION_SKILL_RE = re.compile(r"(?m)^[ \t]*【スキル】.+$")
+_TECHNICATION_INTRODUCTION_RE = re.compile(r"(?m)^[ \t]*【紹介文】.+$")
+_SIGNPOST_INTRO_RE = re.compile(
+    r"\A株式会社テクノヴァース\n+"
+    r"[^\n]+様\n+"
+    r"お世話になっております。\n+"
+    r"株式会社SIGNPOSTでございます。\n+"
+    r"表題の件についてご連絡させていただきました。\n+"
+    r"(?:新しく営業スタートしている技術者情報をお送りさせていただきます。\n+)?"
+    r"見合う案件ございましたらご紹介いただけますと幸いです。"
+)
+_SIGNPOST_NAME_RE = re.compile(r"(?m)^[ \t]*氏[ \t]*名[ \t]*:.+$")
+_SIGNPOST_AFFILIATION_RE = re.compile(r"(?m)^[ \t]*所[ \t]*属[ \t]*:.+$")
+_SIGNPOST_AGE_RE = re.compile(r"(?m)^[ \t]*年[ \t]*齢[ \t]*:.+$")
+_SIGNPOST_STATION_RE = re.compile(r"(?m)^[ \t]*最[ \t]*寄[ \t]*:.+$")
+_SIGNPOST_PRICE_RE = re.compile(r"(?m)^[ \t]*単[ \t]*価[ \t]*:.+$")
+_SIGNPOST_PERIOD_RE = re.compile(r"(?m)^[ \t]*期[ \t]*間[ \t]*:.+$")
+_SIGNPOST_WORK_STYLE_RE = re.compile(r"(?m)^[ \t]*働き方[ \t]*:.+$")
+_SIGNPOST_OVERVIEW_RE = re.compile(
+    r"(?m)^[ \t]*(?:概[ \t]*要[ \t]*:|概1\.[ \t]*概要(?:[ \t]*:)?)"
+)
+_SIGNPOST_SKILL_SHEET_URL_RE = re.compile(
+    r"(?m)^[ \t]*スキルシート[ \t]*:[ \t]*https?://[^\s]+[ \t]*$"
+)
+_ALIPLAZA_MULTI_RESOURCE_SUBJECT_RE = re.compile(
+    r"【[0-9]{2}/[0-9]{2}】【JAVA[ \t]+SE[ \t]*(?P<count>[0-9]+)名】"
+    r"【要件定義~】.+"
+)
+_ALIPLAZA_MULTI_RESOURCE_INTRO_RE = re.compile(
+    r"\A株式会社テクノヴァース\n+"
+    r"営業担当様\n+"
+    r"いつもお世話になっております。\n+"
+    r"アリプラザのヒョウです。\n+"
+    r"早速ですが、[ \t]*弊社現在注力中の要員情報を共有いたします。\n+"
+    r"見合う案件がございましたら、\n+"
+    r"ぜひご紹介いただけますと幸いです。"
+)
+_ALIPLAZA_RESOURCE_BLOCK_RE = re.compile(
+    r"(?m)^要員情報([1-9][0-9]*)[ \t]*$"
+)
+_ALIPLAZA_AFFILIATION_RE = re.compile(r"(?m)^■[ \t]*所[ \t]*属[ \t]*:")
+_ALIPLAZA_EXPERIENCE_RE = re.compile(r"(?m)^■[ \t]*経[ \t]*験[ \t]*:")
+_ALIPLAZA_JAPANESE_RE = re.compile(r"(?m)^■[ \t]*日本語[ \t]*:")
+_ALIPLAZA_SKILL_RE = re.compile(r"(?m)^■[ \t]*スキル[ \t]*:")
+_ALIPLAZA_PHASE_RE = re.compile(r"(?m)^■[ \t]*工[ \t]*程[ \t]*:")
+_ALIPLAZA_AVAILABLE_RE = re.compile(r"(?m)^■[ \t]*稼[ \t]*働[ \t]*:")
+_ALIPLAZA_COMMUTE_RE = re.compile(r"(?m)^■[ \t]*通[ \t]*勤[ \t]*:")
+_T_E_SYSTEM_RESOURCE_SUBJECT_RE = re.compile(
+    r"【要員情報】インフラ要員/AWS、Azure、Docker、Kubernetes、Shell、Python"
+)
+_T_E_SYSTEM_RESOURCE_INTRO_RE = re.compile(
+    r"\A株式会社テクノヴァース\n+"
+    r"御担当者[ \t]*様\n+"
+    r"いつもお世話になっております。TESの金子です。\n+"
+    r"弊社より、(?:Java|インフラ)要員をご提案させていただきます。\n+"
+    r"お手数おかけしますが、ご検討のほどよろしくお願いします。"
+)
+_T_E_SYSTEM_PROFILE_RE = re.compile(
+    r"(?m)^【氏[ \t]*名】[ \t]*:?[ \t]*"
+)
+_T_E_SYSTEM_AGE_RE = re.compile(r"[0-9]{2}歳")
+_T_E_SYSTEM_EXPERIENCE_RE = re.compile(
+    r"(?m)^【(?:IT)?[ \t]*経[ \t]*験】"
+)
+_T_E_SYSTEM_JAPANESE_RE = re.compile(r"(?m)^【日本語】")
+_T_E_SYSTEM_SKILL_RE = re.compile(r"(?m)^【(?:スキル|開発言語)】")
+_T_E_SYSTEM_PHASE_RE = re.compile(r"(?m)^【工[ \t]*程】")
+_T_E_SYSTEM_PRICE_RE = re.compile(r"(?m)^【単[ \t]*(?:価|金)】")
+_T_E_SYSTEM_AVAILABLE_RE = re.compile(r"(?m)^【稼[ \t]*(?:働|動)(?:日)?】")
+_T_E_SYSTEM_PR_RE = re.compile(r"(?m)^【PR】")
+_CAIRN_MULTI_RESOURCE_SUBJECT_RE = re.compile(
+    r"[0-9]{1,2}月~【弊社社員/サーバエンジニア×(?P<count>[0-9]+)名】.+"
+)
+_CAIRN_MULTI_RESOURCE_INTRO_RE = re.compile(
+    r"\A株式会社テクノヴァース\n+"
+    r"ご担当者[ \t]*様\n+"
+    r"お世話になっております。\n+"
+    r"株式会社CAIRNの営業部です。\n+"
+    r"[0-9]{1,2}月より稼働可能な、弊社正社員の注力要員をご紹介させていただきます。\n+"
+    r"見合う案件がございましたら、ぜひご紹介いただけますと幸いです。"
+)
+_CAIRN_PROFILE_RE = re.compile(r"(?m)^【名前】[ \t]*:[ \t]*")
+_CAIRN_STATION_RE = re.compile(r"(?m)^【最寄】[ \t]*:")
+_CAIRN_AVAILABLE_RE = re.compile(r"(?m)^【稼[働動]】[ \t]*:")
+_CAIRN_AFFILIATION_RE = re.compile(r"(?m)^【所属】[ \t]*:")
+_CAIRN_PRICE_RE = re.compile(r"(?m)^【単価】[ \t]*:")
+_CAIRN_PHASE_RE = re.compile(r"(?m)^【工程】[ \t]*:")
+_CAIRN_SKILL_RE = re.compile(r"(?m)^【スキル】[ \t]*:")
+_CAIRN_PREFERENCE_RE = re.compile(r"(?m)^【希望】[ \t]*:")
+_CAIRN_SKILL_SHEET_URL_RE = re.compile(
+    r"(?m)^【スキルシート】[ \t]*:[ \t]*(?:\n[ \t]*)?"
+    r"https?://[^\s]+[ \t]*$"
+)
+_SAKYA_PROCUREMENT_SERVICE_SUBJECT = (
+    "受託案件のエンジニア調達、まるごとお引き受けします"
+    "【0円・当日回答・1案件から】/ サクヤ"
+)
+_SAKYA_PROCUREMENT_SERVICE_NAME = (
+    "サービス「サクヤ調達部」を行っております。"
+)
+_SAKYA_PROCUREMENT_SERVICE_SCALE = (
+    "・協力会社5,000社 / 常時4,000名規模から、絞り込んだ候補のみご提案"
+)
+_SAKYA_PROCUREMENT_SERVICE_CTA = (
+    "本メールにご返信のうえ、案件概要(スキル・単価帯・時期)をお送りください。"
+)
+_SAKYA_INDIVIDUAL_STRUCTURE_RE = re.compile(
+    r"(?m)^(?:【(?:案件名|氏名|所属|最寄|単価|スキル|必須スキル)】"
+    r"|(?:案件名|業務内容|作業内容|必須スキル)[ \t]*:)"
+)
+_SAKYA_RECIRCULATION_SERVICE_SUBJECT = (
+    "当日中にご提案!!案件側失注の要員/他決後の再募集案件を承ります【サクヤ大嶽】"
+)
+_SAKYA_RECIRCULATION_SERVICE_INTRO = "株式会社サクヤの大嶽でございます。"
+_SAKYA_RECIRCULATION_RESOURCE_NOTICE = (
+    "【要員】オファー後に案件側が流れ、次を至急お探しの方"
+)
+_SAKYA_RECIRCULATION_PROJECT_NOTICE = (
+    "【案件】オファーを出したが他決となり、再募集せざるを得ない案件"
+)
+_SAKYA_RECIRCULATION_SERVICE_CTA = (
+    "スキルシート、または案件概要をそのまま転送いただくだけで構いません。"
+)
+_ROUTE_ZERO_INFORMATION_SHARE_SUBJECT = "【情報共有のお願い】"
+_ROUTE_ZERO_INFORMATION_SHARE_REQUEST = (
+    "この度は注力情報の共有をお願いしたく、ご連絡させていただきました。"
+)
+_ROUTE_ZERO_INFORMATION_SHARE_CTA = (
+    "もしよろしければ本メールに返信で弊社の一社先でも可能な案件や"
+    "貴社要員様などご紹介いただけますと幸いです。"
+)
+_ROUTE_ZERO_INFORMATION_SHARE_OFFER = (
+    "また、弊社の注力情報(案件or要員ご指定下さい)もご入用でしたらお送りいたします。"
 )
 
 
@@ -132,6 +317,37 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
                         and re.search(r"■\s*稼\s*働\s*:", b) for b in blocks[2::2])):
             return "multi_item_mail", "aliplaza_three_resource_blocks_v1"
 
+    if sender == "feng-h@aliplaza.co.jp":
+        subject_match = _ALIPLAZA_MULTI_RESOURCE_SUBJECT_RE.fullmatch(subject)
+        if subject_match and _ALIPLAZA_MULTI_RESOURCE_INTRO_RE.search(body):
+            parts = _ALIPLAZA_RESOURCE_BLOCK_RE.split(body)
+            block_numbers = [int(number) for number in parts[1::2]]
+            blocks = parts[2::2]
+            profile_count = len(block_numbers)
+            excel_skill_sheet_count = sum(
+                1 for attachment in record["attachments"]
+                if isinstance(attachment, dict)
+                and isinstance(attachment.get("filename"), str)
+                and Path(attachment["filename"]).suffix.lower()
+                in _EXCEL_SKILL_SHEET_SUFFIXES
+            )
+            blocks_match = all(
+                _ALIPLAZA_AFFILIATION_RE.search(block)
+                and _ALIPLAZA_JAPANESE_RE.search(block)
+                and (_ALIPLAZA_SKILL_RE.search(block)
+                     or len(_ALIPLAZA_EXPERIENCE_RE.findall(block)) >= 2)
+                and _ALIPLAZA_PHASE_RE.search(block)
+                and _ALIPLAZA_AVAILABLE_RE.search(block)
+                and _ALIPLAZA_COMMUTE_RE.search(block)
+                for block in blocks
+            )
+            if (profile_count >= 2
+                    and block_numbers == list(range(1, profile_count + 1))
+                    and int(subject_match.group("count")) == profile_count
+                    and blocks_match
+                    and excel_skill_sheet_count == profile_count):
+                return "multi_item_mail", "aliplaza_multi_resource_intro_v1"
+
     if (sender == "masaya.hayashi@hyperlinksolution.co.jp"
             and subject.startswith("【人材情報一覧】開発経験者3名のご紹介/")
             and "弊社プロパー人材情報のリストをお送り致します。" in body
@@ -141,21 +357,183 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
                          for row in three.group("rows").splitlines()):
             return "multi_item_mail", "hyperlink_three_resource_list_v1"
 
+    if (sender == "atmaeda@radstate.co.jp"
+            and _RADSTATE_MULTI_RESOURCE_SUBJECT_RE.fullmatch(subject)):
+        profile_count = len(_RADSTATE_PROFILE_NUMBER_RE.findall(body))
+        repeated_counts = (
+            len(_RADSTATE_NAME_RE.findall(body)),
+            len(_RADSTATE_STATION_RE.findall(body)),
+            len(_RADSTATE_PRICE_RE.findall(body)),
+            len(_RADSTATE_SKILL_SHEET_RE.findall(body)),
+        )
+        skill_sheet_url_count = len(_RADSTATE_SKILL_SHEET_URL_RE.findall(body))
+        if (profile_count >= 2
+                and all(count == profile_count for count in repeated_counts)
+                and skill_sheet_url_count == profile_count):
+            return "multi_item_mail", "radstate_multi_resource_list_v1"
+
+    if (sender == "kmasuyama@webbolt.co.jp"
+            and _WEBBOLT_EMPLOYEE_INTRO_SUBJECT_RE.fullmatch(subject)
+            and _WEBBOLT_EMPLOYEE_INTRO_RE.search(body)):
+        profile_count = len(_WEBBOLT_NAME_RE.findall(body))
+        repeated_counts = (
+            len(_WEBBOLT_AFFILIATION_RE.findall(body)),
+            len(_WEBBOLT_STATION_RE.findall(body)),
+            len(_WEBBOLT_AVAILABLE_RE.findall(body)),
+            len(_WEBBOLT_PRICE_RE.findall(body)),
+        )
+        excel_skill_sheet_count = sum(
+            1 for attachment in record["attachments"]
+            if isinstance(attachment, dict)
+            and isinstance(attachment.get("filename"), str)
+            and Path(attachment["filename"]).suffix.lower() in _EXCEL_SKILL_SHEET_SUFFIXES
+        )
+        if (profile_count >= 2
+                and all(count == profile_count for count in repeated_counts)
+                and excel_skill_sheet_count == profile_count):
+            return "multi_item_mail", "webbolt_multi_resource_employee_intro_v1"
+
+    if (sender.endswith("@technication.co.jp")
+            and _TECHNICATION_INTRO_RE.search(body)):
+        profile_count = len(_TECHNICATION_NAME_RE.findall(body))
+        repeated_counts = (
+            len(_TECHNICATION_AGE_RE.findall(body)),
+            len(_TECHNICATION_AFFILIATION_RE.findall(body)),
+            len(_TECHNICATION_AVAILABLE_RE.findall(body)),
+            len(_TECHNICATION_PRICE_RE.findall(body)),
+            len(_TECHNICATION_PHASE_RE.findall(body)),
+            len(_TECHNICATION_SKILL_RE.findall(body)),
+            len(_TECHNICATION_INTRODUCTION_RE.findall(body)),
+        )
+        excel_skill_sheet_count = sum(
+            1 for attachment in record["attachments"]
+            if isinstance(attachment, dict)
+            and isinstance(attachment.get("filename"), str)
+            and Path(attachment["filename"]).suffix.lower() in _EXCEL_SKILL_SHEET_SUFFIXES
+        )
+        if (profile_count >= 2
+                and all(count == profile_count for count in repeated_counts)
+                and excel_skill_sheet_count == profile_count):
+            return "multi_item_mail", "technication_multi_resource_intro_v1"
+
+    if (sender == "sales@signpost-g.co.jp"
+            and not record["attachments"]
+            and _SIGNPOST_INTRO_RE.search(body)):
+        profile_count = len(_SIGNPOST_NAME_RE.findall(body))
+        repeated_counts = (
+            len(_SIGNPOST_AFFILIATION_RE.findall(body)),
+            len(_SIGNPOST_AGE_RE.findall(body)),
+            len(_SIGNPOST_STATION_RE.findall(body)),
+            len(_SIGNPOST_PRICE_RE.findall(body)),
+            len(_SIGNPOST_PERIOD_RE.findall(body)),
+            len(_SIGNPOST_WORK_STYLE_RE.findall(body)),
+            len(_SIGNPOST_OVERVIEW_RE.findall(body)),
+        )
+        skill_sheet_url_count = len(_SIGNPOST_SKILL_SHEET_URL_RE.findall(body))
+        if (profile_count >= 2
+                and all(count == profile_count for count in repeated_counts)
+                and skill_sheet_url_count == profile_count):
+            return "multi_item_mail", "signpost_multi_resource_intro_v1"
+
+    if (sender == "kinmh@t-e-system.com"
+            and _T_E_SYSTEM_RESOURCE_SUBJECT_RE.fullmatch(subject)
+            and _T_E_SYSTEM_RESOURCE_INTRO_RE.search(body)):
+        profile_blocks = _T_E_SYSTEM_PROFILE_RE.split(body)[1:]
+        profile_count = len(profile_blocks)
+        blocks_match = all(
+            _T_E_SYSTEM_AGE_RE.search(block)
+            and _T_E_SYSTEM_EXPERIENCE_RE.search(block)
+            and _T_E_SYSTEM_JAPANESE_RE.search(block)
+            and _T_E_SYSTEM_SKILL_RE.search(block)
+            and _T_E_SYSTEM_PHASE_RE.search(block)
+            and _T_E_SYSTEM_PRICE_RE.search(block)
+            and _T_E_SYSTEM_AVAILABLE_RE.search(block)
+            and _T_E_SYSTEM_PR_RE.search(block)
+            for block in profile_blocks
+        )
+        excel_skill_sheet_count = sum(
+            1 for attachment in record["attachments"]
+            if isinstance(attachment, dict)
+            and isinstance(attachment.get("filename"), str)
+            and Path(attachment["filename"]).suffix.lower()
+            in _EXCEL_SKILL_SHEET_SUFFIXES
+        )
+        if (profile_count >= 2
+                and blocks_match
+                and excel_skill_sheet_count == profile_count):
+            return "multi_item_mail", "t_e_system_multi_resource_intro_v1"
+
+    if (sender == "sales@cair-n.co.jp"
+            and not record["attachments"]
+            and _CAIRN_MULTI_RESOURCE_INTRO_RE.search(body)):
+        subject_match = _CAIRN_MULTI_RESOURCE_SUBJECT_RE.fullmatch(subject)
+        profile_blocks = _CAIRN_PROFILE_RE.split(body)[1:]
+        profile_count = len(profile_blocks)
+        blocks_match = all(
+            _CAIRN_STATION_RE.search(block)
+            and _CAIRN_AVAILABLE_RE.search(block)
+            and _CAIRN_AFFILIATION_RE.search(block)
+            and _CAIRN_PRICE_RE.search(block)
+            and _CAIRN_PHASE_RE.search(block)
+            and _CAIRN_SKILL_RE.search(block)
+            and _CAIRN_PREFERENCE_RE.search(block)
+            and _CAIRN_SKILL_SHEET_URL_RE.search(block)
+            for block in profile_blocks
+        )
+        skill_sheet_url_count = len(_CAIRN_SKILL_SHEET_URL_RE.findall(body))
+        if (subject_match
+                and profile_count >= 2
+                and int(subject_match.group("count")) == profile_count
+                and blocks_match
+                and skill_sheet_url_count == profile_count):
+            return "multi_item_mail", "cairn_multi_resource_intro_v1"
+
+    if (sender == "kensuke.kiyota@sakya.jp"
+            and subject == _SAKYA_PROCUREMENT_SERVICE_SUBJECT
+            and not record["attachments"]
+            and _SAKYA_PROCUREMENT_SERVICE_NAME in body
+            and _SAKYA_PROCUREMENT_SERVICE_SCALE in body
+            and _SAKYA_PROCUREMENT_SERVICE_CTA in body
+            and not _SAKYA_INDIVIDUAL_STRUCTURE_RE.search(body)):
+        return "service_notification", "sakya_procurement_service_notice_v1"
+
+    if (sender == "koki.odake@sakya.jp"
+            and subject == _SAKYA_RECIRCULATION_SERVICE_SUBJECT
+            and not record["attachments"]
+            and _SAKYA_RECIRCULATION_SERVICE_INTRO in body
+            and _SAKYA_RECIRCULATION_RESOURCE_NOTICE in body
+            and _SAKYA_RECIRCULATION_PROJECT_NOTICE in body
+            and _SAKYA_RECIRCULATION_SERVICE_CTA in body
+            and not _SAKYA_INDIVIDUAL_STRUCTURE_RE.search(body)):
+        return "service_notification", "sakya_recirculation_service_notice_v1"
+
+    if (sender == "takahashi@route-zero.com"
+            and subject == _ROUTE_ZERO_INFORMATION_SHARE_SUBJECT
+            and not record["attachments"]
+            and _ROUTE_ZERO_INFORMATION_SHARE_REQUEST in body
+            and _ROUTE_ZERO_INFORMATION_SHARE_CTA in body
+            and _ROUTE_ZERO_INFORMATION_SHARE_OFFER in body
+            and not _SAKYA_INDIVIDUAL_STRUCTURE_RE.search(body)):
+        return "service_notification", "route_zero_information_share_notice_v1"
+
     if record["attachments"] or _PROFILE_OR_PROJECT_RE.search(body):
         return None
 
-    if (sender == "bp@id-entity.jp"
-            and subject == "ご提案可能な営業中Webディレクターのご紹介"):
-        # 比較用コピーのみ空行・行頭末空白を正規化する。職種の汎用化はしない。
+    if sender == "bp@id-entity.jp":
+        subject_match = _IDENTITY_WEB_LIST_SUBJECT_RE.fullmatch(subject)
+        # 比較用コピーのみ空行・行頭末空白を正規化する。職種は2語のallowlist限定。
         main_body = "\n".join(line.strip() for line in body.partition("━━")[0].splitlines()
                               if line.strip())
-        template = _IDENTITY_WEB_DIRECTOR_LIST_RE.fullmatch(main_body)
-        if template and any(
+        template = _IDENTITY_WEB_LIST_RE.fullmatch(main_body)
+        if (subject_match and template
+                and subject_match.group("role") == template.group("role")
+                and any(
             isinstance(link, dict) and link.get("source") == "text/html"
             and link.get("href") == template.group("url")
             for link in record["html_links"]
-        ):
-            return "list_or_portal_notice", "identity_web_director_list_portal_v1"
+        )):
+            role = subject_match.group("role")
+            return "list_or_portal_notice", _IDENTITY_WEB_LIST_RULE_IDS[role]
 
     if sender == "noreply@cho-tatsu.com":
         invite = _CHO_INVITE_BODY_RE.fullmatch(body)

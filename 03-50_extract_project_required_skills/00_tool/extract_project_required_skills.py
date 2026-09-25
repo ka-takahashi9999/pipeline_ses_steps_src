@@ -353,6 +353,16 @@ _INLINE_PREFIX_OPT_RE = re.compile(
     re.IGNORECASE
 )
 
+# EBAテンプレートの内容なしラベル単独行。one-shot判定より先にsectionへ遷移する。
+_PAREN_LABEL_ONLY_REQ_RE = re.compile(r'^\(\s*必須\s*\)\s*:\s*$')
+_PAREN_LABEL_ONLY_OPT_RE = re.compile(r'^\(\s*尚可\s*\)\s*:\s*$')
+_EBA_PAREN_SECTION_CONTEXT_RE = re.compile(
+    r'(?ms)^(?:【\s*ス\s*キ\s*ル\s*】\s*:|■スキル)\s*$'
+    r'.*?^\(\s*必須\s*\)\s*:\s*$'
+    r'.*?^\(\s*尚可\s*\)\s*:\s*$'
+    r'.*?^(?:■)?人物像\s*:\s*$'
+)
+
 # 「必須：skill」「尚可：skill」行頭コロン形式（one-shot スキル抽出）
 # 例: 「必須：AIX設計構築経験者」→ required_skill
 # 例: 「尚可：Java,springboot」→ optional_skill
@@ -417,7 +427,10 @@ _INLINE_HDR_SPLIT_RE = re.compile(
 )
 
 
-def _classify_line(line: str) -> Tuple[str, str]:
+def _classify_line(
+    line: str,
+    allow_parenthesized_label_sections: bool = False,
+) -> Tuple[str, str]:
     """
     行を分類する。
     Returns: (kind, inline_content)
@@ -510,6 +523,15 @@ def _classify_line(line: str) -> Tuple[str, str]:
 
     # インライン Must/Want 検出（「経験・スキル 【Must】」「【Must】〜内容〜」等）
     n_line = _n(line)
+
+    # 内容を伴わない「(必須):」「(尚可):」だけsection headerとして扱う。
+    # 「(必須) Java」等は従来どおり直後のone-shot判定へ渡す。
+    if (allow_parenthesized_label_sections
+            and _PAREN_LABEL_ONLY_REQ_RE.fullmatch(n_line)):
+        return 'required_header', ''
+    if (allow_parenthesized_label_sections
+            and _PAREN_LABEL_ONLY_OPT_RE.fullmatch(n_line)):
+        return 'optional_header', ''
 
     # 行頭の「(必須) skill」「(尚可) skill」ラベル（one-shot）
     # _INLINE_REQ_RE より先に判定（(必須) が INLINE_REQ_RE にもマッチするため）
@@ -1010,6 +1032,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
     # HTMLエンティティを解除してからNFKC正規化（&lt;必須&gt; → <必須> 等）
     text = _n(html.unescape(body))
     lines = text.splitlines()
+    allow_parenthesized_label_sections = bool(
+        _EBA_PAREN_SECTION_CONTEXT_RE.search(text)
+    )
 
     required: List[str] = []
     optional: List[str] = []
@@ -1055,7 +1080,10 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                 pseudo_parent_header = ''
                 continue
 
-        kind, inline = _classify_line(line)
+        kind, inline = _classify_line(
+            line,
+            allow_parenthesized_label_sections=allow_parenthesized_label_sections,
+        )
 
         # 確認済みの人材スキル要件ブロック内だけ、必須宣言と加点切替を扱う。
         norm = _normalize_hdr(line)
