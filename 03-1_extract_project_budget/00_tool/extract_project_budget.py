@@ -119,6 +119,31 @@ RX_HOURLY_YEN_SLASH = re.compile(r"(\d{3,5})\s*円\s*/\s*[hｈ時]")
 RX_HOURLY_YEN_SLASH_FLEX = re.compile(
     r"(?:¥|￥)?\s*([\d,]{3,7})\s*(?:円)?\s*/\s*(?:[hHｈ]|時間)"
 )
+# 2026-09-25監査の4案件に限定した円建て時給・日給。
+# 値だけの探索には使わず、明示的な価格欄との組み合わせをfullmatchする。
+_YEN_INTEGER = r"(?:\d{1,3}(?:,\d{3})+|\d{3,6})"
+_PRICE_FIELD_PREFIX = (
+    r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
+    + r"[ \t■●◇】\]:：]*(?:\n[ \t]*)?"
+)
+RX_HOURLY_YEN_VALUE_COMMA = re.compile(
+    r"時給\s*" + _YEN_INTEGER + r"\s*円"
+)
+RX_PRICE_FIELD_HOURLY_YEN = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>時給\s*(?P<yen>" + _YEN_INTEGER + r")\s*円)"
+    + r"(?:\s*\([^()\n]{1,80}\))?\s*"
+)
+RX_PRICE_FIELD_HOURLY_SETTLEMENT = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>[〜~]?\s*(?P<yen>" + _YEN_INTEGER + r")\s*円"
+    + r"\s*(?:程度?)?\s*\(\s*時給精算\s*\))\s*"
+)
+RX_PRICE_FIELD_DAILY_YEN_SYMBOL = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>[¥￥]\s*(?P<yen>" + _YEN_INTEGER + r")"
+    + r"\s*(?:円)?\s*/\s*日)\s*"
+)
 # 数値のみ範囲（万なし）: 単価:60-65 / 単価:60~65 → 万として解釈
 RX_NUM_RANGE_ONLY = re.compile(r"(\d{2,3})\s*[〜~\-]\s*(\d{2,3})(?!\s*万)(?!\s*\d)")
 
@@ -171,6 +196,9 @@ def _get_segments(text: str) -> List[str]:
             or RX_HOURLY_YEN_SLASH.search(line)
             or RX_HOURLY_YEN_SLASH_FLEX.search(line)
             or RX_HOURLY_MAN.search(line)
+            or RX_HOURLY_YEN_VALUE_COMMA.search(line)
+            or RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(line)
+            or RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(line)
             or RX_MAN_MON_RANGE.search(line)
             or RX_MAN_MON.search(line)
             or RX_MAN_DAY_RANGE.search(line)
@@ -264,6 +292,21 @@ def _monthly_explicit(seg: str) -> Optional[Tuple]:
 
 def _hourly_daily(seg: str) -> Optional[Tuple]:
     """時給・日給を検出して月換算で返す"""
+    m = RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+        return v, None, "hourly-yen", 0.82, "monthly", m.group("raw")
+
+    m = RX_PRICE_FIELD_HOURLY_YEN.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+        return v, None, "hourly-yen", 0.82, "monthly", m.group("raw")
+
+    m = RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
+        return v, None, "daily-yen-slash", 0.80, "monthly", m.group("raw")
+
     m = RX_DAILY_RANGE.search(seg)
     if m:
         lo = int(m.group(1)) * 10000 * DAILY_TO_MONTHLY

@@ -292,6 +292,28 @@ _ROUTE_ZERO_INFORMATION_SHARE_CTA = (
 _ROUTE_ZERO_INFORMATION_SHARE_OFFER = (
     "また、弊社の注力情報(案件or要員ご指定下さい)もご入用でしたらお送りいたします。"
 )
+_CLARIFY_DISTRIBUTION_REGISTRATION_SUBJECT = "配信メールご登録のお願い"
+_CLARIFY_DISTRIBUTION_REGISTRATION_CONTEXT = (
+    "貴社より案件情報を配信されているメールアドレスの登録先に、"
+)
+_CLARIFY_DISTRIBUTION_REGISTRATION_REQUEST = (
+    "弊社の下記アドレスを追加いただくことは可能でしょうか。"
+)
+_CLARIFY_DISTRIBUTION_REGISTRATION_ADDRESS = (
+    "【配信先アドレス】\nsales@clarify.co.jp"
+)
+_ESMC_NETWORKING_EVENT_SUBJECT_RE = re.compile(
+    r"【ご招待】ご担当者\s*様へ\s*まだ間に合う!ESMC交流会!"
+    r"ご参加お待ちお待ちしております!"
+)
+_ESMC_NETWORKING_EVENT_ORGANIZER = (
+    "いつも大変お世話になっております。ESMC運営事務局で御座います。"
+)
+_ESMC_NETWORKING_EVENT_ANNOUNCEMENT = "下記日時で、交流会を開催します。"
+_ESMC_NETWORKING_EVENT_APPLICATION = ">>参加申込はコチラから!"
+_ESMC_NETWORKING_EVENT_APPLICATION_URL_RE = re.compile(
+    r"https://a17\.hm-f\.jp/cc\.php\?t=M[0-9]+&c=5915&d=5990"
+)
 
 
 def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
@@ -515,6 +537,37 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
             and _ROUTE_ZERO_INFORMATION_SHARE_OFFER in body
             and not _SAKYA_INDIVIDUAL_STRUCTURE_RE.search(body)):
         return "service_notification", "route_zero_information_share_notice_v1"
+
+    if (sender == "sales@clarify.co.jp"
+            and subject == _CLARIFY_DISTRIBUTION_REGISTRATION_SUBJECT
+            and not record["attachments"]
+            and not record["html_links"]
+            and _CLARIFY_DISTRIBUTION_REGISTRATION_CONTEXT in body
+            and _CLARIFY_DISTRIBUTION_REGISTRATION_REQUEST in body
+            and _CLARIFY_DISTRIBUTION_REGISTRATION_ADDRESS in body
+            and not _PROFILE_OR_PROJECT_RE.search(body)):
+        return (
+            "service_notification",
+            "mail_distribution_registration_notice_v1",
+        )
+
+    if (sender == "esmc@ses.cre-co.jp"
+            and _ESMC_NETWORKING_EVENT_SUBJECT_RE.fullmatch(subject)
+            and not record["attachments"]
+            and _ESMC_NETWORKING_EVENT_ORGANIZER in body
+            and _ESMC_NETWORKING_EVENT_ANNOUNCEMENT in body
+            and _ESMC_NETWORKING_EVENT_APPLICATION in body
+            and not _PROFILE_OR_PROJECT_RE.search(body)):
+        application_links = [
+            link for link in record["html_links"]
+            if isinstance(link, dict)
+            and link.get("source") == "text/html"
+            and link.get("text") == "参加申込はコチラから！"
+            and isinstance(link.get("href"), str)
+            and _ESMC_NETWORKING_EVENT_APPLICATION_URL_RE.fullmatch(link["href"])
+        ]
+        if len(application_links) == 1:
+            return "service_notification", "esmc_networking_event_notice_v1"
 
     if record["attachments"] or _PROFILE_OR_PROJECT_RE.search(body):
         return None

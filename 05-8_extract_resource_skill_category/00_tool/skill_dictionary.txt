@@ -92,6 +92,7 @@
   - "Visual InterDev6.0"
   - JavaEE
   - Grizzly  # Grizzlyベース自社FWを用いた開発
+  - "Pro*C"
 
 フロントエンド:
   - JavaScript
@@ -136,6 +137,7 @@
   - SvelteKit
   - LWC  # LWCでの画面開発経験(2年以上)
   - Ajax  # Ajax
+  - WPF
 
 インフラ:
   - CentOS
@@ -291,6 +293,7 @@
   - ActiveDirectory
   - "Azure AD"  # Microsoft 365 / Microsoft Entra ID (Azure AD)
   - Nutanix
+  - Wireshark
 
 クラウドサービス:
   - CloudFront
@@ -453,6 +456,7 @@ AI:
   - Dify  # Difyを用いたAIエージェントの設計、テスト、リリース、効果測定
   - Notebooklm  # 主要技術スタックに記載
   - AIエージェント  # AIエージェントで開発スピードを高められる方
+  - OpenCV
 
 セキュリティ:
   - Prisma Access
@@ -726,6 +730,7 @@ M365系:
   - "Power Automate"
   - "Power Pages"
   - "Copilot Studio"
+  - SharePoint
 
 Google系:
   - GoogleApps
