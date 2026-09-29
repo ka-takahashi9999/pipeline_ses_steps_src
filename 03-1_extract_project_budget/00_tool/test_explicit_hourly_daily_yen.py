@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""2026-09-25監査の明示的な円建て時給・日給4案件のFocused Test。"""
+"""2026-09-29監査の価格欄「完全時給」2案件のFocused Test。"""
 
 import importlib.util
 import json
@@ -17,13 +17,11 @@ from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list
 
 
 EXPECTED = {
-    "1a0d6bf937d649a9": (848000, "hourly-yen", "〜5,300円程度(時給精算)"),
-    "1a0d6bdf7e2d5317": (848000, "hourly-yen", "〜5,300円(時給精算)"),
-    "1a0d61ed14f62d42": (260000, "daily-yen-slash", "¥13,000/日"),
-    "1a0d5e717c29bd72": (279200, "hourly-yen", "時給1,745 円"),
+    "1a0e5dcf18a36204": (699200, "4,370円程度(完全時給)"),
+    "1a0e6a2d3c01765e": (640000, "~4,000円程度(完全時給)"),
 }
-REPRESENTATIVE_PROJECT_ID = "1a0d6bf937d649a9"
-REPRESENTATIVE_RESOURCE_ID = "1a0d61ead275b248"
+REPRESENTATIVE_PROJECT_ID = "1a0e5dcf18a36204"
+REPRESENTATIVE_RESOURCE_ID = "1a0e5ec10ddeaeda"
 
 
 def _load_budget_module():
@@ -55,10 +53,14 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
                 (cls.master.get(mid) or {}).get("subject", ""),
             )
 
-    def test_four_real_projects_use_existing_monthly_conversions(self):
-        for mid, (price, reason, raw) in EXPECTED.items():
+    def test_two_real_projects_use_existing_hourly_conversion(self):
+        for mid, (price, raw) in EXPECTED.items():
             with self.subTest(message_id=mid):
                 self.assertIsNone(self.old[mid]["unit_price"])
+                self.assertEqual(
+                    self.old[mid]["unit_price_sub_infor"]["reason"],
+                    "no-match",
+                )
                 actual = self.new[mid]
                 self.assertEqual(actual["unit_price"], price)
                 self.assertEqual(
@@ -67,52 +69,87 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
                         "range": None,
                         "currency": "JPY",
                         "method": "rule",
-                        "reason": reason,
+                        "reason": "hourly-yen",
                         "tax_included": "unknown",
-                        "confidence": 0.82 if reason == "hourly-yen" else 0.8,
+                        "confidence": 0.82,
                         "kind": "monthly",
                         "unit_price_raw": raw,
                     },
                 )
+
         self.assertEqual(
-            self.new["1a0d6bf937d649a9"]["unit_price"],
-            5300 * target.HOURLY_TO_MONTHLY,
+            self.new["1a0e5dcf18a36204"]["unit_price"],
+            4370 * target.HOURLY_TO_MONTHLY,
         )
         self.assertEqual(
-            self.new["1a0d6bdf7e2d5317"]["unit_price"],
-            5300 * target.HOURLY_TO_MONTHLY,
+            self.new["1a0e6a2d3c01765e"]["unit_price"],
+            4000 * target.HOURLY_TO_MONTHLY,
         )
-        self.assertEqual(
-            self.new["1a0d5e717c29bd72"]["unit_price"],
-            1745 * target.HOURLY_TO_MONTHLY,
-        )
-        self.assertEqual(
-            self.new["1a0d61ed14f62d42"]["unit_price"],
-            13000 * target.DAILY_TO_MONTHLY,
-        )
+
+    def test_complete_hourly_and_existing_explicit_billing_variants(self):
+        cases = {
+            "complete_hourly_fullwidth": (
+                "■単価：4,370円程度（完全時給）※上振れ検討可能",
+                699200,
+                "hourly-yen",
+            ),
+            "complete_hourly_ascii": (
+                "■単価■\n~4,000円程度(完全時給)",
+                640000,
+                "hourly-yen",
+            ),
+            "hourly_settlement": (
+                "単価：〜5,300円程度(時給精算)",
+                848000,
+                "hourly-yen",
+            ),
+            "explicit_hourly": (
+                "単価：時給1,745円",
+                279200,
+                "hourly-yen",
+            ),
+            "explicit_daily": (
+                "単価：¥13,000/日",
+                260000,
+                "daily-yen-slash",
+            ),
+        }
+
+        for name, (text, price, reason) in cases.items():
+            with self.subTest(case=name):
+                actual = target.build_record("fixture", text)
+                self.assertEqual(actual["unit_price"], price)
+                self.assertEqual(
+                    actual["unit_price_sub_infor"]["reason"], reason
+                )
+                self.assertEqual(
+                    actual["unit_price_sub_infor"]["kind"], "monthly"
+                )
 
     def test_price_field_and_explicit_billing_unit_are_both_required(self):
         negatives = {
             "settlement_range": "単価：精算幅 140-180h",
             "work_time": "単価：勤務時間 9:00-18:00",
-            "overtime": "単価：残業時間 20時間",
-            "daily_incentive": "日額インセンティブ：¥13,000/日",
-            "transportation": "交通費：¥13,000/日",
+            "transportation": "交通費：4,370円",
+            "incentive": "インセンティブ：4,370円",
             "allowance": "手当：時給1,745円",
             "expense": "経費：¥13,000/日",
-            "hours_only": "単価：160時間",
-            "general_amount": "研修参加費は¥13,000/日です",
-            "yen_without_billing_unit": "単価：5,300円",
+            "general_amount": "研修参加費は4,370円です",
+            "complete_hourly_description": (
+                "契約は完全時給で、4,370円程度です"
+            ),
+            "yen_without_billing_unit": "単価：4,370円",
             "symbol_without_billing_unit": "【単価】¥13,000",
-            "hourly_without_price_field": "時給1,745円",
-            "daily_without_price_field": "¥13,000/日",
+            "complete_hourly_without_price_field": (
+                "4,370円程度(完全時給)"
+            ),
         }
         for name, text in negatives.items():
             with self.subTest(case=name):
                 self.assertIsNone(target.rule_extract(text)[0])
 
-    def test_latest_761_projects_change_only_the_four_targets(self):
-        self.assertEqual(len(self.projects), 761)
+    def test_latest_779_projects_change_only_the_two_targets(self):
+        self.assertEqual(len(self.projects), 779)
         self.assertEqual(set(self.old), set(self.new))
         full_record_changes = {
             mid for mid in self.new if self.old[mid] != self.new[mid]
@@ -124,10 +161,10 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
         self.assertEqual(full_record_changes, set(EXPECTED))
         self.assertEqual(unit_price_changes, set(EXPECTED))
         self.assertEqual(
-            sum(row["unit_price"] is None for row in self.old.values()), 12
+            sum(row["unit_price"] is None for row in self.old.values()), 11
         )
         self.assertEqual(
-            sum(row["unit_price"] is None for row in self.new.values()), 8
+            sum(row["unit_price"] is None for row in self.new.values()), 9
         )
 
     def test_in_memory_confirm(self):
@@ -139,7 +176,7 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
             self.new[row["message_id"]] for row in self.projects
             if self.new[row["message_id"]]["unit_price"] is None
         ]
-        self.assertEqual((len(extracted), len(null_rows)), (753, 8))
+        self.assertEqual((len(extracted), len(null_rows)), (770, 9))
 
         path = STEP / "02_confirm" / "confirm_extract_project_budget.py"
         spec = importlib.util.spec_from_file_location(
@@ -163,7 +200,7 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
                 for call in confirm_logger.ok.call_args_list
             ))
 
-    def test_existing_budget_logic_on_7456_pairs(self):
+    def test_existing_budget_logic_on_3786_pairs(self):
         budget = _load_budget_module()
         resources = read_jsonl_as_dict(str(
             ROOT / "05-1_extract_resource_budget" / "01_result"
@@ -172,8 +209,6 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
         passed = 0
         excluded = 0
         pair_count = 0
-        per_project = {mid: {"passed": 0, "excluded": 0} for mid in EXPECTED}
-        representative = None
         pair_path = (
             ROOT / "06-0_match_all_message_id" / "01_result"
             / "matched_pairs_all.jsonl"
@@ -195,54 +230,51 @@ class ExplicitHourlyDailyYenTest(unittest.TestCase):
                     project_price, desired_price
                 )
                 pair_count += 1
-                key = "passed" if is_match else "excluded"
-                per_project[project_id][key] += 1
                 if is_match:
                     passed += 1
                 else:
                     excluded += 1
-                if (
-                    project_id == REPRESENTATIVE_PROJECT_ID
-                    and resource_id == REPRESENTATIVE_RESOURCE_ID
-                ):
+
+        self.assertEqual(pair_count, 3786)
+        self.assertEqual((passed, excluded), (500, 3286))
+
+    def test_current_nine_sales_candidates_are_all_budget_excluded(self):
+        budget = _load_budget_module()
+        resources = read_jsonl_as_dict(str(
+            ROOT / "05-1_extract_resource_budget" / "01_result"
+            / "extract_resource_budget.jsonl"
+        ))
+        candidate_path = (
+            ROOT / "08-5_high_score_required_skill_recheck" / "01_result"
+            / "high_score_required_skill_recheck_all.jsonl"
+        )
+        results = []
+        representative = None
+        with candidate_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                project_id = (row.get("project_info") or {}).get("message_id")
+                if project_id != REPRESENTATIVE_PROJECT_ID:
+                    continue
+                resource_id = (row.get("resource_info") or {}).get("message_id")
+                desired_price = (
+                    resources.get(resource_id) or {}
+                ).get("desired_unit_price")
+                is_match = budget.judge_budget_match(699200, desired_price)
+                results.append(is_match)
+                if resource_id == REPRESENTATIVE_RESOURCE_ID:
                     representative = (
-                        project_price,
+                        699200,
                         desired_price,
                         budget.MIN_MARGIN,
                         is_match,
                     )
 
-        self.assertEqual(pair_count, 7456)
-        self.assertEqual((passed, excluded), (1778, 5678))
-        self.assertEqual(
-            per_project,
-            {
-                "1a0d6bf937d649a9": {"passed": 876, "excluded": 988},
-                "1a0d6bdf7e2d5317": {"passed": 876, "excluded": 988},
-                "1a0d61ed14f62d42": {"passed": 13, "excluded": 1851},
-                "1a0d5e717c29bd72": {"passed": 13, "excluded": 1851},
-            },
-        )
-        self.assertEqual(representative, (848000, 850000, 120000, False))
-
-        recheck_path = (
-            ROOT / "08-5_high_score_required_skill_recheck" / "01_result"
-            / "high_score_required_skill_recheck_all.jsonl"
-        )
-        representative_08_5_count = 0
-        with recheck_path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if (
-                    (row.get("project_info") or {}).get("message_id")
-                    == REPRESENTATIVE_PROJECT_ID
-                    and (row.get("resource_info") or {}).get("message_id")
-                    == REPRESENTATIVE_RESOURCE_ID
-                ):
-                    representative_08_5_count += 1
-        self.assertEqual(representative_08_5_count, 1)
+        self.assertEqual(len(results), 9)
+        self.assertEqual(results, [False] * 9)
+        self.assertEqual(representative, (699200, 1150000, 120000, False))
 
 
 if __name__ == "__main__":

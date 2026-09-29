@@ -309,6 +309,7 @@ _RESOURCE_SINGLE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     rf'稼動{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
     r'【稼働[】]',
     r'【稼動[】]',
+    rf'イニシャル{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
 ]]
 
 

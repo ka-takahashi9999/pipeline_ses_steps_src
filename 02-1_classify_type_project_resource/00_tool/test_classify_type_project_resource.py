@@ -12,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import classify_type_project_resource as target
 
 
-TARGET_MESSAGE_ID = "1a0d0d60a8c482b7"
+TARGET_MESSAGE_ID = "1a0e5c142f948c56"
 
 
 def _read_jsonl(path):
@@ -140,6 +140,38 @@ class RuleClassifyTest(unittest.TestCase):
                 )
                 self.assertIsNone(pattern.search(body))
 
+    def test_initial_label_allows_only_expected_horizontal_space_and_colon_variants(self):
+        pattern = target._RESOURCE_SINGLE_LABEL_RES[-1]
+
+        for text in (
+            "イニシャル: NM",
+            "イニシャル：NM",
+            "イニシャル : NM",
+            "イニシャル　：NM",
+            "イニシャル\t: NM",
+        ):
+            with self.subTest(text=text):
+                body = target._remove_cjk_inner_spaces(target._normalize(text))
+                self.assertIsNotNone(pattern.search(body))
+
+        body = target._remove_cjk_inner_spaces(
+            target._normalize("イニシャル\n: NM")
+        )
+        self.assertIsNone(pattern.search(body))
+
+    def test_initial_label_alone_or_below_threshold_does_not_force_resource(self):
+        empty_keywords = target.KeywordDict(resource={}, project={})
+
+        initial_only_type, _, _ = target.rule_classify(
+            "", "イニシャル: NM", empty_keywords
+        )
+        three_labels_type, _, _ = target.rule_classify(
+            "", "イニシャル: NM\n年齢: 29\n単価: 58万円", empty_keywords
+        )
+
+        self.assertNotEqual(initial_only_type, "resource")
+        self.assertNotEqual(three_labels_type, "resource")
+
     def test_resource_profile_threshold_remains_four_distinct_labels(self):
         empty_keywords = target.KeywordDict(resource={}, project={})
         three_labels = "氏名 ：A\n年齢\t：30\n所属　：弊社社員"
@@ -171,6 +203,11 @@ class RuleClassifyTest(unittest.TestCase):
             has_attachment=bool(mail.get("attachments") or []),
         )
 
+        previous = {
+            record["message_id"]: record["mail_type"]
+            for record in _read_jsonl(target._STEP_DIR / "01_result" / target.OUTPUT_CLASSIFIED)
+        }
+        self.assertEqual(previous[TARGET_MESSAGE_ID], "project")
         self.assertEqual(mail_type, "resource")
 
     def test_latest_input_has_only_the_expected_classification_change(self):
@@ -206,7 +243,7 @@ class RuleClassifyTest(unittest.TestCase):
             if mail_type != previous[message_id]:
                 changes[message_id] = (previous[message_id], mail_type)
 
-        self.assertEqual(len(input_records), 2649)
+        self.assertEqual(len(input_records), 2673)
         self.assertEqual(
             changes,
             {TARGET_MESSAGE_ID: ("project", "resource")},

@@ -294,6 +294,9 @@
   - "Azure AD"  # Microsoft 365 / Microsoft Entra ID (Azure AD)
   - Nutanix
   - Wireshark
+  - Ubuntu
+  - Solaris
+  - Systemwalker
 
 クラウドサービス:
   - CloudFront
@@ -307,6 +310,8 @@
   - ECR  # ECR等を利用したコンテナイメージの管理・バージョン運用
   - サーバレスアーキテクチャ  # サーバレスアーキテクチャ
   - Supabase
+  - Cloudflare
+  - Cognito
 
 DB:
   - "SQL Server"
@@ -731,6 +736,7 @@ M365系:
   - "Power Pages"
   - "Copilot Studio"
   - SharePoint
+  - "Exchange Online"
 
 Google系:
   - GoogleApps

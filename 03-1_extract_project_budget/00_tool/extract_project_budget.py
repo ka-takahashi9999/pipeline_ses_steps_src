@@ -137,7 +137,13 @@ RX_PRICE_FIELD_HOURLY_YEN = re.compile(
 RX_PRICE_FIELD_HOURLY_SETTLEMENT = re.compile(
     _PRICE_FIELD_PREFIX
     + r"(?P<raw>[〜~]?\s*(?P<yen>" + _YEN_INTEGER + r")\s*円"
-    + r"\s*(?:程度?)?\s*\(\s*時給精算\s*\))\s*"
+    + r"\s*(?:程度?)?\s*\(\s*(?:時給精算|完全時給)\s*\))"
+    + r"(?:\s*※上振れ検討可能)?\s*"
+)
+RX_HOURLY_SETTLEMENT_VALUE = re.compile(
+    r"[〜~]?\s*" + _YEN_INTEGER + r"\s*円"
+    + r"\s*(?:程度?)?\s*\(\s*(?:時給精算|完全時給)\s*\)"
+    + r"(?:\s*※上振れ検討可能)?\s*"
 )
 RX_PRICE_FIELD_DAILY_YEN_SYMBOL = re.compile(
     _PRICE_FIELD_PREFIX
@@ -197,6 +203,7 @@ def _get_segments(text: str) -> List[str]:
             or RX_HOURLY_YEN_SLASH_FLEX.search(line)
             or RX_HOURLY_MAN.search(line)
             or RX_HOURLY_YEN_VALUE_COMMA.search(line)
+            or RX_HOURLY_SETTLEMENT_VALUE.fullmatch(line)
             or RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(line)
             or RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(line)
             or RX_MAN_MON_RANGE.search(line)
