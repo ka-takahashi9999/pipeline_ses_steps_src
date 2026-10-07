@@ -1456,3 +1456,44 @@ confirm出力:
 
 - 実施: 保存済みmanifest/rawの専用先コピー、レビュー済みfetchのlocal replay 1回、confirm 1回、67/3,840 partition別record比較、ID・集合・成果物hash・通常master不変・残存プロセス確認。
 - 未実施: S3再取得、通常master更新、追加修正、追加レビュー、無関係テスト、AI、後続step、全体Pipeline、AWS変更、`_src`同期、commit、push。
+
+## 2026-10-07 S3取込移行のGit保存結果
+
+### 結論
+
+- runtimeを正として、未同期だったS3取込移行、個別メール影響分離、8bit本文誤隔離修正、関連合成test、移行・検証・切戻し引き継ぎを`pipeline_ses_steps_src`へ対象限定同期した。
+- primary commitは`8bf1ee8f0a0517b50f88c58a6a066c7f9eb2a47d`（`Migrate Gmail ingestion to resilient S3 replay`）。`main`から`origin/main`へ通常pushし、remote `refs/heads/main`が同SHAであることを確認した。force pushは未実施。
+- 実行4ファイルはruntimeと`_src`でbytes一致。fetch SHA-256は検証済み`66194aec508c07242925248ce6ba054f43be88964a83601c52dadb978c78eac1`。
+- メール原本、添付、master、manifest、review、実行成果物、ログ、認証情報、`.env`、日時付きbackup、無関係な変更は同期・stage・commitしていない。関連testのメールデータは`example.test`を使う合成データだけ。
+
+### primary commit対象
+
+| ファイル | 保存内容 |
+|---|---|
+| `01-1_fetch_gmail/00_tool/fetch_s3_mail.py` | S3選択・取得、個別review分離、header/添付fallback、identity payload bytes検証を含む検証済み取得器 |
+| `01-1_fetch_gmail/02_confirm/confirm_fetch_gmail.py` | success/review集合、raw hash、通常schema、正常0件等のconfirm |
+| `00_pipeline/00_tool/run_full_pipeline.sh` | S3 fetch → confirm → 01-2接続 |
+| `00_pipeline/00_tool/run_full_pipeline_master.sh` | 同一のS3 fetch → confirm → 01-2接続 |
+| `01-1_fetch_gmail/00_tool/test_fetch_s3_mail_transfer.py` | identity encodingと破損ケースの合成focused test |
+| `00_pipeline/02_confirm/gmail_s3_migration_handoff_20261001.md` | 移行・検証・review・replay・切戻し記録 |
+| `tools/pipeline_sync_git.sh` | 上記引き継ぎMarkdownだけを`02_confirm/`除外規則の完全一致例外として許可 |
+
+引き継ぎ文書は`02_confirm/`配下にあるため、正規同期スクリプトの従来規則では生成物として拒否された。`INCLUDE_ALWAYS`へこのMarkdownの相対パス1件だけを完全一致登録し、JSON/JSONL/log/他の`02_confirm`生成物の除外を維持した。正本と`/home/ec2-user/bin/pipeline_sync_git.sh`のself-checkはSHA-256 `4dc3ddcbaaa2e288cdf9baf2fa998175f83f150701e63ae79d65ede898c3fc82`で一致した。
+
+### runtime / `_src`一致
+
+| 実行ファイル | SHA-256（runtime / `_src`一致） |
+|---|---|
+| `01-1_fetch_gmail/00_tool/fetch_s3_mail.py` | `66194aec508c07242925248ce6ba054f43be88964a83601c52dadb978c78eac1` |
+| `01-1_fetch_gmail/02_confirm/confirm_fetch_gmail.py` | `0cb8e14be8853df4ed0c0ffef08ae2812e64bb7fea1bd09428f6d9e31d27e838` |
+| `00_pipeline/00_tool/run_full_pipeline.sh` | `3badb28c2adfe3d3909a06bf74ffb5dba10f6b01ea8bb0965ae728cf0f217107` |
+| `00_pipeline/00_tool/run_full_pipeline_master.sh` | `3badb28c2adfe3d3909a06bf74ffb5dba10f6b01ea8bb0965ae728cf0f217107` |
+
+### Git確認
+
+- `_src`: `/home/ec2-user/pipeline_ses_steps_src`
+- branch: `main`
+- remote: `origin` → `git@github-ka-takahashi9999:ka-takahashi9999/pipeline_ses_steps_src.git`
+- primary commit直後のlocal HEAD / `origin/main` / remote `refs/heads/main`: `8bf1ee8f0a0517b50f88c58a6a066c7f9eb2a47d`で一致。
+- 正規同期スクリプトの`git diff --check`合格。primary push後の`_src`に未commit変更なし。
+- 本節はGit保存結果を残すための引き継ぎ追記であり、引き継ぎ1ファイルだけのfollow-up記録commitとして通常pushする。
