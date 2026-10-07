@@ -16,6 +16,7 @@ Step 01-1 confirmスクリプト: fetch_gmail_mail_master.jsonl の整合性チ�
 """
 
 import sys
+import argparse
 from pathlib import Path
 
 # common モジュールのパス解決
@@ -39,7 +40,51 @@ OUTPUT_FILENAME = "fetch_gmail_mail_master.jsonl"
 
 
 def main() -> None:
-    output_path = get_result_path(str(_STEP_DIR), OUTPUT_FILENAME)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default=get_result_path(str(_STEP_DIR), OUTPUT_FILENAME))
+    parser.add_argument("--manifest")
+    parser.add_argument("--after")
+    parser.add_argument("--before")
+    parser.add_argument("--selection-limit", type=int, default=10)
+    parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument("--allow-needs-review", action="store_true")
+    args = parser.parse_args()
+    output_path = args.input
+    if args.manifest:
+        sys.path.insert(0, str(_STEP_DIR / "00_tool"))
+        from fetch_s3_mail import build_summary, validate_records
+        try:
+            if not args.after or not args.before:
+                raise ValueError("S3 confirm requires expected after/before")
+            records = read_jsonl_as_list(output_path)
+            entries = read_jsonl_as_list(args.manifest)
+            review_path = Path(args.manifest).parent / "needs_review.jsonl"
+            validate_records(records, entries, maximum=args.selection_limit,
+                             require_complete=args.require_complete,
+                             raw_dir=Path(args.manifest).parent / "raw",
+                             expected_after=args.after, expected_before=args.before,
+                             manifest_path=args.manifest if args.after else None,
+                             allow_needs_review=args.allow_needs_review,
+                             review_path=review_path)
+            expected_summary = build_summary(
+                entries, records, args.manifest, review_path)
+            summaries = read_jsonl_as_list(
+                str(Path(args.manifest).parent / "fetch_summary.jsonl"))
+            if summaries != [expected_summary]:
+                raise ValueError("fetch summary mismatch")
+        except Exception as error:
+            logger.error("S3 confirm NG: " + type(error).__name__)
+            sys.exit(1)
+        review_count = sum(entry.get("status") == "needs_review" for entry in entries)
+        warning_count = sum(entry.get("status") == "success" and
+                            bool(entry.get("header_warnings")) for entry in entries)
+        result = "要確認ありで完了" if review_count else "全件正常"
+        logger.ok(
+            f"S3 confirm OK ({result}): selected={len(entries)} "
+            f"success={len(records)} warning_success={warning_count} "
+            f"needs_review={review_count} failed=0 pending=0 "
+            f"review_records={review_path}")
+        return
 
     # 1. ファイル存在確認
     if not Path(output_path).exists():

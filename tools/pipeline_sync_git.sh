@@ -45,7 +45,10 @@ EXCLUDE_DIRS=(01_result 02_confirm 99_execution_time __pycache__ .git .venv node
 EXCLUDE_GLOBS=('*.jsonl' '*.json' '*.log' '*.pyc' '*.zip' '*.gz' 'nohup.out' 'settings.local.json')
 
 # 除外パターンに該当しても同期する例外（相対パス完全一致）
-INCLUDE_ALWAYS=('.claude/settings.json')
+INCLUDE_ALWAYS=(
+  '.claude/settings.json'
+  '00_pipeline/02_confirm/gmail_s3_migration_handoff_20261001.md'
+)
 
 # 除外ディレクトリ配下でも同期する例外（相対パスのglob一致）
 #   02_confirm は生成物置き場のため除外を維持しつつ、confirmスクリプト本体だけを許可する。

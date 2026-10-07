@@ -64,11 +64,26 @@ log "########## pipeline start ##########"
 log "RUN_DATE=$RUN_DATE"
 log "STEP_08_5_EXECUTION_MODE=$STEP_08_5_EXECUTION_MODE"
 
-# RUN_DATEを処理対象データ日とし、当日から翌日までのメールを取得する。
+# RUN_DATEを処理対象データ日とする。S3 LastModifiedのJST当日00:00以上、
+# 翌日00:00未満（当日実行時は開始時刻未満）を対象にする。
 RUN_DATE_ISO="$(date -d "$RUN_DATE" "+%Y-%m-%d")"
-FETCH_AFTER="$(date -d "$RUN_DATE_ISO" "+%Y/%m/%d")"
-FETCH_BEFORE="$(date -d "$RUN_DATE_ISO +1 day" "+%Y/%m/%d")"
-run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_gmail.py" --after "$FETCH_AFTER" --before "$FETCH_BEFORE" --max 3000
+FETCH_AFTER="$RUN_DATE_ISO"
+FETCH_BEFORE="$(date -d "$RUN_DATE_ISO +1 day" "+%Y-%m-%d")"
+S3_FETCH_RUN_DIR="$ROOT/01-1_fetch_gmail/02_confirm/s3_daily/$RUN_DATE_ISO/pipeline"
+S3_FETCH_MANIFEST="$S3_FETCH_RUN_DIR/selection_manifest.jsonl"
+S3_FETCH_MASTER="$ROOT/01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
+S3_FETCH_LIMIT=10000
+S3_FETCH_ARGS=(--after "$FETCH_AFTER" --before "$FETCH_BEFORE" --max "$S3_FETCH_LIMIT"
+  --selection-limit "$S3_FETCH_LIMIT" --sample-dir "$S3_FETCH_RUN_DIR" --out "$S3_FETCH_MASTER"
+  --canonical-output --require-complete --allow-needs-review)
+if [ -f "$S3_FETCH_MANIFEST" ]; then
+  S3_FETCH_ARGS+=(--manifest "$S3_FETCH_MANIFEST")
+fi
+run_step "01-1_fetch_gmail" "$ROOT/01-1_fetch_gmail/00_tool/fetch_s3_mail.py" "${S3_FETCH_ARGS[@]}"
+run_step "01-1_confirm_fetch_s3_mail" "$ROOT/01-1_fetch_gmail/02_confirm/confirm_fetch_gmail.py" \
+  --input "$S3_FETCH_MASTER" --manifest "$S3_FETCH_MANIFEST" \
+  --after "$FETCH_AFTER" --before "$FETCH_BEFORE" --selection-limit "$S3_FETCH_LIMIT" \
+  --require-complete --allow-needs-review
 
 run_step "01-2_remove_duplicate_emails" "$ROOT/01-2_remove_duplicate_emails/00_tool/remove_duplicate_emails.py"
 
