@@ -93,6 +93,33 @@ _WEEK_WORKLOAD_RANGE_RE = re.compile(
 _PERSON_MONTH_RE = re.compile(r"(?<![\d.])((?:0\.[1-9]|1(?:\.0+)?))\s*人\s*月")
 _PERSON_MONTH_CONSULT_RE = re.compile(r"相談可|検討可|応相談")
 
+# 複数人月の帰属判定に使う、原文上の明示的な募集対象宣言。
+# 役割語単独では除外せず、「今回の募集」等と結び付いた場合だけ使う。
+_RECRUITMENT_ROLE = r"(?:インフラ)?(?:メンバー|リーダー)|PMO|PM|PL|SE|PG|管理者"
+_RECRUITMENT_TARGET_ROLE_RES = (
+    re.compile(
+        rf"今回(?:は|の)?[^\n。]{{0,30}}?(?P<role>{_RECRUITMENT_ROLE})"
+        r"(?:枠|ポジション|担当)?[^\n。]{0,20}?募集"
+    ),
+    re.compile(
+        rf"(?:今回の?募集|募集対象|募集ポジション|今回参画いただく方)"
+        rf"[^\n。]{{0,30}}?(?P<role>{_RECRUITMENT_ROLE})"
+    ),
+)
+
+# 別組織の人物が管理・支援側として入ることが同一行で明示される場合だけ除外。
+_EXTERNAL_MANAGEMENT_ACTOR_RE = re.compile(
+    r"(?:元請|元請け|顧客|クライアント|お客様)"
+    r"(?:企業|会社|側|様)?(?:の|側の)?"
+    r"(?:プロパ|社員|PMO|PM|PL|管理者|担当者)"
+)
+_MANAGEMENT_SUPPORT_CONTEXT_RE = re.compile(
+    r"(?:管理|支援|フォロー|サポート)(?:側)?(?:として|で)?"
+)
+_SEPARATE_MANAGER_PARTICIPATION_RE = re.compile(
+    r"管理者[^\n。]{0,30}人\s*月[^\n。]{0,20}(?:参画|支援|管理)"
+)
+
 # 参考用: 週N日/週N回は原則 workload 抽出に使わない
 _WEEK_RANGE_RE = re.compile(
     r"週\s*([1-5一二三四五])\s*[日回]?\s*[〜~]\s*([1-5一二三四五])\s*[日回]"
@@ -166,21 +193,77 @@ def _extract_week_workload_range(text: str) -> Optional[Tuple[int, int, str]]:
     return None
 
 
-def _extract_person_month(text: str) -> Optional[Tuple[int, int, str]]:
+def _canonical_recruitment_role(role: str) -> str:
+    """明示募集対象と人月行を照合する最小役割名へ正規化する。"""
+    if "メンバー" in role:
+        return "メンバー"
+    if "リーダー" in role:
+        return "リーダー"
+    return role
+
+
+def _extract_explicit_recruitment_roles(text: str) -> set:
+    roles = set()
+    for pattern in _RECRUITMENT_TARGET_ROLE_RES:
+        for match in pattern.finditer(text):
+            roles.add(_canonical_recruitment_role(match.group("role")))
+    return roles
+
+
+def _is_explicit_non_target_person_month(line: str, target_roles: set) -> bool:
+    """別人物・別組織の管理支援側と原文上明確な人月だけを除外する。"""
+    if (_EXTERNAL_MANAGEMENT_ACTOR_RE.search(line)
+            and _MANAGEMENT_SUPPORT_CONTEXT_RE.search(line)):
+        return True
+
+    if target_roles and _SEPARATE_MANAGER_PARTICIPATION_RE.search(line):
+        return not any(role in line for role in target_roles)
+
+    return False
+
+
+def _extract_person_month(text: str) -> Optional[Tuple[int, int, Optional[str]]]:
     candidates = []
+    target_roles = _extract_explicit_recruitment_roles(text)
     for idx, line in enumerate(text.splitlines()):
         for m in _PERSON_MONTH_RE.finditer(line):
             pct = _person_month_to_pct(m.group(1))
             if 1 <= pct <= 100:
                 candidates.append(
-                    (_PERSON_MONTH_CONSULT_RE.search(line) is not None, idx, pct, m.group(0))
+                    (
+                        _PERSON_MONTH_CONSULT_RE.search(line) is not None,
+                        idx,
+                        pct,
+                        m.group(0),
+                        line,
+                    )
                 )
 
     if not candidates:
         return None
 
+    # 複数候補で募集対象役割が明示される場合だけ、その役割の人月を優先。
+    if len(candidates) > 1 and target_roles:
+        target_candidates = [
+            item for item in candidates
+            if any(role in item[4] for role in target_roles)
+        ]
+        if target_candidates:
+            target_candidates.sort(key=lambda item: (item[0], item[1]))
+            _, _, pct, raw, _ = target_candidates[0]
+            return pct, pct, raw
+
+    candidates = [
+        item for item in candidates
+        if not _is_explicit_non_target_person_month(item[4], target_roles)
+    ]
+    if not candidates:
+        # 明確な別人物の人月しか無い場合は、募集対象未明示としてdefaultを確定する。
+        return DEFAULT_WORKLOAD, DEFAULT_WORKLOAD, None
+
+    # 帰属が明示されない候補は従来どおり出現順（相談行は後回し）とする。
     candidates.sort(key=lambda item: (item[0], item[1]))
-    _, _, pct, raw = candidates[0]
+    _, _, pct, raw, _ = candidates[0]
     return pct, pct, raw
 
 
@@ -225,7 +308,8 @@ def rule_extract_workload(body: str) -> Tuple[int, int, str, Optional[str]]:
     person_month = _extract_person_month(text)
     if person_month:
         lo, hi, raw = person_month
-        return lo, hi, "extracted", raw
+        source = "extracted" if raw is not None else "default"
+        return lo, hi, source, raw
 
     # 5. 稼働時間（H/月 / 精算幅）→ 100%
     m = _HOURS_RE.search(text)

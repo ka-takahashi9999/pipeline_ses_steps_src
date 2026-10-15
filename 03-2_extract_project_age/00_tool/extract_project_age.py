@@ -47,6 +47,8 @@ INPUT_PROJECTS = str(
 )
 OUTPUT_EXTRACTED = "extract_project_age.jsonl"
 OUTPUT_NULL      = "99_age_null_extract_project_age.jsonl"
+OUTPUT_DEFAULT_SIGNAL = "99_default_with_age_signal.jsonl"
+OUTPUT_CLASSIFIED = "99_default_with_age_signal_classified.jsonl"
 
 AGE_DEFAULT = 100
 
@@ -357,10 +359,17 @@ def build_record(mid: str, body: str) -> Dict:
 
 
 # ── メイン ────────────────────────────────────────────────
+def initialize_confirm_audit_outputs(result_dir: Path) -> None:
+    """scheduled開始時にconfirm専用99成果物2ファイルだけを空JSONL化する。"""
+    write_jsonl(str(result_dir / OUTPUT_DEFAULT_SIGNAL), [])
+    write_jsonl(str(result_dir / OUTPUT_CLASSIFIED), [])
+
+
 def main() -> None:
     start = time.time()
     dirs = ensure_result_dirs(str(_STEP_DIR))
     result_dir = dirs["result"]
+    initialize_confirm_audit_outputs(result_dir)
 
     for path in [INPUT_PROJECTS, INPUT_CLEANED]:
         if not Path(path).exists():

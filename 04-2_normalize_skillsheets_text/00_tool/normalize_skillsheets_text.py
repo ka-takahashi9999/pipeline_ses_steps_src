@@ -20,6 +20,7 @@ import re
 import statistics
 import sys
 import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -89,6 +90,38 @@ def _space_key(value: str) -> str:
 
 
 HEADER_KEYS = {_space_key(line) for line in HEADER_LINES}
+
+# URL経由で取得した文書に限り、単一resourceのskillsheetとして利用できない
+# 明示的な複数人物一覧を検出する。添付ファイルは今回の対象外。
+EXTERNAL_SKILLSHEET_SOURCES = {
+    "google_drive",
+    "one_drive",
+    "ctsu_public_talent",
+    "other",
+}
+MULTI_PERSON_QUALITY_FLAG = "multi_person_skillsheet"
+MULTI_PERSON_LIST_RE = re.compile(
+    r"営業中技術者|要員一覧|人材一覧|技術者一覧"
+)
+PROFILE_NAME_RE = re.compile(
+    r"(?m)^[ \t]*(?:氏[ \t]*名|名前|イニシャル)[ \t]*[:：|]"
+)
+PROFILE_FIELD_RES = {
+    "affiliation": re.compile(r"(?m)^[ \t]*所[ \t]*属[ \t]*[:：|]"),
+    "age": re.compile(r"(?m)^[ \t]*年[ \t]*齢[ \t]*[:：|]"),
+    "station": re.compile(r"(?m)^[ \t]*最[ \t]*寄(?:駅)?[ \t]*[:：|]"),
+    "price": re.compile(r"(?m)^[ \t]*(?:希望)?単[ \t]*価[ \t]*[:：|]"),
+    "availability": re.compile(
+        r"(?m)^[ \t]*(?:期[ \t]*間|稼働開始|参画時期)[ \t]*[:：|]"
+    ),
+    "skills": re.compile(r"(?m)^[ \t]*(?:保有)?スキル[ \t]*[:：|]"),
+    "career": re.compile(r"(?m)^[ \t]*(?:職務)?経歴[ \t]*[:：|]"),
+    "sales_status": re.compile(
+        r"(?m)^[ \t]*営業(?:状況|ステータス)[ \t]*[:：|]"
+    ),
+}
+MIN_REPEATED_PROFILE_FIELDS = 3
+MIN_PROFILE_FIELDS_PER_BLOCK = 3
 
 BUSINESS_LINE_PREFIX_RE = re.compile(r"^\s*[・\-●■]")
 BUSINESS_KEYWORDS = (
@@ -385,6 +418,60 @@ def normalize_skillsheet(raw_text: str) -> Tuple[str, List[str], Dict[str, Any]]
     return text, cleanup_flags, cleanup_stats
 
 
+def detect_multi_person_external_skillsheet(
+    record: Dict[str, Any], text: str
+) -> Dict[str, Any]:
+    """外部取得された明示的な複数人物一覧の証拠を返す。該当しなければ空dict。"""
+    if record.get("source") not in EXTERNAL_SKILLSHEET_SOURCES:
+        return {}
+
+    normalized = unicodedata.normalize("NFKC", text or "")
+    name_matches = list(PROFILE_NAME_RE.finditer(normalized))
+    if len(name_matches) < 2:
+        return {}
+
+    field_counts = {
+        name: len(pattern.findall(normalized))
+        for name, pattern in PROFILE_FIELD_RES.items()
+    }
+    repeated_fields = {
+        name: count for name, count in field_counts.items() if count >= 2
+    }
+    if len(repeated_fields) < MIN_REPEATED_PROFILE_FIELDS:
+        return {}
+
+    complete_profile_blocks = 0
+    for index, name_match in enumerate(name_matches):
+        block_end = (
+            name_matches[index + 1].start()
+            if index + 1 < len(name_matches)
+            else len(normalized)
+        )
+        block = normalized[name_match.start():block_end]
+        block_field_count = sum(
+            1 for pattern in PROFILE_FIELD_RES.values() if pattern.search(block)
+        )
+        if block_field_count >= MIN_PROFILE_FIELDS_PER_BLOCK:
+            complete_profile_blocks += 1
+
+    # 一覧タイトルだけ、または表形式だけでは拒否しない。明示的一覧構造と
+    # 人物プロフィールブロック2件以上の両方が必要。
+    if not MULTI_PERSON_LIST_RE.search(normalized):
+        return {}
+    if complete_profile_blocks < 2:
+        return {}
+
+    # 04-1/04-2には外部文書から本人1名のブロックを選択したことを示す
+    # 既存フィールドがないため、ここに到達した文書全体は安全に本人へ限定できない。
+    return {
+        "profile_name_count": len(name_matches),
+        "repeated_profile_fields": repeated_fields,
+        "complete_profile_block_count": complete_profile_blocks,
+        "list_structure": True,
+        "single_person_block_selected": False,
+    }
+
+
 def build_record(record: Dict[str, Any]) -> Dict[str, Any]:
     success = record.get("success") is True
     raw_text = _to_text(record.get("skillsheet"))
@@ -405,6 +492,16 @@ def build_record(record: Dict[str, Any]) -> Dict[str, Any]:
         raw_char_count = len(raw_text)
         clean_text, cleanup_flags, cleanup_stats = normalize_skillsheet(raw_text)
         clean_char_count = len(clean_text)
+
+        multi_person_evidence = detect_multi_person_external_skillsheet(
+            record, clean_text
+        )
+        if multi_person_evidence:
+            success = False
+            clean_text = ""
+            clean_char_count = 0
+            cleanup_flags.append(MULTI_PERSON_QUALITY_FLAG)
+            cleanup_stats[MULTI_PERSON_QUALITY_FLAG] = multi_person_evidence
 
     reduction_char_count = max(raw_char_count - clean_char_count, 0)
     reduction_rate = (

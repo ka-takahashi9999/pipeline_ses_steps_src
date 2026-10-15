@@ -454,7 +454,7 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
         skill_sheet_url_count = len(_SIGNPOST_SKILL_SHEET_URL_RE.findall(body))
         if (profile_count >= 2
                 and all(count == profile_count for count in repeated_counts)
-                and skill_sheet_url_count == profile_count):
+                and 1 <= skill_sheet_url_count <= profile_count):
             return "multi_item_mail", "signpost_multi_resource_intro_v1"
 
     if (sender == "kinmh@t-e-system.com"
@@ -621,8 +621,15 @@ RESOURCE_COUNT_PATTERNS = (
         rf"(?P<count>[0-9]+)名の{RESOURCE_NOUN_PATTERN}"
         rf"|{RESOURCE_NOUN_PATTERN}(?:[ :])?(?P<count_after>[0-9]+)名"
     ),
+    re.compile(
+        rf"{RESOURCE_NOUN_PATTERN}[ ]*(?:×|x)[ ]*(?P<count_after>[0-9]+)名"
+    ),
     re.compile(r"(?P<count>[0-9]+)名で1人月"),
 )
+RESOURCE_ROLE_SET_PATTERN = re.compile(
+    r"(?<![a-z0-9])(?:pmo|pm|pl|pg|se)[ ]*(?P<count>[0-9]+)名セット"
+)
+RESOURCE_CONTEXT_PATTERN = re.compile(RESOURCE_NOUN_PATTERN)
 PROJECT_COUNT_PATTERNS = (
     re.compile(r"案件(?P<count>[0-9]+)件"),
     re.compile(r"(?P<count>[0-9]+)件の案件"),
@@ -690,6 +697,11 @@ def _has_explicit_multiple_resource(subject: str) -> bool:
             if subject[match.end() :].startswith("規模"):
                 continue
             return True
+
+    if RESOURCE_CONTEXT_PATTERN.search(subject):
+        for match in RESOURCE_ROLE_SET_PATTERN.finditer(subject):
+            if _match_count(match) >= 2:
+                return True
     return False
 
 

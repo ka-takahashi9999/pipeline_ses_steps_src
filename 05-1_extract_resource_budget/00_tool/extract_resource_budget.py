@@ -100,6 +100,17 @@ RX_COMMA6 = re.compile(r"(\d{3}),(\d{3})\s*円")
 RX_ZENPO = re.compile(r"(\d{1,3})\s*万[円]?\s*前後")
 # 単一万: 80万 / 80万円
 RX_MAN1 = re.compile(r"(\d{1,3})\s*万[円]?")
+# 単一千円（月額）: 660千円 / 550千円/月
+# 価格ラベルと同一行、または安全な直後行に限って別関数で使用する。
+_PRICE_FIELD_DECORATION = r"\s:■□◆◇●○・【】\[\]\-="
+RX_THOUSAND_YEN_FIELD_VALUE = re.compile(
+    rf"^[{_PRICE_FIELD_DECORATION}]*"
+    r"(?P<raw>(?P<count>\d{1,4})\s*千円(?:\s*/\s*月)?)"
+    rf"[{_PRICE_FIELD_DECORATION}]*$"
+)
+RX_PRICE_FIELD_DECORATION_ONLY = re.compile(
+    rf"^[{_PRICE_FIELD_DECORATION}]*$"
+)
 
 # 時給・日給
 RX_DAILY_RANGE = re.compile(
@@ -253,6 +264,35 @@ def _man_patterns(seg: str) -> Optional[Tuple]:
     return None
 
 
+def _thousand_yen_labeled(text: str) -> Optional[Tuple]:
+    """価格ラベルの同一行または安全な直後行から単一の千円月額を抽出する。"""
+    candidates = []
+    lines = text.splitlines()
+
+    for index, line in enumerate(lines):
+        for label_match in _PRICE_KW_RE.finditer(line):
+            remainder = line[label_match.end():]
+            value_match = RX_THOUSAND_YEN_FIELD_VALUE.fullmatch(remainder)
+
+            if (value_match is None
+                    and RX_PRICE_FIELD_DECORATION_ONLY.fullmatch(remainder)
+                    and index + 1 < len(lines)):
+                value_match = RX_THOUSAND_YEN_FIELD_VALUE.fullmatch(lines[index + 1])
+
+            if value_match is not None:
+                candidates.append(value_match)
+
+    # 複数の価格欄候補は選択せず、従来どおり抽出不能として扱う。
+    if len(candidates) != 1:
+        return None
+
+    match = candidates[0]
+    value = int(match.group("count")) * 1_000
+    if not (_PRICE_MIN <= value <= _PRICE_MAX):
+        return None
+    return value, None, None, "thousand-yen", match.group("raw")
+
+
 def _fallback_start_date_slash_man(text: str) -> Optional[Tuple]:
     """価格キーワードなしの要員リスト形式から希望単価を抽出する。"""
     for line in text.splitlines():
@@ -304,6 +344,12 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int]
         # スキル見合いフラグ
         if _SKILL_RE.search(seg):
             skill_found = True
+
+    # 千円表記は既存抽出を優先したうえで、明示価格欄だけを限定確認する。
+    result = _thousand_yen_labeled(text)
+    if result:
+        price, p_min, p_max, reason, raw = result
+        return price, p_min, p_max, reason, raw
 
     if skill_found:
         return SKILL_BASED_PRICE, None, None, "skill-based", "スキル見合い"

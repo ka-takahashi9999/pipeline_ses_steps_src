@@ -13,6 +13,18 @@ import classify_type_project_resource as target
 
 
 TARGET_MESSAGE_ID = "1a0e5c142f948c56"
+PROJECT_REQUEST_MESSAGE_IDS = (
+    "s3_528bff3a9ed1623f8a83bec459f16a9b3ae389b438a94bc7d8bea0fd54043e3d",
+    "s3_fec2114d4c2d6e8b630b133685bd08d1894b932a41241930cd6085cd492752d5",
+    "s3_d083fb5caca3fde9454209b51f51b76d6b608c693b11f1efc26645c2b4fffe8f",
+)
+ACTUAL_RESOURCE_MESSAGE_IDS = (
+    "s3_5b87003fa08ad697a86720411baa226b4746a0e7320ecde6b70fa747dd27ccdf",
+    "s3_c49952aad6f9fd7c43016fc5f451ffc18a36cf57835638fba7a612005588ac9d",
+)
+HELD_AMBIGUOUS_MESSAGE_ID = (
+    "s3_83daacd01fe012599d1ef41c7a1676b561dc6625f780c06d8e39f3d5046ded56"
+)
 
 
 def _read_jsonl(path):
@@ -183,6 +195,112 @@ class RuleClassifyTest(unittest.TestCase):
         self.assertNotEqual(three_type, "resource")
         self.assertEqual(four_type, "resource")
 
+    def test_project_requests_for_resource_introductions_are_projects(self):
+        master = {
+            record["message_id"]: record
+            for record in _read_jsonl(Path(target.INPUT_MASTER))
+        }
+        cleaned = {
+            record["message_id"]: record
+            for record in _read_jsonl(Path(target.INPUT_CLEANED))
+        }
+        previous = {
+            record["message_id"]: record["mail_type"]
+            for record in _read_jsonl(
+                target._STEP_DIR / "01_result" / target.OUTPUT_CLASSIFIED
+            )
+        }
+        keywords = target.load_keywords(target.KEYWORDS_PATH)
+
+        for message_id in PROJECT_REQUEST_MESSAGE_IDS:
+            with self.subTest(message_id=message_id):
+                mail = master[message_id]
+                body = (
+                    cleaned[message_id].get("body_text")
+                    or mail.get("body_text")
+                    or ""
+                )
+                mail_type, _, _ = target.rule_classify(
+                    mail.get("subject") or "",
+                    body,
+                    keywords,
+                    has_attachment=bool(mail.get("attachments") or []),
+                )
+                _, _, _, _, resource_context_score, _ = target.score_text(
+                    mail.get("subject") or "",
+                    body,
+                    keywords,
+                    has_attachment=bool(mail.get("attachments") or []),
+                )
+
+                self.assertEqual(previous[message_id], "resource")
+                self.assertEqual(resource_context_score, 0.0)
+                self.assertEqual(mail_type, "project")
+
+    def test_actual_resource_introductions_remain_resources(self):
+        master = {
+            record["message_id"]: record
+            for record in _read_jsonl(Path(target.INPUT_MASTER))
+        }
+        cleaned = {
+            record["message_id"]: record
+            for record in _read_jsonl(Path(target.INPUT_CLEANED))
+        }
+        keywords = target.load_keywords(target.KEYWORDS_PATH)
+
+        for message_id in ACTUAL_RESOURCE_MESSAGE_IDS:
+            with self.subTest(message_id=message_id):
+                mail = master[message_id]
+                body = (
+                    cleaned[message_id].get("body_text")
+                    or mail.get("body_text")
+                    or ""
+                )
+                mail_type, _, _ = target.rule_classify(
+                    mail.get("subject") or "",
+                    body,
+                    keywords,
+                    has_attachment=bool(mail.get("attachments") or []),
+                )
+
+                self.assertIn("要員をご紹介いたします", body)
+                self.assertEqual(mail_type, "resource")
+
+        for introduction_phrase in (
+            "要員をご紹介します",
+            "弊社要員をご紹介いたします",
+        ):
+            with self.subTest(introduction_phrase=introduction_phrase):
+                mail_type, _, _ = target.rule_classify(
+                    "", introduction_phrase, keywords
+                )
+                _, _, _, _, resource_context_score, _ = target.score_text(
+                    "", introduction_phrase, keywords
+                )
+
+                self.assertGreater(resource_context_score, 0.0)
+                self.assertEqual(mail_type, "resource")
+
+    def test_resource_request_phrases_do_not_create_resource_context(self):
+        keywords = target.load_keywords(target.KEYWORDS_PATH)
+        project_structure = "【案件】開発案件\n【概要】新規開発\n【場所】東京\n"
+
+        for request_phrase in (
+            "要員をご紹介お願いいたします",
+            "要員がおりましたらご紹介をお願いいたします",
+            "見合う要員がいましたらご紹介ください",
+            "要員をご提案お願いします",
+        ):
+            with self.subTest(request_phrase=request_phrase):
+                body = project_structure + request_phrase
+                mail_type, _, _ = target.rule_classify("", body, keywords)
+                _, _, _, _, resource_context_score, _ = target.score_text(
+                    "", body, keywords
+                )
+
+                self.assertEqual(resource_context_score, 0.0)
+                self.assertEqual(mail_type, "project")
+
     def test_target_mail_is_classified_as_resource(self):
         master = {
             record["message_id"]: record
@@ -228,6 +346,7 @@ class RuleClassifyTest(unittest.TestCase):
         input_records = _read_jsonl(Path(target.INPUT_PREV))
         keywords = target.load_keywords(target.KEYWORDS_PATH)
         changes = {}
+        current_types = {}
 
         for record in input_records:
             message_id = record["message_id"]
@@ -240,13 +359,22 @@ class RuleClassifyTest(unittest.TestCase):
                 keywords,
                 has_attachment=bool(mail.get("attachments") or []),
             )
+            current_types[message_id] = mail_type
             if mail_type != previous[message_id]:
                 changes[message_id] = (previous[message_id], mail_type)
 
-        self.assertEqual(len(input_records), 2673)
+        self.assertEqual(len(input_records), 3400)
         self.assertEqual(
             changes,
-            {TARGET_MESSAGE_ID: ("project", "resource")},
+            {
+                message_id: ("resource", "project")
+                for message_id in PROJECT_REQUEST_MESSAGE_IDS
+            },
+        )
+        self.assertEqual(current_types[HELD_AMBIGUOUS_MESSAGE_ID], "ambiguous")
+        self.assertEqual(
+            sum(mail_type == "ambiguous" for mail_type in previous.values()),
+            sum(mail_type == "ambiguous" for mail_type in current_types.values()),
         )
 
 

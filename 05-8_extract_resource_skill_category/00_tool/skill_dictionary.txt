@@ -5,6 +5,7 @@
 # ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
 
 バックエンド:
+  - VB6
   - Celery
   - VBScript
   - Java
@@ -140,6 +141,8 @@
   - WPF
 
 インフラ:
+  - IaC
+  - VPS
   - CentOS
   - Hinemos
   - Splunk
@@ -299,6 +302,7 @@
   - Systemwalker
 
 クラウドサービス:
+  - Amazon Connect
   - CloudFront
   - "AWS Bedrock"
   - "IBM Cloud"  # AWS、IBM Cloud等のクラウド環境に関する経験
@@ -380,6 +384,7 @@ DB:
   - "Jetpack Compose"
 
 データ分析/AI:
+  - MLOps
   - "Machine Learning"
   - "Deep Learning"
   - TensorFlow
@@ -404,6 +409,8 @@ DB:
   - 機械学習基盤
 
 データ分析:
+  - Redash
+  - QuickSight
   - Fivetran
   - Pandas
   - NumPy
@@ -437,6 +444,7 @@ DB:
   - "Adobe Analytics"  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
 
 AI:
+  - Whisper
   - "OpenAI API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
   - "Anthropic API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
   - "Gemini API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
@@ -464,6 +472,7 @@ AI:
   - OpenCV
 
 セキュリティ:
+  - IDS/IPS
   - Prisma Access
   - OAuth
   - SAML
@@ -554,6 +563,7 @@ AI:
   - ASM
 
 業務系:
+  - mcframe
   - SAP
   - Salesforce
   - ServiceNow

@@ -40,7 +40,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 # common モジュールのパスを追加
 STEP_DIR = Path(__file__).resolve().parent.parent
@@ -1170,6 +1170,26 @@ def download_google_drive(url: str, timeout: int = TIMEOUT_GDRIVE) -> DownloadRe
 # ---------------------------------------------------------------------------
 
 
+def build_sharepoint_excel_download_url(url: str) -> str:
+    """SharePointのExcel共有リンクだけに download=1 を設定する。"""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not host_matches(host, "sharepoint.com")
+        or "/:x:/" not in parsed.path.lower()
+    ):
+        return url
+
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() != "download"
+    ]
+    query_items.append(("download", "1"))
+    return urlunparse(parsed._replace(query=urlencode(query_items, doseq=True)))
+
+
 def download_onedrive(url: str, timeout: int = TIMEOUT_OTHER) -> DownloadResult:
     """
     OneDrive URL からファイルをダウンロードして bytes を返す。
@@ -1214,6 +1234,9 @@ def download_onedrive(url: str, timeout: int = TIMEOUT_OTHER) -> DownloadResult:
             content_type=resp.headers.get("Content-Type", ""),
             filename="",
         )
+
+    # SharePoint Excel共有リンクは既存queryを保ってdownload指定を追加する。
+    actual_url = build_sharepoint_excel_download_url(actual_url)
 
     # OneDrive の共有リンクはダウンロード URL に変換
     # https://onedrive.live.com/... → download パラメータ追加
