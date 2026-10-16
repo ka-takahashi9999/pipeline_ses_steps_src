@@ -37,6 +37,7 @@ import requests
 import warnings
 import logging
 import zipfile
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -213,6 +214,21 @@ EXCEL_NOISE_CELL_TEXTS = {
     "#NUM!",
 }
 
+XLSX_CUSTOM_PROPERTIES = "docProps/custom.xml"
+XLSX_REQUIRED_MEMBERS = {
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "xl/workbook.xml",
+    "xl/_rels/workbook.xml.rels",
+    XLSX_CUSTOM_PROPERTIES,
+}
+CUSTOM_PROPERTIES_NS = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+)
+CUSTOM_PROPERTIES_VALUE_NS = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+)
+
 
 @dataclass
 class DownloadResult:
@@ -281,6 +297,144 @@ def _normalize_excel_cell_text(value: Any) -> Optional[str]:
     return text
 
 
+def _is_missing_custom_property_name_error(error: Exception) -> bool:
+    """openpyxlのcustom property name欠損エラーだけを識別する。"""
+    message = str(error)
+    return (
+        isinstance(error, TypeError)
+        and "openpyxl.packaging.custom." in message
+        and ".name should be <class 'str'>" in message
+        and "value is <class 'NoneType'>" in message
+    )
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _sanitize_missing_custom_property_names(data: bytes) -> Optional[bytes]:
+    """
+    必須OOXML構造が正常なXLSXからname属性欠損custom propertyだけを除外する。
+
+    条件を満たさない場合はNoneを返す。原本bytesは変更しない。
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(data), "r") as source:
+            entries = source.infolist()
+            if len(entries) > MAX_OOXML_ZIP_ENTRIES or source.testzip() is not None:
+                return None
+
+            names = [entry.filename for entry in entries if not entry.is_dir()]
+            if any(names.count(required) != 1 for required in XLSX_REQUIRED_MEMBERS):
+                return None
+
+            worksheet_names = [
+                name
+                for name in names
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            ]
+            if not worksheet_names:
+                return None
+
+            content_types_root = ET.fromstring(source.read("[Content_Types].xml"))
+            package_relationships_root = ET.fromstring(source.read("_rels/.rels"))
+            workbook_root = ET.fromstring(source.read("xl/workbook.xml"))
+            workbook_relationships_root = ET.fromstring(
+                source.read("xl/_rels/workbook.xml.rels")
+            )
+            if (
+                _xml_local_name(content_types_root.tag) != "Types"
+                or _xml_local_name(package_relationships_root.tag) != "Relationships"
+                or _xml_local_name(workbook_root.tag) != "workbook"
+                or _xml_local_name(workbook_relationships_root.tag) != "Relationships"
+                or not any(
+                    _xml_local_name(element.tag) == "sheet"
+                    for element in workbook_root.iter()
+                )
+            ):
+                return None
+
+            worksheet_roots = [
+                ET.fromstring(source.read(name)) for name in worksheet_names
+            ]
+            if any(
+                _xml_local_name(root.tag) != "worksheet"
+                for root in worksheet_roots
+            ):
+                return None
+
+            # その他のXML/relationshipも構文確認し、別破損を救済しない。
+            already_parsed = XLSX_REQUIRED_MEMBERS | set(worksheet_names)
+            for name in names:
+                if name in already_parsed:
+                    continue
+                if name == "[Content_Types].xml" or name.endswith((".xml", ".rels")):
+                    ET.fromstring(source.read(name))
+
+            custom_root = ET.fromstring(source.read(XLSX_CUSTOM_PROPERTIES))
+            if custom_root.tag != f"{{{CUSTOM_PROPERTIES_NS}}}Properties":
+                return None
+
+            properties = [
+                child
+                for child in list(custom_root)
+                if child.tag == f"{{{CUSTOM_PROPERTIES_NS}}}property"
+            ]
+            missing_name = [
+                prop for prop in properties if "name" not in prop.attrib
+            ]
+            if not missing_name:
+                return None
+
+            for prop in missing_name:
+                custom_root.remove(prop)
+
+            ET.register_namespace("", CUSTOM_PROPERTIES_NS)
+            ET.register_namespace("vt", CUSTOM_PROPERTIES_VALUE_NS)
+            sanitized_custom_xml = ET.tostring(
+                custom_root,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+
+            sanitized_buffer = BytesIO()
+            with zipfile.ZipFile(sanitized_buffer, "w") as destination:
+                destination.comment = source.comment
+                for entry in entries:
+                    member_data = source.read(entry)
+                    if entry.filename == XLSX_CUSTOM_PROPERTIES:
+                        member_data = sanitized_custom_xml
+                    destination.writestr(entry, member_data)
+            return sanitized_buffer.getvalue()
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        ET.ParseError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return None
+
+
+def _load_xlsx_workbook(data: bytes) -> Any:
+    """通常loadを優先し、限定条件成立時だけsanitized copyを1回再読込する。"""
+    import openpyxl
+
+    try:
+        return openpyxl.load_workbook(BytesIO(data), data_only=True, read_only=True)
+    except Exception as error:
+        if not _is_missing_custom_property_name_error(error):
+            raise
+        sanitized = _sanitize_missing_custom_property_names(data)
+        if sanitized is None:
+            raise
+        return openpyxl.load_workbook(
+            BytesIO(sanitized), data_only=True, read_only=True
+        )
+
+
 def extract_text_from_excel(data: bytes, filename: str = "") -> str:
     """Excel (.xlsx / .xls) バイナリからテキストを抽出する。"""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -305,9 +459,7 @@ def extract_text_from_excel(data: bytes, filename: str = "") -> str:
         return "\n".join(rows)
 
     # .xlsx (ZIP形式)
-    import openpyxl
-
-    wb = openpyxl.load_workbook(BytesIO(data), data_only=True, read_only=True)
+    wb = _load_xlsx_workbook(data)
     rows = []
     for sname in wb.sheetnames:
         sheet = wb[sname]

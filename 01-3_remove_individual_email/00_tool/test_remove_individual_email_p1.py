@@ -25,6 +25,9 @@ TARGET_MESSAGE_IDS = {
 SINGLE_RESOURCE_MESSAGE_ID = (
     "s3_5b87003fa08ad697a86720411baa226b4746a0e7320ecde6b70fa747dd27ccdf"
 )
+MULTIPLE_PROJECT_SHARE_MESSAGE_ID = (
+    "s3_0e1e7d9a7ff41e2e0301c444445d29a7772563fb85e671a16a25ee94e18c7e67"
+)
 
 
 def _read_jsonl(path):
@@ -149,6 +152,33 @@ class SubjectDetectorTest(unittest.TestCase):
         self.assert_allowed("M365案件")
         self.assert_allowed("3案件")
 
+    def test_multiple_project_share_or_intro_grammars(self) -> None:
+        for subject in (
+            "3案件ご共有",
+            "3案件共有",
+            "2案件ご紹介",
+            "2案件紹介",
+            "３案件ご共有",
+        ):
+            with self.subTest(subject=subject):
+                self.assertEqual(
+                    detector.detect_p1_exclusion_reason(subject),
+                    "multiple_project_explicit_subject_count",
+                )
+
+    def test_single_and_unrelated_project_phrases_are_allowed(self) -> None:
+        for subject in (
+            "1案件ご共有",
+            "1案件紹介",
+            "3案件の参画経験があります",
+            "過去2案件を担当",
+            "3案件目から参画",
+            "2案件について検討",
+            "案件3をご共有",
+        ):
+            with self.subTest(subject=subject):
+                self.assert_allowed(subject)
+
     def test_body_urls_and_attachments_are_not_detector_inputs(self) -> None:
         record = {
             "subject": "単一要員のご紹介",
@@ -177,7 +207,7 @@ class SubjectDetectorTest(unittest.TestCase):
                     "multiple_resource_explicit_subject_count",
                 )
 
-    def test_latest_survivors_have_only_six_new_exclusions(self) -> None:
+    def test_latest_survivors_have_only_target_new_exclusion(self) -> None:
         subjects = _read_master_subjects()
         survivor_ids = {
             record["message_id"]
@@ -191,8 +221,8 @@ class SubjectDetectorTest(unittest.TestCase):
             if detector.detect_p1_exclusion_reason(subjects[message_id]) is not None
         }
 
-        self.assertEqual(len(survivor_ids), 3400)
-        self.assertEqual(newly_excluded, TARGET_MESSAGE_IDS)
+        self.assertEqual(len(survivor_ids), 3417)
+        self.assertEqual(newly_excluded, {MULTIPLE_PROJECT_SHARE_MESSAGE_ID})
 
     def test_actual_single_resource_remains_allowed(self) -> None:
         subjects = _read_master_subjects()

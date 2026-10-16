@@ -633,6 +633,7 @@ RESOURCE_CONTEXT_PATTERN = re.compile(RESOURCE_NOUN_PATTERN)
 PROJECT_COUNT_PATTERNS = (
     re.compile(r"案件(?P<count>[0-9]+)件"),
     re.compile(r"(?P<count>[0-9]+)件の案件"),
+    re.compile(r"(?P<count>[0-9]+)案件[ ]*(?:ご?共有|ご?紹介)"),
 )
 
 RECRUITMENT_VETO_WORDS = (
@@ -733,7 +734,7 @@ def _list_as_primary_reason(subject: str) -> Optional[str]:
 
 
 def _has_explicit_multiple_project(subject: str) -> bool:
-    """案件N件/N件の案件の2形式だけで明示的な複数案件を判定する。"""
+    """案件N件/N件の案件/N案件の共有・紹介で明示的な複数案件を判定する。"""
     for pattern in PROJECT_COUNT_PATTERNS:
         for match in pattern.finditer(subject):
             if _match_count(match) >= 2:

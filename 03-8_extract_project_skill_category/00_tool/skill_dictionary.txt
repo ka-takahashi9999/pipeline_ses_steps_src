@@ -94,6 +94,9 @@
   - JavaEE
   - Grizzly  # Grizzlyベース自社FWを用いた開発
   - "Pro*C"
+  - Clojure
+  - PowerBuilder
+  - boto3
 
 フロントエンド:
   - JavaScript
@@ -139,6 +142,8 @@
   - LWC  # LWCでの画面開発経験(2年以上)
   - Ajax  # Ajax
   - WPF
+  - RxJS
+  - PrimeNG
 
 インフラ:
   - IaC
@@ -300,6 +305,14 @@
   - Ubuntu
   - Solaris
   - Systemwalker
+  - AKS
+  - Kibana
+  - robocopy
+  - "OpenShift Virtualization"
+  - "BMC Control-M"
+  - "BMC Patrol"
+  - "BMC Remedy ITSM"
+  - "IBM Tivoli"
 
 クラウドサービス:
   - Amazon Connect
@@ -316,6 +329,9 @@
   - Supabase
   - Cloudflare
   - Cognito
+  - "API Gateway"
+  - CodeBuild
+  - CodeCommit
 
 DB:
   - "SQL Server"
@@ -361,6 +377,7 @@ DB:
   - Realm
   - Symfoware
   - Firestore
+  - RMAN
 
 モバイル:
   - iOS
@@ -382,6 +399,8 @@ DB:
   - ReactNative
   - UIKit
   - "Jetpack Compose"
+  - RxJava
+  - Retrofit2
 
 データ分析/AI:
   - MLOps
@@ -407,6 +426,7 @@ DB:
   - Gurobi
   - RAG
   - 機械学習基盤
+  - MATLAB
 
 データ分析:
   - Redash
@@ -442,6 +462,8 @@ DB:
   - PowerPlatform  # データ基盤（PowerPlatform）
   - GA4  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
   - "Adobe Analytics"  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
+  - "Microsoft Clarity"
+  - Presto
 
 AI:
   - Whisper
@@ -470,6 +492,7 @@ AI:
   - Notebooklm  # 主要技術スタックに記載
   - AIエージェント  # AIエージェントで開発スピードを高められる方
   - OpenCV
+  - HuggingFace
 
 セキュリティ:
   - IDS/IPS
@@ -492,6 +515,7 @@ AI:
   - EDR  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
   - WAF  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
   - メールセキュリティ  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
+  - Tripwire
 
 テスト/品質:
   - Vitest
@@ -522,6 +546,7 @@ AI:
   - TestRail
   - TDD
   - Postman
+  - Autify
 
 プロジェクト管理:
   - Agile
@@ -561,6 +586,7 @@ AI:
   - 三菱マイコン
   - "C/C++"
   - ASM
+  - Simulink
 
 業務系:
   - mcframe
@@ -605,6 +631,7 @@ AI:
   - ShareGate
   - "AvePoint Fly"
   - "S/4HANA"  # S/4HANA導入プロジェクトにおいて
+  - "X++"
 
 ミドルウェア・基盤:
   - HULFT
@@ -615,6 +642,8 @@ AI:
   - FJMW  # FJMW系の構築・運用作業経験
   - MIDMOST  # MIDMOST
   - Cosminexus
+  - MuleSoft
+  - Clamd
 
 営業系:
   - 法人営業
@@ -779,6 +808,7 @@ CMS系:
   - クラウド型データ分析基盤
   - クラウドリフト
   - E2Eアーキテクチャ
+  - "Event Sourcing"
 
 #Excel/Word/PowerPoint系: #汎用的すぎて広範囲で一致が発生する為除外
 #  - Excel

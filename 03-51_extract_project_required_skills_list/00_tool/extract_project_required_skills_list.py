@@ -111,6 +111,12 @@ SUPPLEMENTAL_REQUIRED_PATTERNS = [
 
 YEARS_EXPERIENCE_PATTERN = re.compile(r"(?:(実務経験)\s*)?(\d+)\s*年以上")
 
+# 03-51で必須/尚可条件の限定子を保持すべき複合skill。
+# 通常のskill category抽出（03-8/05-8）への波及を避け、03-51の抽出辞書にだけ補完する。
+PRESERVED_COMPOUND_SKILLS = (
+    "z/Linux",
+)
+
 
 # ── 正規化 ────────────────────────────────────────────────────────────────
 def _normalize(s: str) -> str:
@@ -216,6 +222,19 @@ def load_skill_list(path: str) -> List[Tuple[str, re.Pattern]]:
             else:
                 pattern = re.compile(escaped, re.IGNORECASE)
             entries.append((skill_str, pattern))
+
+    # 元辞書にある汎用語（Linux等）より長い複合語を先に評価する。
+    # extract_skill_keywordsのspan重複抑止により、同一のz/Linux内のLinuxは別語にならない。
+    for skill_str in PRESERVED_COMPOUND_SKILLS:
+        if skill_str in seen:
+            continue
+        seen.add(skill_str)
+        escaped = re.escape(_normalize(skill_str))
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9\-\.])" + escaped + r"(?![A-Za-z0-9\-\.])",
+            re.IGNORECASE,
+        )
+        entries.append((skill_str, pattern))
 
     # 複合スキル優先（長さ降順）
     entries.sort(key=lambda x: len(x[0]), reverse=True)

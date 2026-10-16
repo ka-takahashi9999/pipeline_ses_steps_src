@@ -1,37 +1,189 @@
 # Codex execpolicy rules (project scope) — Codex CLI 0.147.0
 #
 # 目的:
-#   - 正規sync/git「実行用コピー」だけを無確認で自走可能にする
+#   - 正規Git同期 / AWS / 固定HTTP wrapperを無確認で自走可能にする
+#   - IAM権限変更、SSM秘密値取得、S3削除は明示確認する
 #   - 破壊的なGit操作を禁止する
 #
 # 有効な decision は allow / prompt / forbidden の3種のみ（0.147.0で実測確認済み）。
 # 検証: codex execpolicy check --rules .codex/rules/pipeline.rules <command...>
 #
 # 制約（既知）:
-#   prefix_rule は argv の先頭一致で判定するため、
-#   `bash -lc "git push --force"` のようにシェル経由で包まれた場合は一致しない。
-#   最終的な破壊操作の防止は「スクリプトにforce push機能を持たせない」設計側で担保する。
+#   prefix_rule は argv の先頭一致で判定する。
+#   raw git pushはallowせず、commit / pushは固定sync wrapperへ統一する。
+#   force optionの表記位置にかかわらず自動許可されず、Agentの不変ルールでも禁止する。
 
 # --- 正規sync/git経路（実行用コピーのみ）---
 # 正本 tools/pipeline_sync_git.sh は workspace 内でAIが編集可能なため allow しない。
 # 「正本を書き換えて sandbox 外で無確認実行」という経路を作らないこと。
 prefix_rule(pattern=["/home/ec2-user/bin/pipeline_sync_git.sh"], decision="allow")
 
-# --- AWS read-only 調査経路（実行用コピーのみ）---
+# --- AWS read-only 調査経路（実行用コピー）---
 # allow list方式のラッパー。変更操作・秘密情報取得は未実装。
-# raw な aws / /usr/bin/aws は allow しない。
 prefix_rule(pattern=["/home/ec2-user/bin/pipeline_aws_readonly.sh"], decision="allow")
 
-# --- 破壊的Git操作は禁止 ---
-prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
-prefix_rule(pattern=["git", "push", "--force-with-lease"], decision="forbidden")
-prefix_rule(pattern=["git", "push", "-f"], decision="forbidden")
-prefix_rule(pattern=["git", "reset", "--hard"], decision="forbidden")
-prefix_rule(pattern=["git", "clean"], decision="forbidden")
+# --- Git ---
+# read-only操作だけを直接allowする。add / commit / pushは固定sync wrapperへ統一し、
+# raw実行はon-requestへ戻す。
+prefix_rule(pattern=[["git", "/usr/bin/git"], "status"], decision="allow")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "diff"], decision="allow")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "log"], decision="allow")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "show"], decision="allow")
 
-# --- git -C <_src> 形式の破壊操作も禁止（通常の status / diff / push は対象外）---
-prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "--force"], decision="forbidden")
-prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "--force-with-lease"], decision="forbidden")
-prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "-f"], decision="forbidden")
-prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "reset", "--hard"], decision="forbidden")
-prefix_rule(pattern=["git", "-C", "/home/ec2-user/pipeline_ses_steps_src", "clean"], decision="forbidden")
+# --- 通常AWS CLI ---
+# Pipeline / Fresh Run / Step Functionsの業務上の実行可否はWORKFLOW.mdを正とする。
+prefix_rule(pattern=[["aws", "/usr/bin/aws"]], decision="allow")
+
+# service名より前のglobal optionはsensitive ruleを迂回し得るため明示確認する。
+prefix_rule(
+    pattern=[
+        ["aws", "/usr/bin/aws"],
+        [
+            "--profile",
+            "--region",
+            "--output",
+            "--endpoint-url",
+            "--no-verify-ssl",
+            "--ca-bundle",
+            "--debug",
+        ],
+    ],
+    decision="prompt",
+)
+prefix_rule(pattern=[["aws", "/usr/bin/aws"], "configure"], decision="prompt")
+
+# IAM read-onlyはgeneric AWS allowを使用し、権限・認証情報を変更するoperationだけ確認する。
+prefix_rule(
+    pattern=[
+        ["aws", "/usr/bin/aws"],
+        "iam",
+        [
+            "add-client-id-to-open-id-connect-provider",
+            "add-role-to-instance-profile",
+            "add-user-to-group",
+            "attach-group-policy",
+            "attach-role-policy",
+            "attach-user-policy",
+            "change-password",
+            "create-access-key",
+            "create-account-alias",
+            "create-group",
+            "create-instance-profile",
+            "create-login-profile",
+            "create-open-id-connect-provider",
+            "create-policy",
+            "create-policy-version",
+            "create-role",
+            "create-saml-provider",
+            "create-service-linked-role",
+            "create-service-specific-credential",
+            "create-user",
+            "create-virtual-mfa-device",
+            "deactivate-mfa-device",
+            "delete-access-key",
+            "delete-account-alias",
+            "delete-account-password-policy",
+            "delete-group",
+            "delete-group-policy",
+            "delete-instance-profile",
+            "delete-login-profile",
+            "delete-open-id-connect-provider",
+            "delete-policy",
+            "delete-policy-version",
+            "delete-role",
+            "delete-role-permissions-boundary",
+            "delete-role-policy",
+            "delete-saml-provider",
+            "delete-server-certificate",
+            "delete-service-linked-role",
+            "delete-service-specific-credential",
+            "delete-signing-certificate",
+            "delete-ssh-public-key",
+            "delete-user",
+            "delete-user-permissions-boundary",
+            "delete-user-policy",
+            "delete-virtual-mfa-device",
+            "detach-group-policy",
+            "detach-role-policy",
+            "detach-user-policy",
+            "enable-mfa-device",
+            "put-group-policy",
+            "put-role-permissions-boundary",
+            "put-role-policy",
+            "put-user-permissions-boundary",
+            "put-user-policy",
+            "remove-client-id-from-open-id-connect-provider",
+            "remove-role-from-instance-profile",
+            "remove-user-from-group",
+            "reset-service-specific-credential",
+            "resync-mfa-device",
+            "set-default-policy-version",
+            "set-security-token-service-preferences",
+            "update-access-key",
+            "update-account-password-policy",
+            "update-assume-role-policy",
+            "update-group",
+            "update-login-profile",
+            "update-open-id-connect-provider-thumbprint",
+            "update-role",
+            "update-role-description",
+            "update-saml-provider",
+            "update-server-certificate",
+            "update-service-specific-credential",
+            "update-signing-certificate",
+            "update-ssh-public-key",
+            "update-user",
+            "upload-server-certificate",
+            "upload-signing-certificate",
+            "upload-ssh-public-key",
+        ],
+    ],
+    decision="prompt",
+)
+
+# SecureString復号・値表示を区別できないため、raw CLIのParameter値取得は確認する。
+# describe-parameters等のmetadata readと固定read-only wrapperはgeneric allowのまま。
+prefix_rule(
+    pattern=[
+        ["aws", "/usr/bin/aws"],
+        "ssm",
+        ["get-parameter", "get-parameters", "get-parameters-by-path", "get-parameter-history"],
+    ],
+    decision="prompt",
+)
+
+# S3 put / copy等は許可し、削除・move・--deleteを持ち得るsyncは確認する。
+prefix_rule(
+    pattern=[["aws", "/usr/bin/aws"], "s3", ["rm", "mv", "sync"]],
+    decision="prompt",
+)
+prefix_rule(
+    pattern=[
+        ["aws", "/usr/bin/aws"],
+        "s3api",
+        ["delete-object", "delete-objects", "delete-bucket"],
+    ],
+    decision="prompt",
+)
+
+# --- Internet通信 ---
+# raw curl / wgetはallowせずon-requestへ戻す。外部通信は、接続先を検証する
+# 固定実行用wrapperだけを無確認で利用する。
+prefix_rule(pattern=["/home/ec2-user/bin/pipeline-public-fetch"], decision="allow")
+prefix_rule(pattern=["/home/ec2-user/bin/pipeline-http-request"], decision="allow")
+
+# --- 破壊的Git操作は禁止 ---
+prefix_rule(pattern=[["git", "/usr/bin/git"], "push", "--force"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "push", "--force-with-lease"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "push", "-f"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "push", "--mirror"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "reset", "--hard"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "clean"], decision="forbidden")
+
+# --- git -C <_src> 形式の破壊操作も禁止 ---
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "--force-with-lease"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "-f"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "push", "--mirror"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "reset", "--hard"], decision="forbidden")
+prefix_rule(pattern=[["git", "/usr/bin/git"], "-C", "/home/ec2-user/pipeline_ses_steps_src", "clean"], decision="forbidden")

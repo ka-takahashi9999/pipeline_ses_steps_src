@@ -101,6 +101,9 @@ RX_ZENPO = re.compile(r"(\d{1,3})\s*万[円]?\s*(?:前後|程度?)")
 # 単一万: 80万 / 80万円
 RX_MAN1 = re.compile(r"(\d{1,3})\s*万[円]?")
 
+# 円整数（カンマ区切りまたは3〜6桁）。数値途中の部分一致は各pattern側で防ぐ。
+_YEN_INTEGER = r"(?:\d{1,3}(?:,\d{3})+|\d{3,6})"
+
 # 時給・日給
 RX_DAILY_RANGE = re.compile(
     r"日給\s*(\d{1,2})\s*万[円]?\s*[〜~\-]\s*(\d{1,2})\s*万[円]?"
@@ -112,16 +115,31 @@ RX_FIXED_DAILY_YEN = re.compile(
     r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
     + r"[ \t】\]:：]*(?P<yen>\d{1,3}(?:,\d{3})+|\d{3,6})[ \t]*円[ \t]*/[ \t]*日[ \t]*"
 )
-RX_HOURLY_YEN = re.compile(r"時給\s*(\d{3,5})\s*円")
+RX_HOURLY_YEN = re.compile(
+    r"時給\s*(?P<yen>\d{3,6})(?![\d,])\s*円"
+)
+RX_STANDALONE_HOURLY_YEN_COMMA = re.compile(
+    r"\s*(?P<raw>時給\s*(?P<yen>\d{1,3}(?:,\d{3})+)\s*円)\s*"
+)
 RX_HOURLY_MAN = re.compile(r"時給\s*(\d{1,2})\s*万[円]?")
+# 両端が円額で /時 が明示された閉区間だけを時給rangeとして扱う。
+RX_HOURLY_YEN_RANGE = re.compile(
+    r"(?<![\d,])(?P<low>" + _YEN_INTEGER + r")(?![\d,])\s*円\s*"
+    + _SEP
+    + r"\s*(?P<high>" + _YEN_INTEGER + r")(?![\d,])\s*円"
+    + r"\s*/\s*(?:[hH]|時間|時)"
+)
 # 時給記号なし: 1900円/h / 2000円/時
-RX_HOURLY_YEN_SLASH = re.compile(r"(\d{3,5})\s*円\s*/\s*[hｈ時]")
+RX_HOURLY_YEN_SLASH = re.compile(
+    r"(?<![\d,])(?P<yen>" + _YEN_INTEGER + r")(?![\d,])"
+    + r"\s*円\s*/\s*(?:[hH]|時間|時)"
+)
 RX_HOURLY_YEN_SLASH_FLEX = re.compile(
-    r"(?:¥|￥)?\s*([\d,]{3,7})\s*(?:円)?\s*/\s*(?:[hHｈ]|時間)"
+    r"(?<![\d,])(?:¥|￥)?\s*(?P<yen>" + _YEN_INTEGER + r")(?![\d,])"
+    + r"\s*(?:円)?\s*/\s*(?:[hH]|時間)"
 )
 # 2026-09-25監査の4案件に限定した円建て時給・日給。
 # 値だけの探索には使わず、明示的な価格欄との組み合わせをfullmatchする。
-_YEN_INTEGER = r"(?:\d{1,3}(?:,\d{3})+|\d{3,6})"
 _PRICE_FIELD_PREFIX = (
     r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
     + r"[ \t■●◇】\]:：]*(?:\n[ \t]*)?"
@@ -198,7 +216,9 @@ def _get_segments(text: str) -> List[str]:
             or RX_DAILY_MAN.search(line)
             or RX_DAILY_YEN.search(line)
             or RX_FIXED_DAILY_YEN.fullmatch(line)
+            or RX_HOURLY_YEN_RANGE.search(line)
             or RX_HOURLY_YEN.search(line)
+            or RX_STANDALONE_HOURLY_YEN_COMMA.fullmatch(line)
             or RX_HOURLY_YEN_SLASH.search(line)
             or RX_HOURLY_YEN_SLASH_FLEX.search(line)
             or RX_HOURLY_MAN.search(line)
@@ -309,10 +329,29 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
         v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
         return v, None, "hourly-yen", 0.82, "monthly", m.group("raw")
 
+    m = RX_STANDALONE_HOURLY_YEN_COMMA.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+        return v, None, "hourly-yen", 0.82, "monthly", m.group("raw")
+
     m = RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(seg)
     if m:
         v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
         return v, None, "daily-yen-slash", 0.80, "monthly", m.group("raw")
+
+    m = RX_HOURLY_YEN_RANGE.search(seg)
+    if m:
+        a = _yen_to_int(m.group("low")) * HOURLY_TO_MONTHLY
+        b = _yen_to_int(m.group("high")) * HOURLY_TO_MONTHLY
+        lo, hi = min(a, b), max(a, b)
+        return (
+            (lo + hi) // 2,
+            {"min": lo, "max": hi},
+            "hourly-yen-range",
+            0.85,
+            "monthly",
+            m.group(0),
+        )
 
     m = RX_DAILY_RANGE.search(seg)
     if m:
@@ -337,17 +376,17 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
 
     m = RX_HOURLY_YEN.search(seg)
     if m:
-        v = int(m.group(1)) * HOURLY_TO_MONTHLY
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
         return v, None, "hourly-yen", 0.82, "monthly", m.group(0)
 
     m = RX_HOURLY_YEN_SLASH.search(seg)
     if m:
-        v = int(m.group(1)) * HOURLY_TO_MONTHLY
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
         return v, None, "hourly-yen-slash", 0.80, "monthly", m.group(0)
 
     m = RX_HOURLY_YEN_SLASH_FLEX.search(seg)
     if m:
-        v = _yen_to_int(m.group(1)) * HOURLY_TO_MONTHLY
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
         return v, None, "hourly-yen-slash", 0.82, "monthly", m.group(0)
 
     m = RX_HOURLY_MAN.search(seg)

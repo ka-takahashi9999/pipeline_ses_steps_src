@@ -892,6 +892,74 @@ _RESOURCE_INTRO_KEYWORDS = [
 ]
 _RESOURCE_INTRO_THRESHOLD = 3
 
+# 要員紹介signalが閾値以上でも、正式なrequired sectionを持つ明確な案件構造なら
+# required / optional抽出を継続する。本文中の一般語ではなく、行単位の案件ラベル
+# として完全一致したものだけを数え、「希望作業内容」等の要員希望条件は含めない。
+_PROJECT_CONTENT_STRUCTURE_KWS: frozenset = frozenset([
+    '案件名', '案件概要', '案件内容', '作業内容',
+    '業務内容', '業務概要', 'プロジェクト名',
+])
+_PROJECT_DETAIL_STRUCTURE_KWS: frozenset = frozenset([
+    '募集人数', '人数', '作業場所', '勤務地',
+    '期間', '作業期間', '契約期間', '案件期間',
+    '単価', '単金', '契約金額', '精算', '面談',
+])
+_PROJECT_STRUCTURE_KWS: frozenset = (
+    _PROJECT_CONTENT_STRUCTURE_KWS | _PROJECT_DETAIL_STRUCTURE_KWS
+)
+
+
+def _has_explicit_required_header(body: str) -> bool:
+    """既存の正式required header判定でsection見出しが存在するか確認する。"""
+    text = _n(html.unescape(body))
+    allow_parenthesized_label_sections = bool(
+        _EBA_PAREN_SECTION_CONTEXT_RE.search(text)
+    )
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        kind, _ = _classify_line(
+            line,
+            allow_parenthesized_label_sections=allow_parenthesized_label_sections,
+        )
+        if kind == 'required_header':
+            return True
+    return False
+
+
+def _project_structure_label(line: str) -> str:
+    """案件構造の明示ラベルを行から取り出す（値や希望条件は数えない）。"""
+    bracket_key = _get_bracket_key(line)
+    if bracket_key:
+        label = _normalize_hdr(bracket_key)
+    else:
+        label = _normalize_hdr(line)
+        if ':' in label:
+            label = label.split(':', 1)[0]
+    return label if label in _PROJECT_STRUCTURE_KWS else ''
+
+
+def _has_clear_single_project_structure(body: str) -> bool:
+    """案件内容系ラベルを含む、2種類以上の明示的な案件ラベルを要求する。"""
+    labels = {
+        label
+        for label in (
+            _project_structure_label(line)
+            for line in _n(html.unescape(body)).splitlines()
+        )
+        if label
+    }
+    return bool(labels & _PROJECT_CONTENT_STRUCTURE_KWS) and len(labels) >= 2
+
+
+def _should_extract_despite_resource_signals(body: str) -> bool:
+    """正式required section AND 明確な単一案件構造の場合だけskipを抑止する。"""
+    return (
+        _has_explicit_required_header(body)
+        and _has_clear_single_project_structure(body)
+    )
+
 
 def _is_resource_introduction(body: str) -> bool:
     # 全角スペース「性　別」→NFKC→「性 別」のようなケースに対応するため
@@ -1280,7 +1348,8 @@ def llm_extract_skills(mid: str, body: str) -> Tuple[List[Dict], List[Dict]]:
 def extract_skills(mid: str, body: str) -> Tuple[List[Dict], List[Dict], str]:
     normalized = _n(body)
 
-    if _is_resource_introduction(normalized):
+    if (_is_resource_introduction(normalized)
+            and not _should_extract_despite_resource_signals(normalized)):
         logger.info(f"要員紹介スキップ: {mid}", message_id=mid)
         return [], [], "skip"
 

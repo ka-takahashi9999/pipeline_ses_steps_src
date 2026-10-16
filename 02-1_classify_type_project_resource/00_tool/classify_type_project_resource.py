@@ -312,6 +312,44 @@ _RESOURCE_SINGLE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     rf'イニシャル{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
 ]]
 
+# 3種類まで既存profile labelが揃った単一要員メールの限定救済用。
+# 「場所」「時期」等は案件本文にも出現するため、通常のprofile labelには加えず、
+# 強いresource提示signalとのAND条件でのみ使用する。
+_RESOURCE_AUX_PROFILE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
+    rf'場所{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
+    r'【場所[】]',
+    rf'所在地{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
+    r'【所在地[】]',
+    rf'時期{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
+    r'【時期[】]',
+    rf'稼働開始{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
+    r'【稼働開始[】]',
+]]
+
+# 「要員募集」等の案件件名を拾わないよう、【…要員】で閉じる件名だけを扱う。
+_RESOURCE_PROFILE_SUBJECT_RE = re.compile(r'【[^】\r\n]{0,30}要員】')
+_RESOURCE_RESUME_LABEL_RE = re.compile(
+    rf'(?:業務)?経歴書{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]'
+)
+
+
+def _has_limited_resource_profile_rescue(
+    subject: str,
+    body_cjk: str,
+    resource_profile_label_count: int,
+) -> bool:
+    """3 profile labelsの単一要員を、狭いAND条件でのみ救済する。"""
+    if resource_profile_label_count < 3:
+        return False
+    if not any(pattern.search(body_cjk) for pattern in _RESOURCE_AUX_PROFILE_LABEL_RES):
+        return False
+
+    normalized_subject = _normalize(subject or "")
+    return bool(
+        _RESOURCE_PROFILE_SUBJECT_RE.search(normalized_subject)
+        or _RESOURCE_RESUME_LABEL_RE.search(body_cjk)
+    )
+
 
 # CJK文字間に挟まれた半角スペース除去用パターン（全角スペースはNFKCで半角化済みのため）
 # 例: 「案 件：」→「案件：」「単 価：」→「単価：」（ラベル表記の全角スペース整形アーティファクト）
@@ -479,6 +517,11 @@ def rule_classify(
     # 氏名：, 【氏名】, 年齢：, 【年齢】, 所属：, 【所属】 等が4つ以上 = 要員プロフィール
     res_struct = sum(1 for p in _RESOURCE_SINGLE_LABEL_RES if p.search(body_cjk))
     if res_struct >= 4:
+        return "resource", 0.85, []
+
+    # profile labelが3種類まで揃っている場合の限定救済。
+    # 補助label単独、threshold緩和、score調整は行わない。
+    if _has_limited_resource_profile_rescue(subject, body_cjk, res_struct):
         return "resource", 0.85, []
 
     res_score, proj_score, res_hits, proj_hits, res_ctx, proj_ctx = score_text(

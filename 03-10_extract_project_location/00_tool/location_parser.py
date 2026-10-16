@@ -77,6 +77,18 @@ _BODY_SIG_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 地方候補が競合した場合だけ優先できる、明示的な地域表現。
+# 曖昧地名の網羅DBは持たず、既存辞書語そのもの、またはその直後の行政区分で判定する。
+_EXPLICIT_REGION_KEYWORDS = {
+    "東京", "大阪", "都内", "23区内", "首都圏",
+    "北海道", "東北", "関東", "中部", "北陸", "東海",
+    "関西", "関西圏", "近畿", "中国地方", "四国", "九州", "沖縄",
+}
+_ADMINISTRATIVE_SUFFIXES = {"都", "道", "府", "県", "市", "区"}
+# 既存辞書に曖昧性metadataがないため、今回原文で地域競合を確認できた語だけを
+# 最小限に列挙する。非曖昧な勤務地や複数拠点を明示地域で上書きしないために使う。
+_KNOWN_AMBIGUOUS_LOCATION_KEYWORDS = {"京橋", "日本橋"}
+
 
 def _n(s: str) -> str:
     """NFKC正規化"""
@@ -189,27 +201,107 @@ def _match_from_tokens(
     entries: List[Tuple[str, str, "re.Pattern"]],
 ) -> Optional[Tuple[str, str]]:
     """
-    トークンリストから最初にマッチした地方を返す。
+    トークンリストから地方を返す。
+
+    通常は従来どおり最初のマッチを採用する。異なる地方の候補が競合し、
+    都内・広域名・都道府県・市区に相当する明示候補が一地方だけに存在し、
+    他地方の候補が確認済みの曖昧地名だけの場合に限り、その地方を優先する。
+    明示候補同士や非曖昧な複数勤務地が競合する場合は従来の先着結果を維持する。
 
     Returns:
         (region, matched_keyword) or None
     """
-    # 各トークンに対して辞書パターンを試す（出現順を重視）
-    for token in tokens:
+    first_match: Optional[Tuple[str, str]] = None
+    matched_regions = set()
+    matches: List[Tuple[int, int, int, int, str, str, bool]] = []
+
+    # 各トークンに対して全辞書パターンを確認する。first_match の選び方は
+    # 既存動作（token順、同一token内は最初の出現位置）をそのまま維持する。
+    for token_index, token in enumerate(tokens):
         text = _n(token)
         best_pos = None
         best_region = None
         best_kw = None
-        for region, keyword, pattern in entries:
+        for entry_index, (region, keyword, pattern) in enumerate(entries):
             m = pattern.search(text)
-            if m and (best_pos is None or m.start() < best_pos):
+            if not m:
+                continue
+
+            matched_regions.add(region)
+            is_explicit = _is_explicit_location_match(text, keyword, m.end())
+            matches.append(
+                (token_index, m.start(), m.end(), entry_index, region, keyword, is_explicit)
+            )
+
+            if best_pos is None or m.start() < best_pos:
                 best_pos = m.start()
                 best_region = region
                 best_kw = keyword
-        if best_region:
-            return (best_region, best_kw)
+        if best_region and first_match is None:
+            first_match = (best_region, best_kw)
 
-    return None
+    if first_match is None:
+        return None
+
+    # 単一地方しか検出されない通常ケースは一切overrideしない。
+    if len(matched_regions) <= 1:
+        return first_match
+
+    explicit_matches = [m for m in matches if m[6]]
+    explicit_regions = {m[4] for m in explicit_matches}
+    if len(explicit_regions) == 1:
+        explicit_region = next(iter(explicit_regions))
+
+        # 「東京都内」中の「京都」のように、明示表現と文字範囲が重なる
+        # 部分一致は独立した地方候補として扱わない。
+        opposing_matches = []
+        for match in matches:
+            token_index, start, end, _, region, keyword, _ = match
+            if region == explicit_region:
+                continue
+            overlaps_explicit = any(
+                token_index == explicit[0]
+                and start < explicit[2]
+                and explicit[1] < end
+                for explicit in explicit_matches
+                if explicit[4] == explicit_region
+            )
+            if not overlaps_explicit:
+                opposing_matches.append(match)
+
+        # overrideは、競合する他地方の候補が確認済みの曖昧地名だけの場合に限定。
+        # 西葛西+大阪出張、品川or大阪など、実在する複数拠点は上書きしない。
+        if not opposing_matches or all(
+            match[5] in _KNOWN_AMBIGUOUS_LOCATION_KEYWORDS
+            for match in opposing_matches
+        ):
+            explicit_matches.sort(key=lambda m: (m[0], m[1], m[3]))
+            _, _, _, _, region, keyword, _ = explicit_matches[0]
+            return (region, keyword)
+
+    # 明示候補なし、または明示候補同士が競合する場合は既存挙動を維持。
+    return first_match
+
+
+def _is_explicit_location_match(text: str, keyword: str, match_end: int) -> bool:
+    """辞書matchが行政区分・広域名を明示する強いlocation evidenceか判定する。"""
+    normalized_keyword = _n(keyword)
+    if normalized_keyword in _EXPLICIT_REGION_KEYWORDS:
+        return True
+
+    # 「京都」の末尾「都」のような地名構成文字は行政区分suffixとみなさない。
+    # 辞書語自体のsuffixで強いとするのは、明確な都道府県名と市区名に限定する。
+    if normalized_keyword in {"東京都", "北海道"}:
+        return True
+    if normalized_keyword.endswith(("府", "県", "市", "区")):
+        return True
+
+    # 辞書が「東京」「神奈川」「大阪」の形式でも、原文が
+    # 「東京都」「神奈川県」「大阪府/大阪市」なら明示表現として扱う。
+    if match_end < len(text) and text[match_end] in _ADMINISTRATIVE_SUFFIXES:
+        return True
+
+    return False
 
 
 def _body_dict_search(
