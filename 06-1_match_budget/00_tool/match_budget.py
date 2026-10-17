@@ -33,6 +33,7 @@ OUTPUT_NO_MATCHED = STEP_DIR / "01_result/99_no_matched_pairs_budget.jsonl"
 
 # 最低利益閾値（円）: 案件単価が要員希望単価よりこの額以上高い場合のみtrue
 MIN_MARGIN = 120_000
+PROGRESS_INTERVAL = 100_000
 
 
 def judge_budget_match(unit_price, desired_unit_price) -> bool:
@@ -65,8 +66,9 @@ def main():
 
         matched = []
         no_matched = []
+        null_default_pass_count = 0
 
-        for pair in pairs:
+        for index, pair in enumerate(pairs, start=1):
             project_message_id = pair["project_info"]["message_id"]
             resource_message_id = pair["resource_info"]["message_id"]
 
@@ -75,6 +77,8 @@ def main():
 
             unit_price = project_rec.get("unit_price")
             desired_unit_price = resource_rec.get("desired_unit_price")
+            if unit_price is None or desired_unit_price is None:
+                null_default_pass_count += 1
 
             is_match = judge_budget_match(unit_price, desired_unit_price)
 
@@ -88,15 +92,13 @@ def main():
 
             if is_match:
                 matched.append(record)
-                logger.info(
-                    f"MATCH: project={project_message_id} resource={resource_message_id}"
-                    f" unit_price={unit_price} desired={desired_unit_price}"
-                )
             else:
                 no_matched.append(record)
+
+            if index % PROGRESS_INTERVAL == 0 or index == len(pairs):
                 logger.info(
-                    f"NO_MATCH: project={project_message_id} resource={resource_message_id}"
-                    f" unit_price={unit_price} desired={desired_unit_price}"
+                    f"進捗: {index:,}/{len(pairs):,}件 "
+                    f"通過={len(matched):,} 除外={len(no_matched):,}"
                 )
 
         write_jsonl(str(OUTPUT_MATCHED), matched)
@@ -110,7 +112,10 @@ def main():
             record_count=len(pairs),
         )
 
-        logger.info(f"処理完了 合計={len(pairs)} マッチ={len(matched)} 除外={len(no_matched)}")
+        logger.info(
+            f"処理完了 合計={len(pairs)} 通過={len(matched)} 除外={len(no_matched)} "
+            f"null既定通過={null_default_pass_count} 処理時間={elapsed:.2f}秒"
+        )
 
     except Exception as e:
         write_error_log(str(dirs["result"]), e, context=STEP_NAME)

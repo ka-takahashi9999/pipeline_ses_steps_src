@@ -100,11 +100,12 @@ def _launcher_probe(temp, supplied_mode=None, config_file=CONFIG_FILE):
     return completed, systemd_environment
 
 
-def _managed_probe(temp, mode, config_file=CONFIG_FILE):
+def _managed_probe(temp, mode, config_file=CONFIG_FILE, min_free_bytes="0"):
     trace = temp / f"managed_{mode}.txt"
     child = temp / f"managed_child_{mode}.sh"
     writer = temp / f"status_writer_{mode}.py"
     fake_aws = temp / f"aws_{mode}"
+    retention = temp / f"retention_{mode}.py"
     _write_executable(
         child,
         "#!/usr/bin/env bash\n"
@@ -114,6 +115,7 @@ def _managed_probe(temp, mode, config_file=CONFIG_FILE):
     )
     writer.write_text("raise SystemExit(0)\n", encoding="utf-8")
     _write_executable(fake_aws, "#!/usr/bin/env bash\nexit 0\n")
+    retention.write_text("raise SystemExit(0)\n", encoding="utf-8")
 
     run_id = f"mode-propagation-managed-{mode}"
     managed_state = ROOT / "00_pipeline" / "01_result" / "managed" / "19700101" / run_id
@@ -128,6 +130,10 @@ def _managed_probe(temp, mode, config_file=CONFIG_FILE):
             "PIPELINE_STATUS_WRITER": str(writer),
             "PIPELINE_PYTHON_BIN": sys.executable,
             "PIPELINE_AWS_BIN": str(fake_aws),
+            "PIPELINE_LOCAL_RETENTION_TOOL": str(retention),
+            "PIPELINE_LOCAL_RETENTION_MANAGED_ROOT": str(temp / "managed"),
+            "PIPELINE_LOCAL_RETENTION_S3_DAILY_ROOT": str(temp / "s3_daily"),
+            "PIPELINE_MIN_FREE_BYTES": min_free_bytes,
             "PIPELINE_LOCK_FILE": str(temp / f"managed_{mode}.lock"),
             "TRACE": str(trace),
         }
@@ -258,6 +264,15 @@ class ExecutionModePropagationTest(unittest.TestCase):
         self.assertEqual(2, completed.returncode)
         self.assertIn("must be set by pipeline S3 config", completed.stdout)
         self.assertEqual({}, systemd_environment)
+
+    def test_managed_fails_before_child_when_disk_preflight_is_below_threshold(self):
+        with tempfile.TemporaryDirectory(prefix="disk_preflight_") as temp_name:
+            completed, observed = _managed_probe(
+                Path(temp_name), "legacy", min_free_bytes="9000000000000000000"
+            )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertEqual([], observed)
+        self.assertIn("insufficient local disk space before pipeline start", completed.stdout)
 
     def test_managed_fails_closed_before_child_when_mode_is_missing(self):
         with tempfile.TemporaryDirectory(prefix="mode_missing_managed_") as temp_name:

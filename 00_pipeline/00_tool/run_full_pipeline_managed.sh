@@ -14,6 +14,10 @@ STATUS_WRITER="${PIPELINE_STATUS_WRITER:-$ROOT/99-9_publish_pipeline_status/00_t
 PYTHON_BIN="${PIPELINE_PYTHON_BIN:-/usr/bin/python3}"
 AWS_BIN="${PIPELINE_AWS_BIN:-/usr/bin/aws}"
 FLOCK_BIN="${PIPELINE_FLOCK_BIN:-/usr/bin/flock}"
+LOCAL_RETENTION_TOOL="${PIPELINE_LOCAL_RETENTION_TOOL:-$SCRIPT_DIR/manage_local_pipeline_retention.py}"
+LOCAL_RETENTION_MANAGED_ROOT="${PIPELINE_LOCAL_RETENTION_MANAGED_ROOT:-$ROOT/00_pipeline/01_result/managed}"
+LOCAL_RETENTION_S3_DAILY_ROOT="${PIPELINE_LOCAL_RETENTION_S3_DAILY_ROOT:-$ROOT/01-1_fetch_gmail/02_confirm/s3_daily}"
+MIN_FREE_BYTES="${PIPELINE_MIN_FREE_BYTES:-5368709120}"
 
 if [[ ! -r "$CONFIG_FILE" ]]; then
   echo "pipeline S3 config is not readable: $CONFIG_FILE" >&2
@@ -45,6 +49,14 @@ if [[ ! "$RUN_DATE" =~ ^[0-9]{8}$ ]] || ! date -d "$RUN_DATE" '+%Y%m%d' >/dev/nu
 fi
 if [[ ! -x "$PYTHON_BIN" || ! -r "$STATUS_WRITER" ]]; then
   echo "python3 or status writer is unavailable; FAILED status cannot be published" >&2
+  exit 2
+fi
+if [[ ! -r "$LOCAL_RETENTION_TOOL" ]]; then
+  echo "local retention tool is not readable: $LOCAL_RETENTION_TOOL" >&2
+  exit 2
+fi
+if [[ ! "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]]; then
+  echo "PIPELINE_MIN_FREE_BYTES must be a non-negative integer: $MIN_FREE_BYTES" >&2
   exit 2
 fi
 
@@ -338,6 +350,42 @@ else
   printf '%s\n' "INITIALIZING" > "$CURRENT_STEP_FILE"
 fi
 : > "$SUSPEND_CONTRACT_FILE"
+
+printf '%s\n' "LOCAL_RETENTION" > "$CURRENT_STEP_FILE"
+set +e
+"$PYTHON_BIN" "$LOCAL_RETENTION_TOOL" \
+  --managed-root "$LOCAL_RETENTION_MANAGED_ROOT" \
+  --s3-daily-root "$LOCAL_RETENTION_S3_DAILY_ROOT" \
+  --managed-keep 3 \
+  --s3-daily-keep 4 \
+  --named-validation-keep 4 \
+  --checkpoint-keep 3 \
+  --llm-usage-keep 30 \
+  --runtime-keep 3 \
+  --active-run-id "$RUN_ID" \
+  --active-run-date "$RUN_DATE" \
+  --region "$PIPELINE_AWS_REGION" \
+  --apply 2>&1 | tee -a "$LOCAL_LOG"
+retention_status=("${PIPESTATUS[@]}")
+set -e
+if [[ "${retention_status[0]}" -ne 0 || "${retention_status[1]}" -ne 0 ]]; then
+  fail_managed "local retention failed before pipeline start"
+fi
+
+printf '%s\n' "DISK_PREFLIGHT" > "$CURRENT_STEP_FILE"
+read -r available_blocks filesystem_block_size < <(stat -f -c '%a %S' "$ROOT")
+available_bytes=$((available_blocks * filesystem_block_size))
+if (( available_bytes < MIN_FREE_BYTES )); then
+  fail_managed \
+    "insufficient local disk space before pipeline start: available_bytes=$available_bytes required_bytes=$MIN_FREE_BYTES"
+fi
+managed_log "disk preflight OK: available_bytes=$available_bytes required_bytes=$MIN_FREE_BYTES"
+
+if [[ "$PIPELINE_PHASE" == "B" ]]; then
+  printf '%s\n' "INITIALIZING_PHASE_B" > "$CURRENT_STEP_FILE"
+else
+  printf '%s\n' "INITIALIZING" > "$CURRENT_STEP_FILE"
+fi
 
 export RUN_ID RUN_DATE
 export PIPELINE_STARTED_AT="$STARTED_AT"

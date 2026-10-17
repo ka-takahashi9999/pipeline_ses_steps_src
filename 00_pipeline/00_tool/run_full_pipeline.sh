@@ -2,6 +2,10 @@
 set -euo pipefail
 
 ROOT="/home/ec2-user/pipeline_ses_steps"
+if [[ -z "${PIPELINE_LOG:-}" ]]; then
+  python3 "$ROOT/00_pipeline/00_tool/manage_local_pipeline_retention.py" \
+    --rotate-log-only --apply
+fi
 LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
 RUN_DATE="${RUN_DATE:-$(date '+%Y%m%d')}"
 MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
