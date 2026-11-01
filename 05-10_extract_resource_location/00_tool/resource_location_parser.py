@@ -18,6 +18,7 @@
 
 import re
 import unicodedata
+from functools import lru_cache
 from typing import List, Optional, Set, Tuple
 
 # ── ラベル検出 ────────────────────────────────────────────
@@ -155,6 +156,12 @@ _NAME_FIELD_RE = re.compile(
 def _n(s: str) -> str:
     """NFKC正規化"""
     return unicodedata.normalize("NFKC", s or "")
+
+
+@lru_cache(maxsize=None)
+def _normalized_keyword(keyword: str) -> str:
+    """辞書語のNFKC正規化結果を完全一致用にキャッシュする。"""
+    return _n(keyword)
 
 
 def _safe_kw_match(pattern: "re.Pattern", text: str) -> Optional["re.Match"]:
@@ -412,6 +419,42 @@ def _normalize_candidate(candidate: str) -> List[str]:
     return tokens
 
 
+def _normalize_exact_label_candidate(candidate: str) -> str:
+    """
+    label値が辞書語そのものか確認するための最小正規化。
+
+    公式駅名には「JR小倉」「中央大学・明星大学」
+    「龍谷富山高校前（永楽町）」のように、通常の路線prefix・区切り・
+    括弧除去を先に行うと別語になる名称がある。
+    ここではNFKC、先頭記号、注釈、末尾の「駅」だけを除去し、
+    辞書完全一致にのみ使う。
+    """
+    text = _n(candidate)
+    text = re.sub(r"&[a-zA-Z]+;", " ", text)
+
+    note_m = _NOTE_PREFIX_RE.match(text)
+    if note_m:
+        text = text[note_m.end():].strip()
+
+    text = re.sub(r"^[\s　・★■□▼※\-\.【】◆☆：:]+", "", text).strip()
+    text = re.sub(r"\s*[※＊]\s*.+$", "", text).strip()
+    return _EKI_RE.sub("", text).strip()
+
+
+def _match_exact_label_candidate(
+    candidate: str,
+    entries: List[Tuple[str, str, "re.Pattern"]],
+) -> Optional[Tuple[str, str]]:
+    """label値を最小正規化し、辞書語と完全一致する場合のみ返す。"""
+    text = _normalize_exact_label_candidate(candidate)
+    if not text:
+        return None
+    for region, keyword, _pattern in entries:
+        if _normalized_keyword(keyword) == text:
+            return (region, keyword)
+    return None
+
+
 def _match_from_tokens(
     tokens: List[str],
     entries: List[Tuple[str, str, "re.Pattern"]],
@@ -533,6 +576,13 @@ def parse_location(
     # ── フェーズ1: ラベル行 + 次行からの抽出（最優先） ──────
     label_candidates = _extract_label_candidates(lines)
     for candidate in label_candidates:
+        # 公式駅名そのものは、路線prefix・区切り・括弧の強い正規化より優先。
+        exact_result = _match_exact_label_candidate(candidate, entries)
+        if exact_result:
+            region, _kw = exact_result
+            raw = _n(candidate)[:100]
+            return region, raw, "label"
+
         tokens = _normalize_candidate(candidate)
         if not tokens:
             continue
