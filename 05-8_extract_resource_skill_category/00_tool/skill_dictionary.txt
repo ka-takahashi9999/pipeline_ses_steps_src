@@ -97,6 +97,20 @@
   - Clojure
   - PowerBuilder
   - boto3
+  # DICT-02（2026-10-30）
+  - Grails
+  - JPA
+  - Hono
+  - Dancer2
+  - PSGI
+  - "Protocol Buffers"
+  - Maven
+  # DICT-02（2026-11-01 一般性review通過）
+  - WebSocket
+  - Tornado
+  - async/await
+  - Zend
+  - iBatis
 
 フロントエンド:
   - JavaScript
@@ -144,6 +158,11 @@
   - WPF
   - RxJS
   - PrimeNG
+  # DICT-02（2026-10-30）
+  - CreateJS
+  - Qt
+  # DICT-02（2026-11-01 一般性review通過）
+  - SSR
 
 インフラ:
   - IaC
@@ -313,6 +332,40 @@
   - "BMC Patrol"
   - "BMC Remedy ITSM"
   - "IBM Tivoli"
+  # DICT-02（2026-10-30）
+  - OpenTelemetry
+  - シェルスクリプト
+  - Squid
+  - 無線LAN
+  - ネットワークインフラ
+  - Samba
+  - SD-WAN
+  - LXD
+  - CCNA
+  - BGP
+  - OSPF
+  - FreeBSD
+  - macOS
+  - FTP
+  - Cloudian
+  - PowerCLI
+  # DICT-02（2026-11-01 一般性review通過）
+  - "Security Group"
+  - "Route Table"
+  - GigaOne
+  - VLAN
+  - LAN
+  - "IBM Power systems"
+  - Arcserve
+  - 無線AP
+  - DHCP
+  - イミュータブルストレージ
+  - SRX
+  - Checkpoint
+  - MQTT
+  - SFTP
+  - Watchguard
+  - Fluentd
 
 クラウドサービス:
   - Amazon Connect
@@ -332,6 +385,12 @@
   - "API Gateway"
   - CodeBuild
   - CodeCommit
+  # DICT-02（2026-10-30）
+  - AVD
+  # DICT-02（2026-11-01 一般性review通過）
+  - OCI
+  - "Genesys Cloud"
+  - CodePipeline
 
 DB:
   - "SQL Server"
@@ -378,6 +437,14 @@ DB:
   - Symfoware
   - Firestore
   - RMAN
+  # DICT-02（2026-10-30）
+  - Sybase
+  - "Berkeley DB"
+  - Flyway
+  # DICT-02（2026-11-01 一般性review通過）
+  - プロシージャ
+  - RDBMS
+  - SnowPark
 
 モバイル:
   - iOS
@@ -401,6 +468,9 @@ DB:
   - "Jetpack Compose"
   - RxJava
   - Retrofit2
+  # DICT-02（2026-10-30）
+  - "Swift Package Manager"
+  - CocoaPods
 
 データ分析/AI:
   - MLOps
@@ -427,6 +497,13 @@ DB:
   - RAG
   - 機械学習基盤
   - MATLAB
+  # DICT-02（2026-10-30）
+  - CUDA
+  - HALCON
+  # DICT-02（2026-11-01 一般性review通過）
+  - 画像処理
+  - 画像認識
+  - 自然言語処理
 
 データ分析:
   - Redash
@@ -464,6 +541,15 @@ DB:
   - "Adobe Analytics"  # Google Analytics（特にGA4）、もしくはAdobe Analyticsを用いたWebアクセス分析の経験
   - "Microsoft Clarity"
   - Presto
+  # DICT-02（2026-10-30）
+  - Streamlit
+  - Talend
+  - DAX
+  - Cesium
+  - GDAL
+  - SNAP
+  - ISCE2
+  - M言語
 
 AI:
   - Whisper
@@ -493,6 +579,17 @@ AI:
   - AIエージェント  # AIエージェントで開発スピードを高められる方
   - OpenCV
   - HuggingFace
+  # DICT-02（2026-10-30）
+  - Codex
+  - "Amazon Transcribe"
+  - 音声認識
+  - Devin
+  - Midjourney
+  - Langflow
+  - MLflow
+  - Langfuse
+  # DICT-02（2026-11-01 一般性review通過）
+  - AIコーディング
 
 セキュリティ:
   - IDS/IPS
@@ -516,6 +613,17 @@ AI:
   - WAF  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
   - メールセキュリティ  # EDR、WAF、メールセキュリティ製品等の設定変更・運用経験
   - Tripwire
+  # DICT-02（2026-10-30）
+  - SASE
+  - CrowdStrike
+  - "HashiCorp Vault"
+  - "Deep Security"
+  # DICT-02（2026-11-01 一般性review通過）
+  - CVSS
+  - ネットワークセキュリティ
+  - SIEM
+  - SOAR
+  - TLS
 
 テスト/品質:
   - Vitest
@@ -547,6 +655,8 @@ AI:
   - TDD
   - Postman
   - Autify
+  # DICT-02（2026-10-30）
+  - PHPUnit
 
 プロジェクト管理:
   - Agile
@@ -587,6 +697,8 @@ AI:
   - "C/C++"
   - ASM
   - Simulink
+  # DICT-02（2026-11-01 一般性review通過）
+  - E2Studio
 
 業務系:
   - mcframe
@@ -632,6 +744,12 @@ AI:
   - "AvePoint Fly"
   - "S/4HANA"  # S/4HANA導入プロジェクトにおいて
   - "X++"
+  # DICT-02（2026-10-30）
+  - Mendix
+  - "FileMaker Pro"
+  # DICT-02（2026-11-01 一般性review通過）
+  - IM-BloomMaker
+  - ECC6.0
 
 ミドルウェア・基盤:
   - HULFT
@@ -644,6 +762,9 @@ AI:
   - Cosminexus
   - MuleSoft
   - Clamd
+  # DICT-02（2026-10-30）
+  - WildFly
+  - SiteScope
 
 営業系:
   - 法人営業
@@ -708,6 +829,8 @@ CAD系:
   - "UX/UIデザイナー"
   - イラスト
   - XD
+  # DICT-02（2026-10-30）
+  - Blender
 
 言語系:
   - 英語
@@ -727,6 +850,8 @@ CAD系:
   - NetView
   - "IBM COBOL"
   - "PL/1"
+  # DICT-02（2026-10-30）
+  - CICS
 
 RPA系:
   - RPA
@@ -739,6 +864,8 @@ RPA系:
   - PowerAutomate
   - WinActor
   - RPAワークフロー
+  # DICT-02（2026-10-30）
+  - "Automation Cloud"
 
 VBA系:
   - VBA
@@ -809,6 +936,12 @@ CMS系:
   - クラウドリフト
   - E2Eアーキテクチャ
   - "Event Sourcing"
+  # DICT-02（2026-11-01 一般性review通過）
+  - AnyTran
+  - Gradle
+  - RPM
+  - YAML
+  - n8n
 
 #Excel/Word/PowerPoint系: #汎用的すぎて広範囲で一致が発生する為除外
 #  - Excel

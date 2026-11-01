@@ -315,6 +315,214 @@ _ESMC_NETWORKING_EVENT_APPLICATION_URL_RE = re.compile(
     r"https://a17\.hm-f\.jp/cc\.php\?t=M[0-9]+&c=5915&d=5990"
 )
 
+# CHECK-02 (2026-10-30): 人数だけでは除外せず、同一メール内で人物profileの
+# 境界labelと属性labelが人数分反復する場合だけ複数要員とみなす。
+_REPEATED_PROFILE_NAME_RE = re.compile(
+    r"(?im)^[ \t]*(?:[・■●◆◇][ \t]*)?【?[ \t]*"
+    r"(?:氏[ \t]*名|名[ \t]*前)[ \t]*】?[ \t]*[:：]?"
+)
+_REPEATED_PROFILE_ATTRIBUTE_RES = (
+    re.compile(
+        r"(?im)^[ \t]*(?:[・■●◆◇][ \t]*)?【?[ \t]*"
+        r"所[ \t]*属[ \t]*】?[ \t]*[:：]?"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:[・■●◆◇][ \t]*)?【?[ \t]*"
+        r"最[ \t]*寄(?:駅|り駅)?[ \t]*】?[ \t]*[:：]?"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:[・■●◆◇][ \t]*)?【?[ \t]*"
+        r"単[ \t]*(?:価|金)[ \t]*】?[ \t]*[:：]?"
+    ),
+)
+_SUMMARY_PERSON_RE = re.compile(
+    r"(?m)^[ \t]*・[ \t]*[A-Z]{1,3}[ \t]+[0-9]{2}歳(?:[ \t]|$)"
+)
+
+_REPEATED_FULL_PROFILE_HEADER = "【注力人材】のご提案"
+_REPEATED_FULL_PROFILE_ID_RE = re.compile(
+    r"(?m)^[ \t]*ID[ \t]*\n[ \t]*[:：][ \t]*(?P<id>[0-9]+)[ \t]*$"
+)
+_REPEATED_FULL_PROFILE_LABEL_RES = (
+    re.compile(r"(?m)^[ \t]*イニシャル[ \t]*$"),
+    re.compile(r"(?m)^[ \t]*最寄り駅[ \t]*$"),
+    re.compile(r"(?m)^[ \t]*単金[ \t]*$"),
+)
+
+_MULTI_PROJECT_ENUMERATION_RE = re.compile(
+    r"(?m)^[^\n]*①[^\n]*②[^\n]*③[^\n]*④[^\n]*⑤[^\n]*(?:案件|要員)[^\n]*$"
+)
+_MULTI_PROJECT_SEPARATOR_RE = re.compile(
+    r"(?m)^[ \t]*[-ー―‐－]{20,}[ \t]*$"
+)
+_MULTI_PROJECT_BLOCK_LABEL_RE = re.compile(
+    r"(?im)^[ \t]*(?:【|\{)?(?P<label>案件(?:名)?|プロジェクト概要|"
+    r"期間|場所|勤務場所|単価|単金|人数|募集(?:人員)?|必要スキル|"
+    r"必須スキル|作業内容|業務)(?:】|\})?[ \t]*[:：}]?"
+)
+_COMPLETE_PROJECT_BLOCK_HEADER_RE = re.compile(r"(?m)^[ \t]*【案件】")
+_COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES = (
+    re.compile(r"(?m)^[ \t]*【内容】"),
+    re.compile(r"(?m)^[ \t]*【要件】"),
+    re.compile(r"(?m)^[ \t]*【募集】"),
+)
+
+# CHECK-02 (2026-10-30): 件名の案件数と、完全な「■案件名」block数が
+# 一致する場合だけを、件数明示形式の限定補完として扱う。
+_COUNTED_PROJECT_SUBJECT_COUNT_RE = re.compile(
+    r"(?<![0-9])(?P<count>(?:[2-9]|[1-9][0-9]+))[ \t]*件(?![0-9])"
+)
+_COUNTED_PROJECT_BLOCK_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*■[ \t]*案件名[ \t]*[:：]"
+)
+_COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES = (
+    re.compile(r"(?m)^[ \t]*■[ \t]*概要[ \t]*[:：]"),
+    re.compile(r"(?m)^[ \t]*■[ \t]*募集人数[ \t]*[:：]"),
+    re.compile(r"(?m)^[ \t]*■[ \t]*単価[ \t]*[:：]"),
+)
+
+# CHECK-02 (2026-10-30): 人数表現に依存せず、氏名境界ごとに3種類以上の
+# 追加profile属性が揃う完全blockだけを数える。営業署名の氏名は
+# 後続blockに属性が揃わないため対象外になる。
+_COMPLETE_RESOURCE_PROFILE_LINE_PREFIX = (
+    r"^[ \t]*(?:[0-9]{1,2}[ \t]*)?(?:[・■●◆◇□][ \t]*)?"
+    r"(?:【[ \t]*)?"
+)
+_COMPLETE_RESOURCE_PROFILE_LINE_SUFFIX = r"(?:[ \t]*】)?[ \t]*[:：]?"
+_COMPLETE_RESOURCE_PROFILE_NAME_RE = re.compile(
+    _COMPLETE_RESOURCE_PROFILE_LINE_PREFIX
+    + r"(?:氏[ \t]*名|名[ \t]*前|イニシャル)"
+    + _COMPLETE_RESOURCE_PROFILE_LINE_SUFFIX,
+    re.IGNORECASE | re.MULTILINE,
+)
+_COMPLETE_RESOURCE_PROFILE_ATTRIBUTE_RES = tuple(
+    re.compile(
+        _COMPLETE_RESOURCE_PROFILE_LINE_PREFIX
+        + label
+        + _COMPLETE_RESOURCE_PROFILE_LINE_SUFFIX,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for label in (
+        r"所[ \t]*属",
+        r"最[ \t]*寄(?:駅|り駅)?",
+        r"(?:希望[ \t]*)?単[ \t]*(?:価|金)",
+        r"(?:稼[ \t]*(?:働|動)(?:日|開始)?|開始|入場日|参画時期)",
+        r"年[ \t]*齢",
+        r"国[ \t]*籍",
+        r"性[ \t]*別",
+        r"スキル",
+    )
+)
+
+
+def _repeated_resource_profile_count(subject: str, body: str) -> int:
+    """明示人数/人物一覧とprofile label反復が一致する場合だけ人数を返す。"""
+    profile_count = len(_REPEATED_PROFILE_NAME_RE.findall(body))
+    if profile_count < 2:
+        return 0
+
+    attribute_counts = [
+        len(pattern.findall(body)) for pattern in _REPEATED_PROFILE_ATTRIBUTE_RES
+    ]
+    if sum(count >= profile_count for count in attribute_counts) < 2:
+        return 0
+
+    count_expression = re.search(
+        r"(?<![0-9]){}[ \t]*名".format(profile_count), subject
+    )
+    summary_count = len(_SUMMARY_PERSON_RE.findall(body))
+    if not count_expression and summary_count < profile_count:
+        return 0
+    return profile_count
+
+
+def _has_repeated_full_profile_blocks(body: str) -> bool:
+    """完全な人材提案blockが異なるIDで2件以上連結された場合だけTrue。"""
+    parts = body.split(_REPEATED_FULL_PROFILE_HEADER)
+    blocks = parts[1:]
+    if len(blocks) < 2:
+        return False
+
+    profile_ids = []
+    for block in blocks:
+        id_match = _REPEATED_FULL_PROFILE_ID_RE.search(block)
+        if not id_match:
+            return False
+        if not all(pattern.search(block) for pattern in _REPEATED_FULL_PROFILE_LABEL_RES):
+            return False
+        profile_ids.append(id_match.group("id"))
+    return len(set(profile_ids)) == len(profile_ids)
+
+
+def _has_repeated_project_blocks(body: str) -> bool:
+    """①〜⑤の案件列挙と、5つの案件構造blockが両方ある場合だけTrue。"""
+    if not _MULTI_PROJECT_ENUMERATION_RE.search(body):
+        return False
+    body = unicodedata.normalize("NFKC", body)
+    structured_blocks = 0
+    for block in _MULTI_PROJECT_SEPARATOR_RE.split(body):
+        labels = set(_MULTI_PROJECT_BLOCK_LABEL_RE.findall(block))
+        if len(labels) >= 3:
+            structured_blocks += 1
+    return structured_blocks >= 5
+
+
+def _has_repeated_complete_project_blocks(body: str) -> bool:
+    """完全な【案件】blockが5件以上反復する場合だけTrue。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+    blocks = _COMPLETE_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
+    if len(blocks) < 5:
+        return False
+    return all(
+        all(pattern.search(block) for pattern in _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES)
+        for block in blocks
+    )
+
+
+def _has_counted_complete_project_blocks(subject: str, body: str) -> bool:
+    """件名の案件数と完全な「■案件名」block数が一致する場合だけTrue。"""
+    normalized_subject = unicodedata.normalize("NFKC", subject)
+    if "案件" not in normalized_subject:
+        return False
+
+    subject_counts = {
+        int(match.group("count"))
+        for match in _COUNTED_PROJECT_SUBJECT_COUNT_RE.finditer(normalized_subject)
+    }
+    if len(subject_counts) != 1:
+        return False
+    expected_count = next(iter(subject_counts))
+
+    normalized_body = unicodedata.normalize("NFKC", body)
+    blocks = _COUNTED_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
+    if len(blocks) != expected_count:
+        return False
+    return all(
+        all(pattern.search(block) for pattern in _COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES)
+        for block in blocks
+    )
+
+
+def _has_repeated_complete_resource_blocks(body: str) -> bool:
+    """氏名境界と追加profile属性3種類以上が揃うblockが2件以上ならTrue。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+    profile_boundaries = list(_COMPLETE_RESOURCE_PROFILE_NAME_RE.finditer(normalized_body))
+    complete_block_count = 0
+    for index, boundary in enumerate(profile_boundaries):
+        block_end = (
+            profile_boundaries[index + 1].start()
+            if index + 1 < len(profile_boundaries)
+            else len(normalized_body)
+        )
+        block = normalized_body[boundary.start():block_end]
+        attribute_count = sum(
+            bool(pattern.search(block))
+            for pattern in _COMPLETE_RESOURCE_PROFILE_ATTRIBUTE_RES
+        )
+        if attribute_count >= 3:
+            complete_block_count += 1
+    return complete_block_count >= 2
+
 
 def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
     """送信元・件名・本文構造が揃う確認済みテンプレートのみ退避する。
@@ -328,7 +536,8 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
         return None
     sender = extract_email(record["from"])
     subject = unicodedata.normalize("NFKC", record["subject"]).strip()
-    body = unicodedata.normalize("NFKC", record["body_text"]).replace("\r\n", "\n").strip()
+    raw_body = record["body_text"].replace("\r\n", "\n").strip()
+    body = unicodedata.normalize("NFKC", raw_body)
 
     if (sender == "feng-h@aliplaza.co.jp"
             and re.fullmatch(r"【[0-9]{2}/[0-9]{2}】【JAVA\s+SE3名】【要件定義~】.+", subject)):
@@ -509,6 +718,28 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
                 and blocks_match
                 and skill_sheet_url_count == profile_count):
             return "multi_item_mail", "cairn_multi_resource_intro_v1"
+
+    # 既存の限定templateを先に評価し、同じメールの既存rule_idを変更しない。
+    if _repeated_resource_profile_count(subject, body) >= 2:
+        return "multi_item_mail", "repeated_resource_profiles_v1"
+
+    if _has_repeated_full_profile_blocks(body):
+        return "multi_item_mail", "repeated_full_profile_blocks_v1"
+
+    if _has_repeated_project_blocks(raw_body):
+        return "multi_item_mail", "five_project_blocks_v1"
+
+    if _has_repeated_complete_project_blocks(raw_body):
+        return "multi_item_mail", "repeated_complete_project_blocks_v1"
+
+    if _has_counted_complete_project_blocks(subject, raw_body):
+        return "multi_item_mail", "counted_two_project_blocks_v1"
+
+    if _has_repeated_complete_resource_blocks(raw_body):
+        return (
+            "multi_item_mail",
+            "repeated_complete_resource_blocks_without_accepted_count_v1",
+        )
 
     if (sender == "kensuke.kiyota@sakya.jp"
             and subject == _SAKYA_PROCUREMENT_SERVICE_SUBJECT
@@ -695,7 +926,7 @@ def _has_explicit_multiple_resource(subject: str) -> bool:
         for match in pattern.finditer(subject):
             if _match_count(match) < 2:
                 continue
-            if subject[match.end() :].startswith("規模"):
+            if subject[match.end() :].startswith(("規模", "参画中")):
                 continue
             return True
 

@@ -122,6 +122,28 @@ PROFILE_FIELD_RES = {
 }
 MIN_REPEATED_PROFILE_FIELDS = 3
 MIN_PROFILE_FIELDS_PER_BLOCK = 3
+MIN_LARGE_ROSTER_PROFILES = 10
+
+PROFILE_MARKER_RES = {
+    "name": re.compile(
+        r"(?:【\s*|■\s*)?(?:氏\s*名|名前|イニシャル)\s*(?:】|[:：|])"
+    ),
+    "affiliation": re.compile(
+        r"(?:【\s*|■\s*)?所\s*属\s*(?:】|[:：|])"
+    ),
+    "age": re.compile(
+        r"(?:【\s*|■\s*)?年\s*齢\s*(?:】|[:：|])"
+    ),
+    "station": re.compile(
+        r"(?:【\s*|■\s*)?最\s*寄(?:り?\s*駅)?\s*(?:】|[:：|])"
+    ),
+    "price": re.compile(
+        r"(?:【\s*|■\s*)?(?:希望)?単\s*価\s*(?:】|[:：|])"
+    ),
+    "availability": re.compile(
+        r"(?:【\s*|■\s*)?(?:期間|稼働開始|参画時期)\s*(?:】|[:：|])"
+    ),
+}
 
 BUSINESS_LINE_PREFIX_RE = re.compile(r"^\s*[・\-●■]")
 BUSINESS_KEYWORDS = (
@@ -427,49 +449,94 @@ def detect_multi_person_external_skillsheet(
 
     normalized = unicodedata.normalize("NFKC", text or "")
     name_matches = list(PROFILE_NAME_RE.finditer(normalized))
-    if len(name_matches) < 2:
-        return {}
+    if len(name_matches) >= 2:
+        field_counts = {
+            name: len(pattern.findall(normalized))
+            for name, pattern in PROFILE_FIELD_RES.items()
+        }
+        repeated_fields = {
+            name: count for name, count in field_counts.items() if count >= 2
+        }
 
-    field_counts = {
+        complete_profile_blocks = 0
+        for index, name_match in enumerate(name_matches):
+            block_end = (
+                name_matches[index + 1].start()
+                if index + 1 < len(name_matches)
+                else len(normalized)
+            )
+            block = normalized[name_match.start():block_end]
+            block_field_count = sum(
+                1 for pattern in PROFILE_FIELD_RES.values() if pattern.search(block)
+            )
+            if block_field_count >= MIN_PROFILE_FIELDS_PER_BLOCK:
+                complete_profile_blocks += 1
+
+        # 既存の縦持ちprofile block形式は従来条件を維持する。
+        if (
+            len(repeated_fields) >= MIN_REPEATED_PROFILE_FIELDS
+            and MULTI_PERSON_LIST_RE.search(normalized)
+            and complete_profile_blocks >= 2
+        ):
+            return {
+                "profile_name_count": len(name_matches),
+                "repeated_profile_fields": repeated_fields,
+                "complete_profile_block_count": complete_profile_blocks,
+                "list_structure": True,
+                "single_person_block_selected": False,
+            }
+
+    marker_counts = {
         name: len(pattern.findall(normalized))
-        for name, pattern in PROFILE_FIELD_RES.items()
+        for name, pattern in PROFILE_MARKER_RES.items()
     }
-    repeated_fields = {
-        name: count for name, count in field_counts.items() if count >= 2
+
+    # XLSXの1行へ人物profileを列方向に並べた形式。
+    # 同一行で氏名と3種類以上の属性が2人物分以上反復する場合だけ拒否する。
+    for line in normalized.splitlines():
+        line_counts = {
+            name: len(pattern.findall(line))
+            for name, pattern in PROFILE_MARKER_RES.items()
+        }
+        repeated_attributes = {
+            name: count
+            for name, count in line_counts.items()
+            if name != "name" and count >= 2
+        }
+        if (
+            line_counts["name"] >= 2
+            and len(repeated_attributes) >= MIN_REPEATED_PROFILE_FIELDS
+        ):
+            return {
+                "profile_name_count": line_counts["name"],
+                "repeated_profile_fields": repeated_attributes,
+                "complete_profile_block_count": line_counts["name"],
+                "list_structure": True,
+                "list_layout": "horizontal_profile_columns",
+                "single_person_block_selected": False,
+            }
+
+    # 一覧タイトルを持たない外部の大規模人材台帳も、人物数とprofile属性の
+    # 強い反復が揃う場合だけ拒否する。横長の単一人物経歴表は対象外。
+    repeated_large_attributes = {
+        name: count
+        for name, count in marker_counts.items()
+        if name != "name" and count >= MIN_LARGE_ROSTER_PROFILES
     }
-    if len(repeated_fields) < MIN_REPEATED_PROFILE_FIELDS:
-        return {}
+    if (
+        marker_counts["name"] >= MIN_LARGE_ROSTER_PROFILES
+        and len(repeated_large_attributes) >= MIN_REPEATED_PROFILE_FIELDS
+    ):
+        return {
+            "profile_name_count": marker_counts["name"],
+            "repeated_profile_fields": repeated_large_attributes,
+            "complete_profile_block_count": marker_counts["name"],
+            "list_structure": True,
+            "list_layout": "large_profile_roster",
+            "single_person_block_selected": False,
+        }
 
-    complete_profile_blocks = 0
-    for index, name_match in enumerate(name_matches):
-        block_end = (
-            name_matches[index + 1].start()
-            if index + 1 < len(name_matches)
-            else len(normalized)
-        )
-        block = normalized[name_match.start():block_end]
-        block_field_count = sum(
-            1 for pattern in PROFILE_FIELD_RES.values() if pattern.search(block)
-        )
-        if block_field_count >= MIN_PROFILE_FIELDS_PER_BLOCK:
-            complete_profile_blocks += 1
-
-    # 一覧タイトルだけ、または表形式だけでは拒否しない。明示的一覧構造と
-    # 人物プロフィールブロック2件以上の両方が必要。
-    if not MULTI_PERSON_LIST_RE.search(normalized):
-        return {}
-    if complete_profile_blocks < 2:
-        return {}
-
-    # 04-1/04-2には外部文書から本人1名のブロックを選択したことを示す
-    # 既存フィールドがないため、ここに到達した文書全体は安全に本人へ限定できない。
-    return {
-        "profile_name_count": len(name_matches),
-        "repeated_profile_fields": repeated_fields,
-        "complete_profile_block_count": complete_profile_blocks,
-        "list_structure": True,
-        "single_person_block_selected": False,
-    }
+    return {}
 
 
 def build_record(record: Dict[str, Any]) -> Dict[str, Any]:

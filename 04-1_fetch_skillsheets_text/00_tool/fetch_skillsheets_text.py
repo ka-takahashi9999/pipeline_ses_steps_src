@@ -37,6 +37,7 @@ import requests
 import warnings
 import logging
 import zipfile
+import stat
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from pathlib import Path
@@ -83,6 +84,7 @@ CTSU_PUBLIC_DOMAINS = {"ctsu.jp", "cho-tatsu.com"}
 
 # スキルシートらしいファイル拡張子
 SKILLSHEET_EXTENSIONS = {"pdf", "xlsx", "xls", "docx", "doc"}
+SAFE_SKILLSHEET_ARCHIVE_EXTENSION = "zip"
 UNKNOWN_ATTACHMENT_MIME_TYPES = {
     "",
     "application/octet-stream",
@@ -90,6 +92,10 @@ UNKNOWN_ATTACHMENT_MIME_TYPES = {
 }
 MAX_OOXML_SNIFF_BASE64_CHARS = 40 * 1024 * 1024
 MAX_OOXML_ZIP_ENTRIES = 4096
+MAX_SAFE_SKILLSHEET_ZIP_BYTES = 40 * 1024 * 1024
+MAX_SAFE_SKILLSHEET_ZIP_ENTRIES = 32
+MAX_SAFE_SKILLSHEET_MEMBER_BYTES = 40 * 1024 * 1024
+MAX_SAFE_SKILLSHEET_COMPRESSION_RATIO = 200
 
 SHORTENER_DOMAINS = {
     "bit.ly",
@@ -652,6 +658,68 @@ def extract_text_from_bytes(data: bytes, filename: str = "") -> str:
     raise ValueError(f"サポートされていないファイル形式: filename={filename!r}, header={header!r}")
 
 
+def extract_safe_single_file_zip(data: bytes) -> Tuple[bytes, str]:
+    """安全な単一ファイルZIPから既存対応形式の1ファイルだけを返す。"""
+    if len(data) > MAX_SAFE_SKILLSHEET_ZIP_BYTES:
+        raise ValueError("ZIPアーカイブがサイズ上限を超えています")
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_SAFE_SKILLSHEET_ZIP_ENTRIES:
+                raise ValueError("ZIP entry数が上限を超えています")
+
+            file_entries = []
+            for entry in entries:
+                normalized_name = (entry.filename or "").replace("\\", "/")
+                path_name = normalized_name.rstrip("/") if entry.is_dir() else normalized_name
+                parts = path_name.split("/")
+                if (
+                    not path_name
+                    or normalized_name.startswith("/")
+                    or re.match(r"^[A-Za-z]:", normalized_name)
+                    or any(part in ("", ".", "..") for part in parts)
+                ):
+                    raise ValueError(f"ZIP内pathが安全ではありません: {entry.filename!r}")
+
+                mode = (entry.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise ValueError(f"ZIP内symlinkは対象外です: {entry.filename!r}")
+                if entry.flag_bits & 0x1:
+                    raise ValueError("暗号化ZIPまたはpassword付きZIPは対象外です")
+                if not entry.is_dir():
+                    file_entries.append(entry)
+
+            if len(file_entries) != 1:
+                raise ValueError(
+                    f"ZIP内の非directory file数が1件ではありません: {len(file_entries)}"
+                )
+
+            member = file_entries[0]
+            member_name = member.filename.replace("\\", "/")
+            member_ext = (
+                member_name.rsplit(".", 1)[-1].lower()
+                if "." in member_name
+                else ""
+            )
+            if member_ext not in SKILLSHEET_EXTENSIONS:
+                raise ValueError(
+                    f"ZIP内ファイル形式が既存対応外です: {member_name!r}"
+                )
+            if member.file_size > MAX_SAFE_SKILLSHEET_MEMBER_BYTES:
+                raise ValueError("ZIP内ファイルがサイズ上限を超えています")
+            compression_ratio = member.file_size / max(member.compress_size, 1)
+            if compression_ratio > MAX_SAFE_SKILLSHEET_COMPRESSION_RATIO:
+                raise ValueError("ZIP圧縮率が安全上限を超えています")
+
+            extracted = archive.read(member)
+            if len(extracted) != member.file_size:
+                raise ValueError("ZIP内ファイルの展開サイズがmetadataと一致しません")
+            return extracted, member_name
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+        raise ValueError(f"ZIPファイルを安全に展開できません: {error}") from error
+
+
 # ---------------------------------------------------------------------------
 # 添付ファイル処理
 # ---------------------------------------------------------------------------
@@ -671,6 +739,10 @@ def extract_from_attachment(attachment: Dict[str, Any]) -> str:
     raw_bytes = base64.urlsafe_b64decode(padded)
 
     filename = attachment.get("filename", "")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext == SAFE_SKILLSHEET_ARCHIVE_EXTENSION:
+        member_bytes, member_name = extract_safe_single_file_zip(raw_bytes)
+        return extract_text_from_bytes_with_timeout(member_bytes, member_name)
     return extract_text_from_bytes_with_timeout(raw_bytes, filename)
 
 
@@ -989,7 +1061,7 @@ def is_eligible_attachment(attachment: Dict[str, Any]) -> bool:
     ).casefold()
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime = (attachment.get("mime_type", "") or "").lower()
-    is_supported = ext in SKILLSHEET_EXTENSIONS or any(
+    is_supported = ext in SKILLSHEET_EXTENSIONS or ext == SAFE_SKILLSHEET_ARCHIVE_EXTENSION or any(
         keyword in mime
         for keyword in ("pdf", "excel", "word", "spreadsheet", "document", "officedocument")
     )
@@ -1110,6 +1182,214 @@ def validate_skillsheet_text(text: str) -> Optional[str]:
     return None
 
 
+IDENTITY_INITIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z])([A-Za-z](?:[._・_]?\s*[A-Za-z]){1,2})(?![A-Za-z])"
+)
+IDENTITY_NAME_LABEL_RE = re.compile(
+    r"(?:【\s*|■\s*)?(?:氏\s*名|名\s*前|技術者名)(?:\s*】|\s*■)?",
+    re.IGNORECASE,
+)
+IDENTITY_AGE_LABEL_RE = re.compile(
+    r"(?:【\s*|■\s*)?年\s*齢(?:\s*】|\s*■)?",
+    re.IGNORECASE,
+)
+IDENTITY_STATION_LABEL_RE = re.compile(
+    r"(?:【\s*|■\s*)?最\s*寄(?:り?\s*駅)?(?:\s*】|\s*■)?",
+    re.IGNORECASE,
+)
+MAX_UNAMBIGUOUS_IDENTITY_VALUES = 5
+MIN_CLEAR_AGE_DIFFERENCE = 5
+
+
+def _normalize_identity_text(text: str) -> str:
+    return unicodedata.normalize(
+        "NFKC", (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    )
+
+
+def _identity_label_windows(text: str, label_re: re.Pattern) -> List[str]:
+    """label直後の同一行、または次の非空行だけをidentity値候補として返す。"""
+    normalized = _normalize_identity_text(text)
+    windows: List[str] = []
+    for match in label_re.finditer(normalized):
+        for raw_line in normalized[match.end():].splitlines():
+            line = raw_line.strip(" \t:：|】■")
+            if line:
+                windows.append(line[:160])
+                break
+    return windows
+
+
+def _normalize_initial(value: str) -> str:
+    return re.sub(r"[^A-Z]", "", (value or "").upper())
+
+
+def _extract_identity_initials(text: str, skillsheet: bool = False) -> Set[str]:
+    values: Set[str] = set()
+    for window in _identity_label_windows(text, IDENTITY_NAME_LABEL_RE):
+        split_initial = re.match(
+            r"^([A-Za-z])\s*\|\s*([A-Za-z])(?:\s*\||$)", window
+        )
+        if split_initial:
+            values.add(
+                _normalize_initial(split_initial.group(1) + split_initial.group(2))
+            )
+            continue
+        token = IDENTITY_INITIAL_TOKEN_RE.search(window)
+        if token:
+            normalized = _normalize_initial(token.group(1))
+            if 2 <= len(normalized) <= 3 and (not skillsheet or len(normalized) == 2):
+                values.add(normalized)
+
+    if skillsheet:
+        normalized_text = _normalize_identity_text(text)
+        sheet_title_re = re.compile(r"===\s*シート:\s*([^=\n]+)", re.IGNORECASE)
+        summary_re = re.compile(
+            r"(?m)^\s*([A-Za-z](?:[._・_]?\s*[A-Za-z]){1,2})"
+            r"\s*[|｜]\s*(?:男性|女性|男|女)"
+        )
+        for raw_value in sheet_title_re.findall(normalized_text) + summary_re.findall(normalized_text):
+            token = IDENTITY_INITIAL_TOKEN_RE.search(raw_value)
+            if token:
+                normalized = _normalize_initial(token.group(1))
+                if len(normalized) == 2:
+                    values.add(normalized)
+    return values
+
+
+def _extract_identity_ages(text: str, skillsheet: bool = False) -> Set[int]:
+    values: Set[int] = set()
+    for window in _identity_label_windows(text, IDENTITY_AGE_LABEL_RE):
+        match = re.search(r"(?<!\d)([2-7]\d)\s*歳?", window)
+        if match:
+            values.add(int(match.group(1)))
+
+    # 「氏名: AB(35歳)」形式を扱う。
+    for window in _identity_label_windows(text, IDENTITY_NAME_LABEL_RE):
+        values.update(
+            int(value)
+            for value in re.findall(r"(?<!\d)([2-7]\d)\s*歳", window)
+        )
+
+    if skillsheet:
+        # labelの無い職務サマリーは先頭部だけを補助的に見る。
+        normalized_text = _normalize_identity_text(text)
+        values.update(
+            int(value)
+            for value in re.findall(
+                r"(?<!\d)([2-7]\d)\s*歳", normalized_text[:500]
+            )
+        )
+    return values
+
+
+def _extract_identity_stations(text: str) -> Set[str]:
+    values: Set[str] = set()
+    for window in _identity_label_windows(text, IDENTITY_STATION_LABEL_RE):
+        matches = re.findall(
+            r"([一-龯ぁ-んァ-ヶA-Za-z0-9・ー]+)\s*駅", window
+        )
+        if matches:
+            values.add(matches[-1])
+    return values
+
+
+def _initials_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return len(left) == 2 and left == right[::-1]
+
+
+def _stations_match(left: str, right: str) -> bool:
+    return left == right or left in right or right in left
+
+
+def _initial_present_in_text(initial: str, text: str) -> bool:
+    chars = list(initial)
+    pattern = r"(?<![A-Za-z])" + r"[._・_]?\s*".join(
+        re.escape(char) for char in chars
+    ) + r"(?![A-Za-z])"
+    if re.search(pattern, _normalize_identity_text(text), re.IGNORECASE):
+        return True
+    if len(initial) == 2:
+        reverse_pattern = r"(?<![A-Za-z])" + r"[._・_]?\s*".join(
+            re.escape(char) for char in reversed(chars)
+        ) + r"(?![A-Za-z])"
+        return bool(
+            re.search(
+                reverse_pattern,
+                _normalize_identity_text(text),
+                re.IGNORECASE,
+            )
+        )
+    return False
+
+
+def detect_clear_identity_mismatch(
+    email_body_text: str, skillsheet_text: str
+) -> Dict[str, Any]:
+    """年齢差と別属性の不一致が揃う明確な別人物だけを返す。"""
+    body_initials = _extract_identity_initials(email_body_text)
+    sheet_initials = _extract_identity_initials(skillsheet_text, skillsheet=True)
+    body_ages = _extract_identity_ages(email_body_text)
+    sheet_ages = _extract_identity_ages(skillsheet_text, skillsheet=True)
+    body_stations = _extract_identity_stations(email_body_text)
+    sheet_stations = _extract_identity_stations(skillsheet_text)
+
+    sheet_value_sets = (sheet_initials, sheet_ages, sheet_stations)
+    if any(len(values) > MAX_UNAMBIGUOUS_IDENTITY_VALUES for values in sheet_value_sets):
+        return {}
+    if len(body_ages) != 1 or not sheet_ages:
+        return {}
+
+    body_age = next(iter(body_ages))
+    age_mismatch = all(
+        abs(body_age - sheet_age) >= MIN_CLEAR_AGE_DIFFERENCE
+        for sheet_age in sheet_ages
+    )
+    if not age_mismatch:
+        return {}
+
+    body_initial = next(iter(body_initials)) if len(body_initials) == 1 else ""
+    initial_mismatch = bool(
+        body_initial
+        and sheet_initials
+        and not _initial_present_in_text(body_initial, skillsheet_text)
+        and not any(
+            _initials_match(body_initial, sheet_initial)
+            for sheet_initial in sheet_initials
+        )
+    )
+    normalized_skillsheet = _normalize_identity_text(skillsheet_text)
+    body_station = next(iter(body_stations)) if len(body_stations) == 1 else ""
+    station_mismatch = (
+        bool(body_station)
+        and bool(sheet_stations)
+        and body_station not in normalized_skillsheet
+        and not any(
+            _stations_match(body_station, sheet_station)
+            for sheet_station in sheet_stations
+        )
+    )
+    if not (initial_mismatch or station_mismatch):
+        return {}
+
+    mismatched_attributes = ["age"]
+    if initial_mismatch:
+        mismatched_attributes.append("initial")
+    if station_mismatch:
+        mismatched_attributes.append("station")
+    return {
+        "mismatched_attributes": mismatched_attributes,
+        "body_initials": sorted(body_initials),
+        "skillsheet_initials": sorted(sheet_initials),
+        "body_ages": sorted(body_ages),
+        "skillsheet_ages": sorted(sheet_ages),
+        "body_stations": sorted(body_stations),
+        "skillsheet_stations": sorted(sheet_stations),
+    }
+
+
 def classify_attachment_failure(filename: str, error: Exception) -> str:
     """添付ファイル失敗理由を対象区分つきで整形する。"""
     message = str(error).strip() or "unknown attachment error"
@@ -1117,7 +1397,9 @@ def classify_attachment_failure(filename: str, error: Exception) -> str:
         scope = "要確認"
         kind = "extract_timeout"
     elif (
-        "could not read strings" in message.lower()
+        message.startswith("ZIP")
+        or "暗号化ZIP" in message
+        or "could not read strings" in message.lower()
         or "サポートされていないファイル形式" in message
         or "旧Word(.doc)抽出未対応" in message
         or "抽出テキストが空" in message
@@ -1667,6 +1949,12 @@ def fetch_skillsheet(
     Returns:
         {message_id, skillsheet, source, success, urls}
     """
+    identity_body_text = (
+        (mail_record or {}).get("body_text")
+        or (cleanup_record or {}).get("body_text")
+        or ""
+    )
+
     # --- ① 添付ファイル優先 ---
     attachments = (mail_record or {}).get("attachments") or []
     failure_reasons: List[str] = []
@@ -1683,6 +1971,26 @@ def fetch_skillsheet(
                 text = extract_from_attachment(att)
                 quality_error = validate_skillsheet_text(text)
                 if quality_error is None:
+                    identity_mismatch = detect_clear_identity_mismatch(
+                        identity_body_text, text
+                    )
+                    if identity_mismatch:
+                        attributes = ",".join(
+                            identity_mismatch["mismatched_attributes"]
+                        )
+                        errors.append(
+                            f"{filename}: 本文人物とskillsheet人物が不一致({attributes})"
+                        )
+                        classified_errors.append(
+                            "要確認[identity_mismatch] "
+                            f"attachment:{filename}: mismatched_attributes={attributes}"
+                        )
+                        logger.warn(
+                            "添付skillsheet人物不一致のため次候補へ進む: "
+                            f"{filename} ({attributes})",
+                            message_id,
+                        )
+                        continue
                     logger.ok(f"添付ファイルからテキスト取得: {filename}", message_id)
                     return {
                         "message_id": message_id,
@@ -1745,6 +2053,23 @@ def fetch_skillsheet(
 
             quality_error = validate_skillsheet_text(text)
             if quality_error is None:
+                identity_mismatch = detect_clear_identity_mismatch(
+                    identity_body_text, text
+                )
+                if identity_mismatch:
+                    attributes = ",".join(
+                        identity_mismatch["mismatched_attributes"]
+                    )
+                    failure_reasons.append(
+                        "要確認[identity_mismatch] "
+                        f"url[{category}] {url}: mismatched_attributes={attributes}"
+                    )
+                    logger.warn(
+                        "URL skillsheet人物不一致のため次候補へ進む "
+                        f"({source}/{category}): {url} ({attributes})",
+                        message_id,
+                    )
+                    continue
                 logger.ok(
                     f"URLからテキスト取得 ({source}/{category}): {url} -> {download_result.final_url}",
                     message_id,

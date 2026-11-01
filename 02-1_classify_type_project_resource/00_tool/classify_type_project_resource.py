@@ -211,6 +211,9 @@ _PROJECT_CONTEXT_PATTERNS = [
     r"見合う.*がおりましたら",        # 「見合う人材がおりましたら」(Y's等)
     r"見合う.*がいらっしゃれば",      # 「見合う方がいらっしゃれば」(sus4等)
     r"対応可能な.*ご紹介ください",    # 「対応可能なエンジニア様が…ご紹介ください」(CRE-CO等)
+    # --- 追加: 既存候補者紹介依頼の未対応構文（対象語と終止表現を限定） ---
+    r"見合う(?:要員|人材|技術者|エンジニア|方)(?:が)?(?:おりましたら|いらっしゃいましたら|いらっしゃれば|いれば|あれば)",
+    r"(?:ご)?対応できる(?:要員|人材|技術者|エンジニア|方)(?:が)?(?:おりましたら|いらっしゃいましたら|いらっしゃれば|いれば)",
 ]
 
 _RESOURCE_CONTEXT_RE = [re.compile(p) for p in _RESOURCE_CONTEXT_PATTERNS]
@@ -262,6 +265,9 @@ _STRONG_RESOURCE_PROFILE_SUBJECT_RE = re.compile(
 _RESOURCE_SUBJECT_PROFILE_RES: List[re.Pattern] = [re.compile(p) for p in [
     r"\d{2}歳(?!まで|以下|迄)",
     r"(?:^|[\s/|｜])(?:男性|女性)(?:$|[\s/|｜])",
+    # 強いresource件名内の、区切られた単独の性別tokenだけを扱う。
+    # 「男女」「長男」「女子」等の部分一致は対象外。
+    r"(?:^|[\s/|｜()（）])(?:男|女)(?:$|[\s/|｜()（）])",
     r"[^\s/|｜]{1,20}駅(?:[（(][^)）]+[)）])?",
 ]]
 
@@ -312,6 +318,14 @@ _RESOURCE_SINGLE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     rf'イニシャル{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
 ]]
 
+# resource profile判定で既に使用しているラベルのうち、個人を識別できるもの。
+# project構造が強い複数案件メールをresourceへ早期確定しないための限定条件に再利用する。
+_RESOURCE_IDENTITY_LABEL_RES: List[re.Pattern] = (
+    _RESOURCE_SINGLE_LABEL_RES[0:8]
+    + _RESOURCE_SINGLE_LABEL_RES[14:16]
+    + [_RESOURCE_SINGLE_LABEL_RES[-1]]
+)
+
 # 3種類まで既存profile labelが揃った単一要員メールの限定救済用。
 # 「場所」「時期」等は案件本文にも出現するため、通常のprofile labelには加えず、
 # 強いresource提示signalとのAND条件でのみ使用する。
@@ -326,8 +340,11 @@ _RESOURCE_AUX_PROFILE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     r'【稼働開始[】]',
 ]]
 
-# 「要員募集」等の案件件名を拾わないよう、【…要員】で閉じる件名だけを扱う。
-_RESOURCE_PROFILE_SUBJECT_RE = re.compile(r'【[^】\r\n]{0,30}要員】')
+# 「要員募集」等の案件件名を拾わないよう、【…要員】で閉じる件名と
+# 実績確認済みの完全一致【即日技術者】だけを扱う。
+_RESOURCE_PROFILE_SUBJECT_RE = re.compile(
+    r'(?:【[^】\r\n]{0,30}要員】|【即日技術者】)'
+)
 _RESOURCE_RESUME_LABEL_RE = re.compile(
     rf'(?:業務)?経歴書{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]'
 )
@@ -516,12 +533,22 @@ def rule_classify(
     # 要員単人構造ラベル（4種類以上 = resource確定）
     # 氏名：, 【氏名】, 年齢：, 【年齢】, 所属：, 【所属】 等が4つ以上 = 要員プロフィール
     res_struct = sum(1 for p in _RESOURCE_SINGLE_LABEL_RES if p.search(body_cjk))
-    if res_struct >= 4:
+    proj_struct = sum(1 for p in _PROJECT_STRUCT_LABEL_RES if p.search(body_cjk))
+    has_resource_identity = any(
+        p.search(body_cjk) for p in _RESOURCE_IDENTITY_LABEL_RES
+    )
+    suppress_resource_early_confirmation = (
+        proj_struct >= 3 and not has_resource_identity
+    )
+    if res_struct >= 4 and not suppress_resource_early_confirmation:
         return "resource", 0.85, []
 
     # profile labelが3種類まで揃っている場合の限定救済。
     # 補助label単独、threshold緩和、score調整は行わない。
-    if _has_limited_resource_profile_rescue(subject, body_cjk, res_struct):
+    if (
+        not suppress_resource_early_confirmation
+        and _has_limited_resource_profile_rescue(subject, body_cjk, res_struct)
+    ):
         return "resource", 0.85, []
 
     res_score, proj_score, res_hits, proj_hits, res_ctx, proj_ctx = score_text(
@@ -531,8 +558,6 @@ def rule_classify(
 
     # 案件構造ラベル（3種類以上 = project確定）
     # ただし要員紹介シグナルが強い場合は早期確定させず、通常スコア判定に流す。
-    proj_struct = sum(1 for p in _PROJECT_STRUCT_LABEL_RES if p.search(body_cjk))
-
     # 技術経歴が長い要員紹介は案件系キーワードのスコアが過大になりやすい。
     # 明確な要員件名 + 複数プロフィール属性があり、案件側の明示シグナルが
     # ない場合は、スコア比較より要員プロフィール構造を優先する。

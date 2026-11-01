@@ -33,6 +33,7 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 INPUT_PAIRS         = project_root / "06-10_match_location/01_result/matched_pairs_location.jsonl"
 INPUT_PROJECT_KWS   = project_root / "03-51_extract_project_required_skills_list/01_result/extract_project_required_skills_list.jsonl"
 INPUT_SKILLSHEET    = project_root / "04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl"
+INPUT_NORMALIZED_SKILLSHEET = project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
 INPUT_EMAIL_BODY    = project_root / "01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl"
 
 OUTPUT_MATCHED    = STEP_DIR / "01_result/matched_pairs_required_skills_list.jsonl"
@@ -40,7 +41,6 @@ OUTPUT_NO_MATCHED = STEP_DIR / "01_result/99_not_matched_pairs_required_skills_l
 
 REQUIRED_SKILL_KEY = "required_skill_keywords"
 REQUIRED_PHASE_KEY = "required_phase_keywords"
-
 STRONG_REQUIRED_PHASE_KEYWORDS = {
     "要件定義",
     "基本設計",
@@ -71,6 +71,13 @@ SQL_RELATED_DATABASE_KEYWORDS = {
 
 def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKC", s or "")
+
+
+def skillsheet_text_for_matching(raw_record: dict, normalized_record: dict) -> str:
+    """04-2の最終状態をcanonical inputとして返す。04-1 rawへは戻らない。"""
+    if normalized_record.get("success") is not True:
+        return ""
+    return normalized_record.get("skillsheet") or ""
 
 
 def build_required_skill_keyword_set(project_rec: dict) -> List[str]:
@@ -209,7 +216,13 @@ def main():
     logger.info("処理開始")
 
     # 入力ファイル存在確認
-    for path in [INPUT_PAIRS, INPUT_PROJECT_KWS, INPUT_SKILLSHEET, INPUT_EMAIL_BODY]:
+    for path in [
+        INPUT_PAIRS,
+        INPUT_PROJECT_KWS,
+        INPUT_SKILLSHEET,
+        INPUT_NORMALIZED_SKILLSHEET,
+        INPUT_EMAIL_BODY,
+    ]:
         if not path.exists():
             msg = f"入力ファイルが存在しません: {path}"
             logger.error(msg)
@@ -220,6 +233,9 @@ def main():
         pairs            = read_jsonl_as_list(str(INPUT_PAIRS))
         project_kws_map  = read_jsonl_as_dict(str(INPUT_PROJECT_KWS),  key="message_id")
         skillsheet_map   = read_jsonl_as_dict(str(INPUT_SKILLSHEET),    key="message_id")
+        normalized_skillsheet_map = read_jsonl_as_dict(
+            str(INPUT_NORMALIZED_SKILLSHEET), key="message_id"
+        )
         email_body_map   = read_jsonl_as_dict(str(INPUT_EMAIL_BODY),    key="message_id")
     except Exception as e:
         write_error_log(str(dirs["result"]), e, context=STEP_NAME)
@@ -229,11 +245,13 @@ def main():
     logger.info(f"入力ペア数: {len(pairs)}")
     logger.info(f"案件キーワードレコード数: {len(project_kws_map)}")
     logger.info(f"スキルシートレコード数: {len(skillsheet_map)}")
+    logger.info(f"正規化スキルシートレコード数: {len(normalized_skillsheet_map)}")
     logger.info(f"メール本文レコード数: {len(email_body_map)}")
 
     matched = []
     no_matched = []
     passthrough_count = 0
+    unavailable_skillsheet_resource_ids: Set[str] = set()
 
     for pair in pairs:
         project_message_id  = pair["project_info"]["message_id"]
@@ -241,11 +259,18 @@ def main():
 
         project_rec       = project_kws_map.get(project_message_id, {})
         skillsheet_rec    = skillsheet_map.get(resource_message_id, {})
+        normalized_skillsheet_rec = normalized_skillsheet_map.get(
+            resource_message_id, {}
+        )
         email_body_rec    = email_body_map.get(resource_message_id, {})
 
         required_skill_keywords = build_required_skill_keyword_set(project_rec)
         strong_required_phase_keywords, weak_required_phase_keywords = build_required_phase_keywords(project_rec)
-        skillsheet_text   = skillsheet_rec.get("skillsheet") or ""
+        skillsheet_text = skillsheet_text_for_matching(
+            skillsheet_rec, normalized_skillsheet_rec
+        )
+        if normalized_skillsheet_rec.get("success") is not True:
+            unavailable_skillsheet_resource_ids.add(resource_message_id)
         email_body_text   = email_body_rec.get("body_text") or ""
 
         is_match, matched_skill_kws, matched_phase_kws, matched_in = judge_match(
@@ -305,6 +330,7 @@ def main():
     logger.info(
         f"処理完了 合計={len(pairs)} マッチ={len(matched)} 除外={len(no_matched)}"
         f" うちキーワード空（pass-through）={passthrough_count}"
+        f" 04-2利用不可resource={len(unavailable_skillsheet_resource_ids)}"
     )
 
 

@@ -63,6 +63,77 @@ class RuleClassifyTest(unittest.TestCase):
 
         self.assertEqual(mail_type, "resource")
 
+    def test_direct_individual_bare_gender_tokens_are_resources(self):
+        body = """エンジニアのご紹介です。
+名前：A.B
+所属：個人事業主
+単価：80万円
+要件定義 基本設計 詳細設計 求人
+要件定義 基本設計 詳細設計 求人
+マッチする案件がございましたらご紹介ください。
+"""
+        subjects = (
+            "【SPONTO直個人】即日〜 / 53歳 / 日本 / 男 / 宮前平",
+            "【SPONTO直個人】即日〜 / 45歳 / 日本 / 女 / 横浜",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                mail_type, _, _ = target.rule_classify(subject, body, self.keywords)
+                self.assertEqual(mail_type, "resource")
+
+    def test_direct_individual_full_gender_tokens_remain_resources(self):
+        body = "名前：A.B\n所属：個人事業主\n単価：80万円\n案件がございましたらご紹介ください。"
+        subjects = (
+            "【SPONTO直個人】即日〜 / 53歳 / 日本 / 男性 / 宮前平",
+            "【SPONTO直個人】即日〜 / 45歳 / 日本 / 女性 / 横浜",
+        )
+
+        for subject in subjects:
+            with self.subTest(subject=subject):
+                mail_type, _, _ = target.rule_classify(subject, body, self.keywords)
+                self.assertEqual(mail_type, "resource")
+
+    def test_bare_gender_profile_requires_an_independent_token(self):
+        expressions = (
+            "男女問わず",
+            "男女活躍中",
+            "男性向け",
+            "女性向け",
+            "長男",
+            "女子",
+            "男子",
+        )
+
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                subject = f"【SPONTO直個人】即日〜 / 53歳 / {expression} / 宮前平"
+                self.assertFalse(target._has_strong_resource_subject_profile(subject))
+
+    def test_bare_gender_profile_accepts_supported_boundaries(self):
+        gender_tokens = (
+            "/ 男 /",
+            "／ 女 ／",
+            "| 男 |",
+            "｜ 女 ｜",
+            " 男 ",
+            "(女)",
+            "（男）",
+        )
+
+        for gender_token in gender_tokens:
+            with self.subTest(gender_token=gender_token):
+                subject = f"【SPONTO直個人】即日〜 / 53歳 {gender_token} 宮前平"
+                self.assertTrue(target._has_strong_resource_subject_profile(subject))
+
+    def test_bare_gender_profile_requires_a_strong_resource_subject(self):
+        subject = "【案件】Java開発 / 53歳 / 日本 / 男 / 東京"
+        body = "募集：Javaエンジニア1名"
+
+        mail_type, _, _ = target.rule_classify(subject, body, self.keywords)
+
+        self.assertEqual(mail_type, "project")
+
     def test_direct_individual_allowed_variants_follow_project_score(self):
         body = "募集：Javaエンジニア1名"
 

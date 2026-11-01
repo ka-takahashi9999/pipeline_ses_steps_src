@@ -59,7 +59,7 @@ def _n(s: str) -> str:
 
 
 _HDR_STRIP_LEAD_RE = re.compile(r'^[\s【■□◆◇●○◎▶▼▽◾〈★☆~\[<「『《※*＊\-ー=－]+')
-_HDR_STRIP_TAIL_RE = re.compile(r'[\s】■◆☆▽~\]>〉」』》:：*＊!！\-ー=－]+$')
+_HDR_STRIP_TAIL_RE = re.compile(r'[\s】■◆☆▽~\]>〉」』》:：;；*＊!！\-ー=－]+$')
 _HDR_INNER_SPACE_RE = re.compile(r'[\s　\t_＿]+')  # 全角スペース・半角スペース・タブ・アンダースコア
 # 絵文字バリエーションセレクタ（U+FE00-FE0F: ◾️ の ️ 部分等）を除去
 _VARIATION_SELECTOR_RE = re.compile('[\ufe00-\ufe0f]')
@@ -331,6 +331,58 @@ _OPTIONAL_HDR_NORM_RE = re.compile(
     re.IGNORECASE
 )
 
+# CHECK-04限定: 通常の見出し判定・stop判定では失われる確認済み表記だけを扱う。
+# 一般的な複合見出し推測には広げない。
+_LIMITED_REQUIRED_HDR_NORM_RE = re.compile(
+    r'^(?:求めるスキル・経験|業務内容・必須スキル|必須前提条件|必須条件[/／]経験)$',
+    re.IGNORECASE,
+)
+
+_LIMITED_OPTIONAL_HDR_NORM_RE = re.compile(
+    r'^(?:スキル\(尚可\)|〇尚可スキル|歓迎・尚可スキル)$',
+    re.IGNORECASE,
+)
+
+# CHECK-04限定: requiredセクション内の独立否定行だけを除外する。
+# 別のrequired条件が同じ行に続く場合は、明示的な接続語の後半だけを保持する。
+_STANDALONE_NEGATED_REQUIRED_RE = re.compile(
+    r'^(?:※\s*)?.{1,80}?(?:は不問|は不要|は問いません|ツール不問)'
+    r'(?:\s*[（(]キャッチアップ前提[）)])?[。.]?$',
+)
+# 括弧内の補足否定（例: 「AWS開発経験（インフラ経験は不要）」）は残し、
+# 行の主節自体が「経験/スキルは不問・必須ではない」と否定される場合だけ除外する。
+_MAIN_CLAUSE_NEGATED_REQUIRED_RE = re.compile(
+    r'^(?:※\s*)?(?:【)?[^（(\n]{1,120}?(?:経験|スキル)は'
+    r'(?:不問|不要|問いません|必須では(?:ない|ありません|ございません))'
+    r'(?:】)?(?:です[。.]?.*)?$',
+)
+_COMPOUND_NEGATED_REQUIRED_RE = re.compile(
+    r'^(?:※\s*)?.+?(?:は不問|は不要|は問いません|ツール不問)'
+    r'\s*(?:、\s*)?(?:だが|ただし|但し|しかし|一方で)\s*(?P<positive>.+)$',
+)
+_POSITIVE_REQUIRED_CUE_RE = re.compile(
+    r'(?:必須|必要|MUST|Required)',
+    re.IGNORECASE,
+)
+
+
+def _prepare_required_skill_text(text: str) -> str:
+    """独立否定行を除外し、複合行では明示required側だけを保持する。"""
+    skill_text = _strip_bullet(text).strip()
+    normalized = _n(skill_text)
+
+    compound = _COMPOUND_NEGATED_REQUIRED_RE.fullmatch(normalized)
+    if compound:
+        positive = compound.group('positive').strip()
+        if _POSITIVE_REQUIRED_CUE_RE.search(positive):
+            return positive
+        return skill_text
+
+    if (_STANDALONE_NEGATED_REQUIRED_RE.fullmatch(normalized)
+            or _MAIN_CLAUSE_NEGATED_REQUIRED_RE.fullmatch(normalized)):
+        return ''
+    return skill_text
+
 # 行末の「(must)」「(尚可)」等、スキル名に付随するインラインラベル（セクションヘッダーではなくラベル）
 # 例: 「Prisma Accessの設計、運用経験(must)」→ skill="Prisma Accessの設計、運用経験"
 _INLINE_SKILL_MUST_RE = re.compile(
@@ -338,7 +390,7 @@ _INLINE_SKILL_MUST_RE = re.compile(
     re.IGNORECASE
 )
 _INLINE_SKILL_OPT_RE = re.compile(
-    r'\s*(?:\(\s*optional\s*\)|\(\s*尚可\s*\)|\(\s*want\s*\))\s*$',
+    r'\s*(?:\(\s*optional\s*\)|\(\s*尚可\s*\)|\(\s*want\s*\)|\(\s*希望\s*\))\s*$',
     re.IGNORECASE
 )
 
@@ -440,11 +492,18 @@ def _classify_line(
       inline_content: 見出しと同一行にあるコンテンツ（通常は空文字）
       ※ required_skill / optional_skill は one-shot 抽出（STATE_NONE に戻る）
     """
-    # 停止条件を最優先
+    norm = _normalize_hdr(line)
+
+    # 「業務内容・必須スキル」は通常のstop判定にも一致するため、
+    # 確認済みの限定見出しだけstop判定より先に確定する。
+    if norm and _LIMITED_REQUIRED_HDR_NORM_RE.fullmatch(norm):
+        return 'required_header', ''
+    if norm and _LIMITED_OPTIONAL_HDR_NORM_RE.fullmatch(norm):
+        return 'optional_header', ''
+
+    # 上記の限定例外以外は既存どおり停止条件を最優先する。
     if _is_stop_section(line):
         return 'stop', ''
-
-    norm = _normalize_hdr(line)
 
     # 正規化後の完全一致で required/optional 判定
     if norm and _REQUIRED_HDR_NORM_RE.match(norm):
@@ -1113,6 +1172,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
     consumed_until = -1
     in_person_skill_requirements = False
     in_experience_section = False
+    in_mind_required_subsection = False
+    blank_terminated_required_header = False
+    blank_terminated_required_has_content = False
 
     for line_index, raw_line in enumerate(lines):
         if line_index <= consumed_until:
@@ -1122,6 +1184,31 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
 
         line = raw_line.strip()
         if not line:
+            # CHECK-04で確認済みの「必須前提条件」は、単独条件の直後に空行を置き、
+            # その後へ広告・署名が続く形式だった。この限定見出しだけは、1件以上の
+            # 条件を取得した後の空行をsection終端として扱い、広告文を巻き込まない。
+            if (state == STATE_REQUIRED
+                    and blank_terminated_required_header
+                    and blank_terminated_required_has_content):
+                state = STATE_NONE
+                blank_terminated_required_header = False
+                blank_terminated_required_has_content = False
+                pseudo_parent_header = ''
+            continue
+
+        norm = _normalize_hdr(line)
+
+        # CHECK-04限定: 「マインド・姿勢面」はrequired配下の小見出しであり、
+        # required sectionの終了条件にはしない。配下の人物・勤務態度条件は
+        # 03-51 required keywordへ渡さず、対になる「技術面」から通常抽出を再開する。
+        # STATE_NONE / OPTIONAL で現れた場合は従来のstop挙動を維持する。
+        if state == STATE_REQUIRED and norm == 'マインド・姿勢面':
+            in_mind_required_subsection = True
+            pseudo_parent_header = ''
+            continue
+        if state == STATE_REQUIRED and in_mind_required_subsection and norm == '技術面':
+            in_mind_required_subsection = False
+            pseudo_parent_header = ''
             continue
 
         # 必須の選択条件直下にある○子行だけを、親の工程文脈と一体で保持する。
@@ -1156,7 +1243,6 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
         )
 
         # 確認済みの人材スキル要件ブロック内だけ、必須宣言と加点切替を扱う。
-        norm = _normalize_hdr(line)
         if norm in ('必須経験', '尚可経験'):
             in_experience_section = True
         elif in_experience_section and norm == '稼働詳細':
@@ -1181,6 +1267,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
         # ラベルで種別が確定しているため _is_skill_line の文脈チェックを省略し、
         # reject/stop/空文字チェックのみ実施。skill 確定後 STATE_NONE に戻る。
         if kind in ('required_skill', 'optional_skill'):
+            in_mind_required_subsection = False
+            blank_terminated_required_header = False
+            blank_terminated_required_has_content = False
             pseudo_parent_header = ''
             if inline:
                 skill_text = _strip_bullet(inline)
@@ -1190,7 +1279,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                         and not _REJECT_CONTENT_RE.search(skill_text)
                         and not _is_non_skill_explanatory_line(skill_text)):
                     if kind == 'required_skill':
-                        required.append(skill_text)
+                        skill_text = _prepare_required_skill_text(skill_text)
+                        if skill_text:
+                            required.append(skill_text)
                     else:
                         optional.append(skill_text)
             state = STATE_NONE
@@ -1198,6 +1289,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
 
         # Must/Want 見出し: いずれの状態からでも正しいセクションに遷移する
         if kind == 'required_header':
+            in_mind_required_subsection = False
+            blank_terminated_required_header = norm == '必須前提条件'
+            blank_terminated_required_has_content = False
             state = STATE_REQUIRED
             if inline and _is_pseudo_list_header(inline):
                 pseudo_parent_header = inline
@@ -1208,10 +1302,17 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                 for item in _INLINE_BULLET_SPLIT_RE.split(inline):
                     item = item.strip()
                     if item and _is_skill_line(item, in_section=True):
-                        required.append(_strip_bullet(item))
+                        skill_text = _prepare_required_skill_text(item)
+                        if skill_text:
+                            required.append(skill_text)
+                            if blank_terminated_required_header:
+                                blank_terminated_required_has_content = True
             continue
 
         if kind == 'optional_header':
+            in_mind_required_subsection = False
+            blank_terminated_required_header = False
+            blank_terminated_required_has_content = False
             state = STATE_OPTIONAL
             if inline and _is_pseudo_list_header(inline):
                 pseudo_parent_header = inline
@@ -1225,6 +1326,9 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
             continue
 
         if kind == 'stop':
+            in_mind_required_subsection = False
+            blank_terminated_required_header = False
+            blank_terminated_required_has_content = False
             in_person_skill_requirements = False
             in_experience_section = False
             if state in (STATE_REQUIRED, STATE_OPTIONAL):
@@ -1238,6 +1342,11 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
             continue
 
         # content
+        if state == STATE_REQUIRED and in_mind_required_subsection:
+            # 小見出し配下は非技術required条件として中立化する。
+            # 「情報セキュリティ」等をグローバル除外語には追加しない。
+            continue
+
         if state == STATE_NONE:
             # _REJECT_CONTENT_RE で年齢・単価等の非スキル行を除外してから判定する。
             # STATE_NONE はセクション前後どちらでも通過するため、拒否フィルタが必要。
@@ -1248,7 +1357,7 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                 if skill_text and len(skill_text) > 5:
                     optional.append(skill_text)
             elif _TECH_ELEMENT_RE.match(line):
-                skill_text = _strip_bullet(line)
+                skill_text = _prepare_required_skill_text(line)
                 if skill_text:
                     required.append(skill_text)
 
@@ -1276,7 +1385,11 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                     skill_text, pseudo_parent_header
                 )
                 if state == STATE_REQUIRED:
-                    required.append(skill_text)
+                    skill_text = _prepare_required_skill_text(skill_text)
+                    if skill_text:
+                        required.append(skill_text)
+                        if blank_terminated_required_header:
+                            blank_terminated_required_has_content = True
                 else:
                     optional.append(skill_text)
 

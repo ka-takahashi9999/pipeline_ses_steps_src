@@ -24,6 +24,7 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 INPUT_MATCHED       = project_root / "06-11_match_required_skills_list/01_result/matched_pairs_required_skills_list.jsonl"
 INPUT_PROJECT_KWS   = project_root / "03-51_extract_project_required_skills_list/01_result/extract_project_required_skills_list.jsonl"
 INPUT_SKILLSHEET    = project_root / "04-1_fetch_skillsheets_text/01_result/fetch_skillsheets_text.jsonl"
+INPUT_NORMALIZED_SKILLSHEET = project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
 INPUT_EMAIL_BODY    = project_root / "01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl"
 
 OUTPUT_MATCHED    = STEP_DIR / "01_result/matched_pairs_required_skills_noise_filtered.jsonl"
@@ -75,6 +76,13 @@ def _normalize(s: str) -> str:
 
 def _normalized_text(skillsheet_text: str, email_body_text: str) -> str:
     return (_normalize(skillsheet_text or "") + "\n" + _normalize(email_body_text or "")).lower()
+
+
+def skillsheet_text_for_matching(raw_record: dict, normalized_record: dict) -> str:
+    """04-2の最終状態をcanonical inputとして返す。04-1 rawへは戻らない。"""
+    if normalized_record.get("success") is not True:
+        return ""
+    return normalized_record.get("skillsheet") or ""
 
 
 def has_fw_network_context(project_rec: dict) -> bool:
@@ -237,7 +245,13 @@ def main():
 
     logger.info("処理開始")
 
-    for path in [INPUT_MATCHED, INPUT_PROJECT_KWS, INPUT_SKILLSHEET, INPUT_EMAIL_BODY]:
+    for path in [
+        INPUT_MATCHED,
+        INPUT_PROJECT_KWS,
+        INPUT_SKILLSHEET,
+        INPUT_NORMALIZED_SKILLSHEET,
+        INPUT_EMAIL_BODY,
+    ]:
         if not path.exists():
             msg = f"入力ファイルが存在しません: {path}"
             logger.error(msg)
@@ -248,6 +262,9 @@ def main():
         matched_pairs    = read_jsonl_as_list(str(INPUT_MATCHED))
         project_kws_map  = read_jsonl_as_dict(str(INPUT_PROJECT_KWS), key="message_id")
         skillsheet_map   = read_jsonl_as_dict(str(INPUT_SKILLSHEET), key="message_id")
+        normalized_skillsheet_map = read_jsonl_as_dict(
+            str(INPUT_NORMALIZED_SKILLSHEET), key="message_id"
+        )
         email_body_map   = read_jsonl_as_dict(str(INPUT_EMAIL_BODY), key="message_id")
     except Exception as e:
         write_error_log(str(dirs["result"]), e, context=STEP_NAME)
@@ -259,13 +276,22 @@ def main():
     refiltered_matched = []
     refiltered_no_match = []
     filtered_keyword_counter: Dict[str, int] = {}
+    unavailable_skillsheet_resource_ids: Set[str] = set()
 
     for pair in matched_pairs:
         project_message_id = pair["project_info"]["message_id"]
         resource_message_id = pair["resource_info"]["message_id"]
 
         project_rec = project_kws_map.get(project_message_id, {})
-        skillsheet_text = (skillsheet_map.get(resource_message_id) or {}).get("skillsheet") or ""
+        skillsheet_rec = skillsheet_map.get(resource_message_id) or {}
+        normalized_skillsheet_rec = normalized_skillsheet_map.get(
+            resource_message_id, {}
+        )
+        skillsheet_text = skillsheet_text_for_matching(
+            skillsheet_rec, normalized_skillsheet_rec
+        )
+        if normalized_skillsheet_rec.get("success") is not True:
+            unavailable_skillsheet_resource_ids.add(resource_message_id)
         email_body_text = (email_body_map.get(resource_message_id) or {}).get("body_text") or ""
         combined_text = _normalized_text(skillsheet_text, email_body_text)
 
@@ -336,6 +362,7 @@ def main():
     logger.info(
         f"処理完了 入力={len(matched_pairs)} マッチ={len(refiltered_matched)}"
         f" 除外={len(refiltered_no_match)} filtered_keyword_counter={filtered_keyword_counter}"
+        f" 04-2利用不可resource={len(unavailable_skillsheet_resource_ids)}"
     )
 
 

@@ -84,6 +84,15 @@ _SKILL_RE = re.compile(
 RX_MAN_MAN = re.compile(
     r"(\d{1,3})\s*万[円]?\s*" + _SEP + r"\s*(\d{1,3})\s*万[円]?"
 )
+# MAX付き閉区間: 55万〜MAX65万 / 65万円〜（MAX85万円）
+RX_MAN_MAX_MAN = re.compile(
+    r"(\d{1,3})\s*万[円]?\s*" + _SEP
+    + r"\s*[（(]?\s*[Mm][Aa][Xx]\s*(\d{1,3})\s*万[円]?"
+)
+# 「から」付き閉区間: 70万円から80万円
+RX_MAN_KARA_MAN = re.compile(
+    r"(\d{1,3})\s*万[円]?\s*から\s*(\d{1,3})\s*万[円]?"
+)
 # 数-数万 閉区間: 80〜90万 / 75~85万 / 70-75万
 RX_NUM_MAN = re.compile(
     r"(\d{1,3})\s*" + _SEP + r"\s*(\d{1,3})\s*万[円]?"
@@ -104,16 +113,47 @@ RX_MAN1 = re.compile(r"(\d{1,3})\s*万[円]?")
 # 円整数（カンマ区切りまたは3〜6桁）。数値途中の部分一致は各pattern側で防ぐ。
 _YEN_INTEGER = r"(?:\d{1,3}(?:,\d{3})+|\d{3,6})"
 
+# 価格欄のカンマ付き円額range。時給・日給は別ruleで換算する。
+_COMMA_YEN_INTEGER = r"\d{1,3}(?:,\d{3})+"
+RX_COMMA_YEN_RANGE = re.compile(
+    r"(?<![\d,])(?P<low>" + _COMMA_YEN_INTEGER + r")(?![\d,])\s*円?\s*"
+    + _SEP
+    + r"\s*(?P<high>" + _COMMA_YEN_INTEGER + r")(?![\d,])\s*円?"
+    + r"(?:\s*/\s*月)?"
+)
+RX_COMMA_YEN_OPEN_LOW = re.compile(
+    r"(?<![\d,])(?P<yen>" + _COMMA_YEN_INTEGER + r")(?![\d,])"
+    + r"\s*円\s*[〜~](?!\s*\d)"
+)
+RX_CURRENCY_SYMBOL_COMMA_VALUE = re.compile(
+    r"[\\¥￥]\s*(?P<yen>" + _COMMA_YEN_INTEGER + r")(?![\d,])"
+)
+
+# 明示月額と括弧内の参考時給が併記される場合は月額を優先する。
+RX_MONTHLY_WITH_HOURLY_EQUIVALENT = re.compile(
+    r"(?P<monthly>\d{1,3})\s*万[円]?\s*\(\s*"
+    r"(?:参考\s*)?時給\s*" + _YEN_INTEGER
+    + r"\s*円?\s*相当\s*\)"
+)
+
 # 時給・日給
 RX_DAILY_RANGE = re.compile(
     r"日給\s*(\d{1,2})\s*万[円]?\s*[〜~\-]\s*(\d{1,2})\s*万[円]?"
 )
 RX_DAILY_MAN  = re.compile(r"日給\s*(\d{1,2})\s*万[円]?")
-RX_DAILY_YEN  = re.compile(r"日給\s*(\d{3,6})\s*円")
+RX_DAILY_YEN  = re.compile(
+    r"日給\s*(?P<yen>\d{1,3}(?:,\d{3})+|\d{3,6})\s*円"
+)
 # 価格欄の同一行に固定日額だけがある場合に限定（段階表・範囲は対象外）。
 RX_FIXED_DAILY_YEN = re.compile(
     r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
-    + r"[ \t】\]:：]*(?P<yen>\d{1,3}(?:,\d{3})+|\d{3,6})[ \t]*円[ \t]*/[ \t]*日[ \t]*"
+    + r"[ \t■●◇】\]:：]*(?:\n[ \t]*)?"
+    + r"(?:一律\s*)?(?P<yen>\d{1,3}(?:,\d{3})+|\d{3,6})[ \t]*円?[ \t]*/[ \t]*日"
+    + r"(?:\s*\([^()\n]{1,40}\))?\s*"
+)
+RX_FIXED_DAILY_YEN_VALUE = re.compile(
+    r"\s*(?:一律\s*)?\d{1,3}(?:,\d{3})+\s*円?\s*/\s*日"
+    r"(?:\s*\([^()\n]{1,40}\))?\s*"
 )
 RX_HOURLY_YEN = re.compile(
     r"時給\s*(?P<yen>\d{3,6})(?![\d,])\s*円"
@@ -141,8 +181,13 @@ RX_HOURLY_YEN_SLASH_FLEX = re.compile(
 # 2026-09-25監査の4案件に限定した円建て時給・日給。
 # 値だけの探索には使わず、明示的な価格欄との組み合わせをfullmatchする。
 _PRICE_FIELD_PREFIX = (
-    r"[ \t■●◇【\[]*" + _PRICE_KW_RE.pattern
+    r"[ \t■●◇・【\[]*" + _PRICE_KW_RE.pattern
     + r"[ \t■●◇】\]:：]*(?:\n[ \t]*)?"
+)
+RX_PRICE_FIELD_CURRENCY_SYMBOL_COMMA = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>[\\¥￥]\s*(?P<yen>" + _COMMA_YEN_INTEGER + r")"
+    + r"(?:\s*円)?(?:\s*-(?!\s*\d))?)"
 )
 RX_HOURLY_YEN_VALUE_COMMA = re.compile(
     r"時給\s*" + _YEN_INTEGER + r"\s*円"
@@ -167,6 +212,11 @@ RX_PRICE_FIELD_DAILY_YEN_SYMBOL = re.compile(
     _PRICE_FIELD_PREFIX
     + r"(?P<raw>[¥￥]\s*(?P<yen>" + _YEN_INTEGER + r")"
     + r"\s*(?:円)?\s*/\s*日)\s*"
+)
+RX_PRICE_FIELD_HOURLY_OPEN_HIGH = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>(?P<yen>" + _YEN_INTEGER + r")\s*円\s*まで"
+    + r"(?=[^\n]{0,40}時給制)[^\n]*)\s*"
 )
 # 数値のみ範囲（万なし）: 単価:60-65 / 単価:60~65 → 万として解釈
 RX_NUM_RANGE_ONLY = re.compile(r"(\d{2,3})\s*[〜~\-]\s*(\d{2,3})(?!\s*万)(?!\s*\d)")
@@ -205,9 +255,14 @@ def _get_segments(text: str) -> List[str]:
         return bool(
             _SKILL_RE.search(line)
             or RX_MAN_MAN.search(line)
+            or RX_MAN_MAX_MAN.search(line)
+            or RX_MAN_KARA_MAN.search(line)
             or RX_NUM_MAN.search(line)
             or RX_OPEN_HIGH.search(line)
             or RX_OPEN_LOW.search(line)
+            or RX_COMMA_YEN_RANGE.search(line)
+            or RX_COMMA_YEN_OPEN_LOW.search(line)
+            or RX_CURRENCY_SYMBOL_COMMA_VALUE.search(line)
             or RX_COMMA7.search(line)
             or RX_COMMA6.search(line)
             or RX_ZENPO.search(line)
@@ -216,6 +271,7 @@ def _get_segments(text: str) -> List[str]:
             or RX_DAILY_MAN.search(line)
             or RX_DAILY_YEN.search(line)
             or RX_FIXED_DAILY_YEN.fullmatch(line)
+            or RX_FIXED_DAILY_YEN_VALUE.fullmatch(line)
             or RX_HOURLY_YEN_RANGE.search(line)
             or RX_HOURLY_YEN.search(line)
             or RX_STANDALONE_HOURLY_YEN_COMMA.fullmatch(line)
@@ -226,6 +282,8 @@ def _get_segments(text: str) -> List[str]:
             or RX_HOURLY_SETTLEMENT_VALUE.fullmatch(line)
             or RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(line)
             or RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(line)
+            or RX_PRICE_FIELD_HOURLY_OPEN_HIGH.fullmatch(line)
+            or RX_MONTHLY_WITH_HOURLY_EQUIVALENT.search(line)
             or RX_MAN_MON_RANGE.search(line)
             or RX_MAN_MON.search(line)
             or RX_MAN_DAY_RANGE.search(line)
@@ -246,6 +304,15 @@ def _get_segments(text: str) -> List[str]:
                 if _SECTION_HEADER_RE.search(next_line):
                     break
                 if _has_price_value(next_line):
+                    if RX_FIXED_DAILY_YEN_VALUE.fullmatch(next_line):
+                        following_values = (
+                            candidate.strip()
+                            for candidate in lines[next_idx + 1:]
+                            if candidate.strip()
+                        )
+                        following = next(following_values, "")
+                        if RX_FIXED_DAILY_YEN_VALUE.fullmatch(following):
+                            break
                     seg_lines.append(next_line)
                     break
                 break
@@ -278,28 +345,6 @@ def _is_range_num_only_allowed(seg: str, match: re.Match) -> bool:
     return True
 
 
-def _prefer_skill_based(seg: str) -> bool:
-    if not _SKILL_RE.search(seg):
-        return False
-    if any(
-        pattern.search(seg)
-        for pattern in (
-            RX_MAN_MAN,
-            RX_NUM_MAN,
-            RX_OPEN_HIGH,
-            RX_OPEN_LOW,
-            RX_COMMA7,
-            RX_COMMA6,
-            RX_ZENPO,
-            RX_MAN1,
-        )
-    ):
-        return False
-    if RX_NUM_RANGE_ONLY.search(seg):
-        return True
-    return True
-
-
 # ── 抽出関数 ─────────────────────────────────────────────
 def _monthly_explicit(seg: str) -> Optional[Tuple]:
     """/月 明示付きパターン（日給より優先）"""
@@ -315,6 +360,17 @@ def _monthly_explicit(seg: str) -> Optional[Tuple]:
         if _PRICE_MIN <= v <= _PRICE_MAX:
             return v, None, "man-mon", 0.93, "monthly", m.group(0)
     return None
+
+
+def _monthly_with_hourly_equivalent(seg: str) -> Optional[Tuple]:
+    """「N万円（時給N円相当）」の明示月額を優先する。"""
+    m = RX_MONTHLY_WITH_HOURLY_EQUIVALENT.search(seg)
+    if not m:
+        return None
+    value = int(m.group("monthly")) * 10000
+    if not (_PRICE_MIN <= value <= _PRICE_MAX):
+        return None
+    return value, None, "monthly-with-hourly-equivalent", 0.95, "monthly", m.group(0)
 
 
 def _hourly_daily(seg: str) -> Optional[Tuple]:
@@ -338,6 +394,18 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
     if m:
         v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
         return v, None, "daily-yen-slash", 0.80, "monthly", m.group("raw")
+
+    m = RX_PRICE_FIELD_HOURLY_OPEN_HIGH.fullmatch(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+        return (
+            v,
+            {"min": None, "max": v},
+            "hourly-yen-open-high",
+            0.82,
+            "monthly",
+            m.group("raw"),
+        )
 
     m = RX_HOURLY_YEN_RANGE.search(seg)
     if m:
@@ -366,7 +434,7 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
 
     m = RX_DAILY_YEN.search(seg)
     if m:
-        v = int(m.group(1)) * DAILY_TO_MONTHLY
+        v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
         return v, None, "daily-yen", 0.80, "monthly", m.group(0)
 
     m = RX_FIXED_DAILY_YEN.fullmatch(seg)
@@ -419,10 +487,75 @@ _PRICE_MIN = 100_000   # 10万（下限）
 _PRICE_MAX = 5_000_000 # 500万（上限）
 
 
+def _comma_yen_patterns(seg: str) -> Optional[Tuple]:
+    """価格欄のカンマ付き月額range/open rangeを抽出する。"""
+    m = RX_PRICE_FIELD_CURRENCY_SYMBOL_COMMA.search(seg)
+    if m:
+        value = _yen_to_int(m.group("yen"))
+        if _PRICE_MIN <= value <= _PRICE_MAX:
+            return (
+                value,
+                None,
+                "currency-symbol-comma-yen",
+                0.90,
+                "monthly",
+                m.group("raw"),
+            )
+
+    m = RX_COMMA_YEN_RANGE.search(seg)
+    if m:
+        nearby = seg[max(0, m.start() - 20):m.end() + 20]
+        if not re.search(r"(?:時給|日給|/\s*(?:[hH]|時|日))", nearby):
+            a = _yen_to_int(m.group("low"))
+            b = _yen_to_int(m.group("high"))
+            lo, hi = min(a, b), max(a, b)
+            if _PRICE_MIN <= lo and hi <= _PRICE_MAX:
+                return (
+                    (lo + hi) // 2,
+                    {"min": lo, "max": hi},
+                    "range-closed-comma-yen",
+                    0.93,
+                    "monthly",
+                    m.group(0),
+                )
+
+    m = RX_COMMA_YEN_OPEN_LOW.search(seg)
+    if m:
+        nearby = seg[max(0, m.start() - 20):m.end() + 20]
+        if not re.search(r"(?:時給|日給|/\s*(?:[hH]|時|日))", nearby):
+            value = _yen_to_int(m.group("yen"))
+            if _PRICE_MIN <= value <= _PRICE_MAX:
+                return (
+                    value,
+                    {"min": value, "max": None},
+                    "range-open-low-comma-yen",
+                    0.88,
+                    "monthly",
+                    m.group(0),
+                )
+    return None
+
+
 def _man_patterns(seg: str) -> Optional[Tuple]:
     """万円パターンで価格を抽出"""
-    if _prefer_skill_based(seg):
-        return SKILL_BASED_PRICE, None, "skill-based", 0.70, "monthly", "スキル見合い"
+    # MAX付き / 「から」付きの閉区間を、既存のopen rangeより先に評価する。
+    for pattern, reason in (
+        (RX_MAN_MAX_MAN, "range-closed-man-max"),
+        (RX_MAN_KARA_MAN, "range-closed-man-kara"),
+    ):
+        m = pattern.search(seg)
+        if m:
+            a, b = int(m.group(1)) * 10000, int(m.group(2)) * 10000
+            lo, hi = min(a, b), max(a, b)
+            if _PRICE_MIN <= lo and hi <= _PRICE_MAX:
+                return (
+                    (lo + hi) // 2,
+                    {"min": lo, "max": hi},
+                    reason,
+                    0.93,
+                    "monthly",
+                    m.group(0),
+                )
 
     # 先頭側が open-high の場合は、後続の別項番価格と閉区間としてまたがせない
     open_high_matches = list(RX_OPEN_HIGH.finditer(seg))
@@ -528,6 +661,16 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[Dict], str, float, 
     skill_found = False
 
     for seg in segments:
+        # 括弧内の参考時給より、直前の明示月額を優先する。
+        result = _monthly_with_hourly_equivalent(seg)
+        if result:
+            return result
+
+        # カンマ付き円額rangeは単一円額より先に評価する。
+        result = _comma_yen_patterns(seg)
+        if result:
+            return result
+
         # /月 明示付き（日給より最優先）
         result = _monthly_explicit(seg)
         if result:
