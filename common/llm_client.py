@@ -32,6 +32,9 @@ _rate_limit_lock = threading.Lock()
 _last_call_time: float = 0.0
 _MIN_INTERVAL_SECONDS: float = 0.5  # 最小呼び出し間隔
 _HTTP_ERROR_BODY_MAX_CHARS: int = 1000
+_PERMANENT_QUOTA_ERROR_IDENTIFIERS = frozenset(
+    {"insufficient_quota", "credit_balance_exhausted"}
+)
 CHAT_COMPLETIONS_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
 # counter fileを利用できない場合だけ使うプロセス内fallback。
@@ -104,6 +107,34 @@ def _format_http_error_detail(response: Optional[requests.Response]) -> str:
             parts.append(f"{key}={_truncate_http_error_text(value)}")
     parts.append(f"response_body={response_text}")
     return " ".join(parts)
+
+
+def _is_permanent_quota_error(response: Optional[requests.Response]) -> bool:
+    """429のうち、明示的なクレジット枯渇応答だけを識別する。"""
+    if response is None or response.status_code != 429:
+        return False
+
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+
+    containers = [body]
+    nested_error = body.get("error")
+    if isinstance(nested_error, dict):
+        containers.append(nested_error)
+
+    for container in containers:
+        for key in ("type", "code"):
+            value = container.get(key)
+            if (
+                isinstance(value, str)
+                and value.strip().casefold() in _PERMANENT_QUOTA_ERROR_IDENTIFIERS
+            ):
+                return True
+    return False
 
 
 def build_chat_completion_payload(
@@ -422,7 +453,9 @@ def call_llm(
 
     last_error: Optional[Exception] = None
     last_error_detail: Optional[str] = None
+    attempts_made = 0
     for attempt in range(1, max_retries + 1):
+        attempts_made = attempt
         _enforce_rate_limit()
         attempt_started = time.monotonic()
         response_json: Any = None
@@ -470,7 +503,7 @@ def call_llm(
             )
             last_error = e
             last_error_detail = f"{e}; {http_error_detail}"
-            if status in (400, 401, 403):
+            if status in (400, 401, 403) or _is_permanent_quota_error(e.response):
                 # リトライしても意味がないエラー
                 break
         except (json.JSONDecodeError, ValueError) as e:
@@ -533,7 +566,7 @@ def call_llm(
         ) from last_error
 
     raise RuntimeError(
-        f"OpenAI API呼び出しが{max_retries}回失敗しました: {last_error_detail}"
+        f"OpenAI API呼び出しが{attempts_made}回失敗しました: {last_error_detail}"
     ) from last_error
 
 

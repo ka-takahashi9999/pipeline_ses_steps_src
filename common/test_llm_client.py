@@ -254,6 +254,141 @@ class CallLlmTest(unittest.TestCase):
         self.assertEqual(result, {"result": "ok"})
         sleep_mock.assert_called_once_with(1.0)
 
+    def test_insufficient_quota_429_is_not_retried(self):
+        response = FakeResponse(
+            {
+                "error": {
+                    "message": "You have no credits remaining.",
+                    "type": "insufficient_quota",
+                    "code": None,
+                }
+            },
+            status_code=429,
+        )
+
+        _, call_count, error, records = self.call(response)
+
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("1回失敗", str(error))
+        self.assertEqual(call_count, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["attempt_number"], 1)
+
+    def test_credit_balance_exhausted_429_is_not_retried(self):
+        response = FakeResponse(
+            {
+                "error": {
+                    "message": "You have no credits remaining.",
+                    "type": "insufficient_quota_error",
+                    "code": "credit_balance_exhausted",
+                }
+            },
+            status_code=429,
+        )
+
+        _, call_count, error, records = self.call(response)
+
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("1回失敗", str(error))
+        self.assertEqual(call_count, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["attempt_number"], 1)
+
+    def test_permanent_quota_detection_accepts_only_explicit_type_or_code(self):
+        for payload in (
+            {"type": "insufficient_quota"},
+            {"code": "credit_balance_exhausted"},
+        ):
+            with self.subTest(payload=payload):
+                self.assertTrue(
+                    llm_client._is_permanent_quota_error(
+                        FakeResponse(payload, status_code=429)
+                    )
+                )
+
+        self.assertFalse(
+            llm_client._is_permanent_quota_error(
+                FakeResponse(
+                    {"error": {"message": "insufficient_quota"}},
+                    status_code=429,
+                )
+            )
+        )
+        self.assertFalse(
+            llm_client._is_permanent_quota_error(
+                FakeResponse(
+                    {"error": {"code": "credit_balance_exhausted"}},
+                    status_code=503,
+                )
+            )
+        )
+
+    def test_normal_rate_limit_429_is_still_retried(self):
+        responses = [
+            FakeResponse(
+                {
+                    "error": {
+                        "message": "insufficient_quota is not an error code here",
+                        "type": "rate_limit_error",
+                        "code": "rate_limit_exceeded",
+                    }
+                },
+                status_code=429,
+            ),
+            FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"result":"ok"}'},
+                        }
+                    ]
+                }
+            ),
+        ]
+
+        result, call_count, error, records = self.call(responses)
+
+        self.assertIsNone(error)
+        self.assertEqual(result, {"result": "ok"})
+        self.assertEqual(call_count, 2)
+        self.assertEqual([item["success"] for item in records], [False, True])
+
+    def test_transient_request_failures_are_still_retried(self):
+        transient_errors = (
+            llm_client.requests.exceptions.Timeout("timeout"),
+            llm_client.requests.exceptions.ChunkedEncodingError("chunked"),
+            llm_client.requests.exceptions.ConnectionError("connection reset"),
+            FakeResponse(
+                {"error": {"message": "temporary server error"}},
+                status_code=503,
+            ),
+        )
+        for transient_error in transient_errors:
+            with self.subTest(error=type(transient_error).__name__):
+                responses = [
+                    transient_error,
+                    FakeResponse(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "message": {"content": '{"result":"ok"}'},
+                                }
+                            ]
+                        }
+                    ),
+                ]
+
+                result, call_count, error, records = self.call(responses)
+
+                self.assertIsNone(error)
+                self.assertEqual(result, {"result": "ok"})
+                self.assertEqual(call_count, 2)
+                self.assertEqual(
+                    [item["success"] for item in records[-2:]], [False, True]
+                )
+
     def test_usage_available_success_is_recorded_with_required_schema(self):
         response = FakeResponse(
             {

@@ -14,15 +14,19 @@ detector = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(detector)
 
 COUNTED_PROJECT_RULE = "counted_two_project_blocks_v1"
+REPEATED_PROJECT_RULE = "repeated_complete_project_blocks_v1"
 COMPLETE_RESOURCE_RULE = (
     "repeated_complete_resource_blocks_without_accepted_count_v1"
 )
 EXPECTED_NEW_HITS = {
-    "s3_76536d55a6affadbc5382090b8196e93732d65f41e8622f6363024f33d370814": COUNTED_PROJECT_RULE,
-    "s3_3b9e3ce529dd32a35977e0dff7b8ab702ce79a3283bf5bc5f9fb83d5937e14a5": COMPLETE_RESOURCE_RULE,
-    "s3_ef64199a25b5a174627da9dec927cd2a38d729e5c6cacc78a1d7f02487ad38bb": COMPLETE_RESOURCE_RULE,
-    "s3_0bad056a1d887ee2df6616ab716a839ca9987d80324a423d41e80df8c3fae5b5": COMPLETE_RESOURCE_RULE,
-    "s3_ed0a8d1e69749ac1afb68be05b7c714f01ad7fa339c343a17ed269742431f0e7": COMPLETE_RESOURCE_RULE,
+    "s3_3d4e2e30afe1b339e9e03397f652e4168be8c1566655d8ec9691bcd6afae711e": COMPLETE_RESOURCE_RULE,
+    "s3_855b42e642bf71e27cd19499b639c22a16349ba7d64ff932f7bbc5ccc7535227": COMPLETE_RESOURCE_RULE,
+    "s3_6248a5b19d317e54d438dfa4fb88878714c58c91c33468d04552797739e5b2f0": COMPLETE_RESOURCE_RULE,
+    "s3_c5ea5fb90740db103d9a098604bc725fc80adbe50bf265d5849d0172ca2b18b9": COUNTED_PROJECT_RULE,
+}
+EXPECTED_FORMAT_VARIANT_HITS = {
+    "s3_35adcdb7f1370c39c932fff857497b566ae6caa690949af4c80f31ca09c7b0e8": REPEATED_PROJECT_RULE,
+    "s3_c5ea5fb90740db103d9a098604bc725fc80adbe50bf265d5849d0172ca2b18b9": COUNTED_PROJECT_RULE,
 }
 
 
@@ -58,6 +62,34 @@ def _resource_block(number, name_label="氏名"):
     ).format(number, name_label, 20 + number)
 
 
+def _boxed_project_block(number, header="■案件名■", title=None):
+    return (
+        "{header}\n"
+        "{title}\n"
+        "■案件内容■\n開発{number}\n"
+        "■単価■\n{number}0万円\n"
+        "■場所■\n東京{number}\n"
+        "■時間■\n9:00-18:00\n"
+    ).format(
+        header=header,
+        title=title or "案件{}".format(number),
+        number=number,
+    )
+
+
+def _plain_project_block(number):
+    return (
+        "案 件：案件{0}\n"
+        "内 容：開発{0}\n"
+        "スキル：Python\n"
+        "場 所：東京{0}\n"
+        "期 間：12月〜\n"
+        "単 価：{0}0万円\n"
+        "面 談：1回\n"
+        "募 集：1名\n"
+    ).format(number)
+
+
 class Check02NewRootTest(unittest.TestCase):
     def test_counted_two_project_blocks_positive(self):
         record = _record(
@@ -78,6 +110,34 @@ class Check02NewRootTest(unittest.TestCase):
             detector.detect_template_exclusion(record),
             ("multi_item_mail", COMPLETE_RESOURCE_RULE),
         )
+
+    def test_boxed_project_name_variants_positive(self):
+        for header in ("■案件名", "■案件名：", "■案件名■"):
+            with self.subTest(header=header):
+                record = _record(
+                    "複数案件のご紹介",
+                    _boxed_project_block(1, header)
+                    + _boxed_project_block(2, header),
+                )
+                self.assertEqual(
+                    detector.detect_template_exclusion(record),
+                    ("multi_item_mail", REPEATED_PROJECT_RULE),
+                )
+
+    def test_explicit_project_count_variants_positive(self):
+        body = _plain_project_block(1) + _plain_project_block(2)
+        for count_text in (
+            "2案件動いています",
+            "2案件あります",
+            "2案件ございます",
+            "2案件ご紹介します",
+        ):
+            with self.subTest(count_text=count_text):
+                record = _record(count_text, body)
+                self.assertEqual(
+                    detector.detect_template_exclusion(record),
+                    ("multi_item_mail", COUNTED_PROJECT_RULE),
+                )
 
     def test_four_numbered_complete_resource_blocks_positive(self):
         record = _record(
@@ -128,7 +188,52 @@ class Check02NewRootTest(unittest.TestCase):
             detector.detect_template_exclusion(_record("単一案件 2件の要件", body))
         )
 
-    def test_fixed_run_has_exactly_five_new_hits(self):
+    def test_project_count_without_multiple_complete_blocks_does_not_trigger(self):
+        for subject in (
+            "2名募集",
+            "2名参画中",
+            "2チーム体制",
+            "2案件動いています",
+        ):
+            with self.subTest(subject=subject):
+                self.assertIsNone(
+                    detector.detect_template_exclusion(
+                        _record(subject, _plain_project_block(1))
+                    )
+                )
+
+    def test_same_project_repeated_by_quote_does_not_trigger(self):
+        body = (
+            _boxed_project_block(1, title="同一案件")
+            + "\n--- quoted message ---\n"
+            + _boxed_project_block(2, title="同一案件")
+        )
+        self.assertIsNone(
+            detector.detect_template_exclusion(_record("同一案件の引用", body))
+        )
+
+    def test_single_project_positions_and_numbered_sections_do_not_trigger(self):
+        body = (
+            "案 件：単一案件\n"
+            "内 容：1. 概要\n2. 業務内容\n"
+            "ポジション1：リーダー\nポジション2：メンバー\n"
+            "場 所：東京\n単 価：70万円\n"
+        )
+        self.assertIsNone(
+            detector.detect_template_exclusion(_record("単一案件", body))
+        )
+
+    def test_profile_signature_and_career_team_size_do_not_trigger(self):
+        profile = (
+            _resource_block(1)
+            + "\n氏名：営業 太郎\n所属：営業部\n"
+            + "経歴：20名規模のチームをマネジメント\n"
+        )
+        self.assertIsNone(
+            detector.detect_template_exclusion(_record("単一要員のご紹介", profile))
+        )
+
+    def test_fixed_run_has_current_counted_and_complete_resource_hits(self):
         with Path(detector.INPUT_MASTER).open(encoding="utf-8") as file_obj:
             master = {
                 record["message_id"]: record
@@ -146,6 +251,26 @@ class Check02NewRootTest(unittest.TestCase):
                 hits[message_id] = result[1]
 
         self.assertEqual(hits, EXPECTED_NEW_HITS)
+
+    def test_fixed_run_has_exactly_two_format_variant_hits(self):
+        with Path(detector.INPUT_MASTER).open(encoding="utf-8") as file_obj:
+            master = {
+                record["message_id"]: record
+                for record in (json.loads(line) for line in file_obj if line.strip())
+            }
+        filtered_path = Path(detector._STEP_DIR) / "01_result" / detector.OUTPUT_FILTERED
+        with filtered_path.open(encoding="utf-8") as file_obj:
+            filtered_ids = [
+                json.loads(line)["message_id"] for line in file_obj if line.strip()
+            ]
+
+        hits = {}
+        for message_id in filtered_ids:
+            result = detector.detect_template_exclusion(master[message_id])
+            if result:
+                hits[message_id] = result[1]
+
+        self.assertEqual(hits, EXPECTED_FORMAT_VARIANT_HITS)
 
 
 if __name__ == "__main__":

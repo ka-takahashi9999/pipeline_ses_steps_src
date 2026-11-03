@@ -111,6 +111,10 @@
   - async/await
   - Zend
   - iBatis
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - Seasar2
+  - CakePHP
+  - "Oracle Forms"
 
 フロントエンド:
   - JavaScript
@@ -163,6 +167,9 @@
   - Qt
   # DICT-02（2026-11-01 一般性review通過）
   - SSR
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - Riverpod
+  - ActionScript
 
 インフラ:
   - IaC
@@ -366,6 +373,12 @@
   - SFTP
   - Watchguard
   - Fluentd
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - SNMPサーバ
+  - Syslogサーバ
+  - Netcool
+  - PRTG
+  - ksh
 
 クラウドサービス:
   - Amazon Connect
@@ -391,6 +404,8 @@
   - OCI
   - "Genesys Cloud"
   - CodePipeline
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - "Cloud Build"
 
 DB:
   - "SQL Server"
@@ -445,6 +460,8 @@ DB:
   - プロシージャ
   - RDBMS
   - SnowPark
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - DDL
 
 モバイル:
   - iOS
@@ -504,6 +521,8 @@ DB:
   - 画像処理
   - 画像認識
   - 自然言語処理
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - テキストデータマイニング
 
 データ分析:
   - Redash
@@ -550,6 +569,10 @@ DB:
   - SNAP
   - ISCE2
   - M言語
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - Cognos
+  - "AWS Glue"
+  - "ASTERIA Warp"
 
 AI:
   - Whisper
@@ -590,6 +613,9 @@ AI:
   - Langfuse
   # DICT-02（2026-11-01 一般性review通過）
   - AIコーディング
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - プロンプトエンジニアリング
+  - Kiro
 
 セキュリティ:
   - IDS/IPS
@@ -624,6 +650,15 @@ AI:
   - SIEM
   - SOAR
   - TLS
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - FortiOS
+  - "Microsoft Defender for Endpoint"
+  - Athenz
+  - "OpenID Connect"
+  - Cato
+  - Netskope
+  - Zscaler
+  - セキュリティインシデント
 
 テスト/品質:
   - Vitest
@@ -699,6 +734,8 @@ AI:
   - Simulink
   # DICT-02（2026-11-01 一般性review通過）
   - E2Studio
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - ラダー言語
 
 業務系:
   - mcframe
@@ -750,6 +787,8 @@ AI:
   # DICT-02（2026-11-01 一般性review通過）
   - IM-BloomMaker
   - ECC6.0
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - RICEF
 
 ミドルウェア・基盤:
   - HULFT
@@ -831,6 +870,8 @@ CAD系:
   - XD
   # DICT-02（2026-10-30）
   - Blender
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - "Adobe Premiere Pro"
 
 言語系:
   - 英語
@@ -918,6 +959,8 @@ Google系:
 CMS系:
   - WordPress
   - CMS
+  # DICT-02（2026-11-03 skill confirmation unit）
+  - "Adobe Experience Manager"
 
 #ネットワークのファイアーウォールとバックエンドのフレームワークと混在する恐れがあるので独立
 #FW:

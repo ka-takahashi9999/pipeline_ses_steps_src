@@ -37,10 +37,17 @@ class ResourceLocationParserTest(unittest.TestCase):
         self.assertEqual(actual, "関東地方")
         self.assertEqual(source, "label")
 
-    def test_unregistered_misspelling_is_not_added(self):
+    def test_adopted_yakuendai_area_alias(self):
         actual, _raw, source = parse_location("最寄駅: 薬円台駅", self.entries)
-        self.assertEqual(actual, "unknown")
-        self.assertEqual(source, "")
+        self.assertEqual(actual, "関東地方")
+        self.assertEqual(source, "label")
+
+    def test_adopted_odakyu_sagamihara_with_space(self):
+        actual, _raw, source = parse_location(
+            "最寄駅: 小田急 相模原駅", self.entries
+        )
+        self.assertEqual(actual, "関東地方")
+        self.assertEqual(source, "label")
 
 
 if __name__ == "__main__":

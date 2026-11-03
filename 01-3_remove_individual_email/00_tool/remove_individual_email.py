@@ -367,10 +367,15 @@ _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES = (
     re.compile(r"(?m)^[ \t]*【募集】"),
 )
 
-# CHECK-02 (2026-10-30): 件名の案件数と、完全な「■案件名」block数が
+# CHECK-02 (2026-10-30): 明示された案件数と、完全な「■案件名」block数が
 # 一致する場合だけを、件数明示形式の限定補完として扱う。
 _COUNTED_PROJECT_SUBJECT_COUNT_RE = re.compile(
     r"(?<![0-9])(?P<count>(?:[2-9]|[1-9][0-9]+))[ \t]*件(?![0-9])"
+)
+_COUNTED_PROJECT_SUBJECT_PROJECT_COUNT_RE = re.compile(
+    r"(?<![0-9])(?P<count>(?:[2-9]|[1-9][0-9]+))[ \t]*案件[ \t]*"
+    r"(?:(?:が[ \t]*)?(?:動いて(?:います|おります)|あります|ございます)|"
+    r"(?:を[ \t]*)?ご紹介(?:いた)?します)"
 )
 _COUNTED_PROJECT_BLOCK_HEADER_RE = re.compile(
     r"(?m)^[ \t]*■[ \t]*案件名[ \t]*[:：]"
@@ -379,6 +384,60 @@ _COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES = (
     re.compile(r"(?m)^[ \t]*■[ \t]*概要[ \t]*[:：]"),
     re.compile(r"(?m)^[ \t]*■[ \t]*募集人数[ \t]*[:：]"),
     re.compile(r"(?m)^[ \t]*■[ \t]*単価[ \t]*[:：]"),
+)
+
+# CHECK-02 (2026-11-03): 既存multi-project root causeの表記差だけを補完する。
+# 案件名の反復だけでは除外せず、各blockに内容・単価・他の案件属性が
+# 揃い、かつ案件名が異なる場合だけ既存ruleに含める。
+_BOXED_PROJECT_NAME_BLOCK_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*■[ \t]*案件名[ \t]*(?:■|[:：])?[ \t]*(?P<title>[^\n]*)$"
+)
+_FLEX_PROJECT_NAME_BLOCK_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*(?:"
+    r"■[ \t]*案件名[ \t]*(?:■|[:：])?[ \t]*(?P<boxed_title>[^\n]*)|"
+    r"案[ \t]*件(?:[ \t]*名)?[ \t]*[:：][ \t]*(?P<plain_title>[^\n]+)"
+    r")[ \t]*$"
+)
+_COMPLETE_NAMED_PROJECT_CONTENT_RE = re.compile(
+    r"(?im)^[ \t]*(?:"
+    r"■[ \t]*(?:案件[ \t]*)?(?:内容|概要)[ \t]*(?:■|[:：])|"
+    r"(?:内[ \t]*容|概[ \t]*要|業[ \t]*務[ \t]*内[ \t]*容|"
+    r"作[ \t]*業[ \t]*内[ \t]*容)[ \t]*[:：]"
+    r")"
+)
+_COMPLETE_NAMED_PROJECT_RATE_RE = re.compile(
+    r"(?im)^[ \t]*(?:■[ \t]*)?単[ \t]*(?:価|金)[ \t]*(?:■|[:：])"
+)
+_COMPLETE_NAMED_PROJECT_OTHER_ATTRIBUTE_RES = (
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?"
+        r"(?:場[ \t]*所|勤[ \t]*務[ \t]*地|作[ \t]*業[ \t]*場[ \t]*所)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?"
+        r"(?:期[ \t]*間|開[ \t]*始[ \t]*時[ \t]*期)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?"
+        r"(?:ス[ \t]*キ[ \t]*ル|必[ \t]*須(?:[ \t]*ス[ \t]*キ[ \t]*ル|[ \t]*要[ \t]*件)?)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?(?:面[ \t]*談|面[ \t]*接)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?"
+        r"(?:募[ \t]*集(?:[ \t]*人[ \t]*数|[ \t]*人[ \t]*員)?|人[ \t]*数)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?im)^[ \t]*(?:■[ \t]*)?"
+        r"(?:フェーズ|時[ \t]*間|備[ \t]*考)"
+        r"[ \t]*(?:■|[:：])"
+    ),
 )
 
 # CHECK-02 (2026-10-30): 人数表現に依存せず、氏名境界ごとに3種類以上の
@@ -471,36 +530,97 @@ def _has_repeated_complete_project_blocks(body: str) -> bool:
     """完全な【案件】blockが5件以上反復する場合だけTrue。"""
     normalized_body = unicodedata.normalize("NFKC", body)
     blocks = _COMPLETE_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
-    if len(blocks) < 5:
-        return False
-    return all(
-        all(pattern.search(block) for pattern in _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES)
-        for block in blocks
-    )
+    if len(blocks) >= 5 and all(
+            all(pattern.search(block) for pattern in _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES)
+            for block in blocks):
+        return True
+
+    # 既存complete-block root causeの「■案件名■」等の表記差。
+    return len(_complete_distinct_named_project_block_titles(
+        normalized_body, _BOXED_PROJECT_NAME_BLOCK_HEADER_RE
+    )) >= 2
+
+
+def _complete_distinct_named_project_block_titles(
+    body: str,
+    header_re: re.Pattern,
+) -> List[str]:
+    """案件名と完全な属性が揃う、異なる案件blockの名称を返す。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+    headers = list(header_re.finditer(normalized_body))
+    if len(headers) < 2:
+        return []
+
+    titles = []
+    normalized_titles = []
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(normalized_body)
+        block = normalized_body[header.start():block_end]
+
+        group_values = [value for value in header.groupdict().values() if value]
+        title = group_values[0].strip() if group_values else ""
+        if not title:
+            following_lines = [
+                line.strip()
+                for line in normalized_body[header.end():block_end].splitlines()
+                if line.strip()
+            ]
+            if not following_lines or following_lines[0].startswith(("■", "【")):
+                return []
+            title = following_lines[0]
+
+        has_content = bool(_COMPLETE_NAMED_PROJECT_CONTENT_RE.search(block))
+        has_rate = bool(_COMPLETE_NAMED_PROJECT_RATE_RE.search(block))
+        other_attribute_count = sum(
+            bool(pattern.search(block))
+            for pattern in _COMPLETE_NAMED_PROJECT_OTHER_ATTRIBUTE_RES
+        )
+        if not (has_content and has_rate and other_attribute_count >= 2):
+            return []
+
+        normalized_title = re.sub(r"[ \t]+", "", title).lower()
+        if not normalized_title:
+            return []
+        titles.append(title)
+        normalized_titles.append(normalized_title)
+
+    if len(set(normalized_titles)) != len(normalized_titles):
+        return []
+    return titles
 
 
 def _has_counted_complete_project_blocks(subject: str, body: str) -> bool:
-    """件名の案件数と完全な「■案件名」block数が一致する場合だけTrue。"""
+    """明示案件数と完全な案件block数が一致する場合だけTrue。"""
     normalized_subject = unicodedata.normalize("NFKC", subject)
-    if "案件" not in normalized_subject:
-        return False
+    normalized_body = unicodedata.normalize("NFKC", body)
 
     subject_counts = {
         int(match.group("count"))
         for match in _COUNTED_PROJECT_SUBJECT_COUNT_RE.finditer(normalized_subject)
     }
+    explicit_project_count_text = normalized_subject + "\n" + normalized_body
+    subject_counts.update(
+        int(match.group("count"))
+        for match in _COUNTED_PROJECT_SUBJECT_PROJECT_COUNT_RE.finditer(
+            explicit_project_count_text
+        )
+    )
     if len(subject_counts) != 1:
         return False
     expected_count = next(iter(subject_counts))
 
-    normalized_body = unicodedata.normalize("NFKC", body)
     blocks = _COUNTED_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
-    if len(blocks) != expected_count:
-        return False
-    return all(
+    if len(blocks) == expected_count and all(
         all(pattern.search(block) for pattern in _COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES)
         for block in blocks
+    ):
+        return True
+
+    # 明示件数と、表記差を含む完全block数が一致する場合だけ補完。
+    titles = _complete_distinct_named_project_block_titles(
+        normalized_body, _FLEX_PROJECT_NAME_BLOCK_HEADER_RE
     )
+    return len(titles) == expected_count
 
 
 def _has_repeated_complete_resource_blocks(body: str) -> bool:

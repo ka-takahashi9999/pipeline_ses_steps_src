@@ -94,6 +94,56 @@ AWS
         self.assertEqual([x["skill"] for x in required], ["Java開発経験"])
         self.assertEqual([x["skill"] for x in optional], ["AWS"])
 
+    def test_standalone_inexperienced_allowed_lines_are_removed(self):
+        required, optional = extractor.rule_extract_skills(
+            """必須スキル:
+未経験可
+・未経験可
+※未経験可
+未経験可（育成枠）
+※未経験可（育成枠）
+
+尚可:
+AWS
+"""
+        )
+        self.assertEqual(required, [])
+        self.assertEqual([x["skill"] for x in optional], ["AWS"])
+
+    def test_inexperienced_allowed_text_with_other_meaning_is_preserved(self):
+        # 今回追加した限定filter自体は、別意味の表現へ広がらない。
+        # 「未経験者歓迎」は既存の一般rejectルールでは抽出対象外だが、
+        # _prepare_required_skill_textでは変更せず返すことを確認する。
+        for value in (
+            "Java未経験可",
+            "業界未経験可",
+            "一部未経験可",
+            "未経験可だがSQL経験必須",
+            "未経験者歓迎",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(extractor._prepare_required_skill_text(value), value)
+
+        required, _ = extractor.rule_extract_skills(
+            """必須スキル:
+・Java未経験可
+・業界未経験可
+・一部未経験可
+・未経験可だがSQL経験必須
+・Python開発経験
+"""
+        )
+        self.assertEqual(
+            [x["skill"] for x in required],
+            [
+                "Java未経験可",
+                "業界未経験可",
+                "一部未経験可",
+                "未経験可だがSQL経験必須",
+                "Python開発経験",
+            ],
+        )
+
     def test_compound_negative_keeps_only_explicit_required_clause(self):
         required, _ = extractor.rule_extract_skills(
             """必須スキル:

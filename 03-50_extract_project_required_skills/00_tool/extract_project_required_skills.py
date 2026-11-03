@@ -356,6 +356,12 @@ _MAIN_CLAUSE_NEGATED_REQUIRED_RE = re.compile(
     r'(?:不問|不要|問いません|必須では(?:ない|ありません|ございません))'
     r'(?:】)?(?:です[。.]?.*)?$',
 )
+# CHECK-04限定: required section内で、行全体が「未経験可」だけを表す場合は
+# required skillにしない。技術名や別条件を伴う文章には広げない。
+_STANDALONE_INEXPERIENCED_ALLOWED_RE = re.compile(
+    r'^未経験可(?:\s*\(\s*育成枠\s*\))?[。.]?$',
+    re.IGNORECASE,
+)
 _COMPOUND_NEGATED_REQUIRED_RE = re.compile(
     r'^(?:※\s*)?.+?(?:は不問|は不要|は問いません|ツール不問)'
     r'\s*(?:、\s*)?(?:だが|ただし|但し|しかし|一方で)\s*(?P<positive>.+)$',
@@ -378,7 +384,8 @@ def _prepare_required_skill_text(text: str) -> str:
             return positive
         return skill_text
 
-    if (_STANDALONE_NEGATED_REQUIRED_RE.fullmatch(normalized)
+    if (_STANDALONE_INEXPERIENCED_ALLOWED_RE.fullmatch(normalized)
+            or _STANDALONE_NEGATED_REQUIRED_RE.fullmatch(normalized)
             or _MAIN_CLAUSE_NEGATED_REQUIRED_RE.fullmatch(normalized)):
         return ''
     return skill_text

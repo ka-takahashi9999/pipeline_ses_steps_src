@@ -215,8 +215,8 @@ def _match_from_tokens(
     matched_regions = set()
     matches: List[Tuple[int, int, int, int, str, str, bool]] = []
 
-    # 各トークンに対して全辞書パターンを確認する。first_match の選び方は
-    # 既存動作（token順、同一token内は最初の出現位置）をそのまま維持する。
+    # 各トークンに対して全辞書パターンを確認する。token順と開始位置優先は
+    # 既存どおり維持し、同じ開始位置で競合した場合だけ長いkeywordを優先する。
     for token_index, token in enumerate(tokens):
         text = _n(token)
         best_pos = None
@@ -233,7 +233,14 @@ def _match_from_tokens(
                 (token_index, m.start(), m.end(), entry_index, region, keyword, is_explicit)
             )
 
-            if best_pos is None or m.start() < best_pos:
+            if (
+                best_pos is None
+                or m.start() < best_pos
+                or (
+                    m.start() == best_pos
+                    and len(keyword) > len(best_kw or "")
+                )
+            ):
                 best_pos = m.start()
                 best_region = region
                 best_kw = keyword
