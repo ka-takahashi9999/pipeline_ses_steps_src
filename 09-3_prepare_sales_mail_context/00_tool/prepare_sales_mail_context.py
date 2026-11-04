@@ -130,6 +130,11 @@ SCHEDULE_VALUE_PATTERN = re.compile(
     r"\d{1,2}月(?:頃|以降|以後|中|末|初旬|中旬|下旬)?(?:開始予定)?)"
 )
 SETTLEMENT_VALUE_PATTERN = re.compile(r"(\d+h\s*(?:~|〜|-|－)\s*\d+h|固定|なし|あり|上下割|中間割)")
+LABELED_SETTLEMENT_HOUR_RANGE_PATTERN = re.compile(
+    r"(\d+\s*(?:h|時間)\s*(?:~|〜|-|－)\s*\d+(?:\s*(?:h|時間))?"
+    r"|\d+\s*(?:~|〜|-|－)\s*\d+\s*(?:h|時間))",
+    re.IGNORECASE,
+)
 INTERVIEW_COUNT_VALUE_PATTERN = re.compile(
     r"((?:WEB|Web)?\s*\d+\s*(?:[~〜\-－]\s*\d+)?\s*回|\d+\s*(?:[~〜\-－]\s*\d+)?\s*回)"
 )
@@ -573,6 +578,17 @@ def normalize_settlement_value(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def normalize_labeled_settlement_hour_range(value: Optional[str]) -> Optional[str]:
+    """明示的な精算ラベル配下でのみ使う時間range fallback。"""
+    text = strip_label_artifacts(value, ["精算条件", "精算幅", "精算", "条件"])
+    if not text:
+        return None
+    match = LABELED_SETTLEMENT_HOUR_RANGE_PATTERN.search(text)
+    if not match:
+        return None
+    return normalize_text(match.group(1))
+
+
 def normalize_foreign_restriction_value(value: Optional[str]) -> Optional[str]:
     text = strip_label_artifacts(value, ["外国籍条件", "外国籍"])
     if not text:
@@ -692,7 +708,13 @@ def format_settlement(workload_record: Optional[Dict[str, Any]], cleaned_body: s
         raw = normalize_settlement_value(workload_record.get("workload_raw"))
         if raw:
             return raw, normalize_text(workload_record.get("workload_max_source")) or "03-6_extract_project_workload"
-    fallback = normalize_settlement_value(extract_label_value(cleaned_body, LABEL_PATTERNS["project_settlement"]))
+    labeled_value = extract_label_value(
+        cleaned_body, LABEL_PATTERNS["project_settlement"]
+    )
+    fallback = normalize_settlement_value(labeled_value)
+    if fallback:
+        return fallback, "01-4_cleanup_email_text"
+    fallback = normalize_labeled_settlement_hour_range(labeled_value)
     if fallback:
         return fallback, "01-4_cleanup_email_text"
     return None, "unavailable"

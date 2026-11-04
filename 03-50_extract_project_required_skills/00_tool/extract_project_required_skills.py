@@ -1151,6 +1151,73 @@ def _is_hard_stop(line: str) -> bool:
     return bool(_SIGNATURE_STOP_RE.match(s) or _STOP_FULL_LINE_RE.search(line))
 
 
+_REQUIRED_CHECKLIST_HEADER = 'スキル確認項目'
+_REQUIRED_CHECKLIST_REQUEST_MAX_CHARS = 800
+_REQUIRED_CHECKLIST_LABEL_RE = re.compile(r'必須(?:スキル|条件|要件)', re.IGNORECASE)
+_NON_REQUIRED_CHECKLIST_LABEL_RE = re.compile(
+    r'(?:尚可|任意|OPTIONAL|WANT)', re.IGNORECASE
+)
+_CHECKLIST_RESPONSE_CUE_RE = re.compile(
+    r'(?:[○〇●◎△×✕✖]{2,}|回答|記載|チェック|判定|可否)', re.IGNORECASE
+)
+_CHECKLIST_REQUEST_CUE_RE = re.compile(
+    r'(?:お願|ください|下さい|求め)', re.IGNORECASE
+)
+
+
+def _classify_checklist_request(line: str) -> str:
+    """確認項目への回答依頼を required / non_required に限定分類する。"""
+    normalized = _n(line.strip())
+    if (not _CHECKLIST_RESPONSE_CUE_RE.search(normalized)
+            or not _CHECKLIST_REQUEST_CUE_RE.search(normalized)):
+        return ''
+    if _NON_REQUIRED_CHECKLIST_LABEL_RE.search(normalized):
+        return 'non_required'
+    if _REQUIRED_CHECKLIST_LABEL_RE.search(normalized):
+        return 'required'
+    return ''
+
+
+def _has_nearby_required_checklist_request(
+    lines: List[str], header_index: int
+) -> bool:
+    """見出し前の近接範囲で、明示的な必須回答依頼が最も近いか確認する。"""
+    scanned_chars = 0
+    for index in range(header_index - 1, -1, -1):
+        scanned_chars += len(lines[index]) + 1
+        if scanned_chars > _REQUIRED_CHECKLIST_REQUEST_MAX_CHARS:
+            break
+        request_kind = _classify_checklist_request(lines[index])
+        if request_kind:
+            return request_kind == 'required'
+    return False
+
+
+def _has_multiple_checklist_bullets(lines: List[str], header_index: int) -> bool:
+    """見出し直下に抽出可能な箇条書き確認条件が2件以上あるか確認する。"""
+    bullet_count = 0
+    for raw_line in lines[header_index + 1:]:
+        line = raw_line.strip()
+        if not line and bullet_count == 0:
+            continue
+        if not line or not _has_bullet(line):
+            break
+        if not _is_skill_line(line, in_section=True):
+            break
+        bullet_count += 1
+    return bullet_count >= 2
+
+
+def _is_required_checklist_header(lines: List[str], header_index: int) -> bool:
+    """3条件ANDを満たす「スキル確認項目」だけrequired見出しとして扱う。"""
+    if _normalize_hdr(lines[header_index]) != _REQUIRED_CHECKLIST_HEADER:
+        return False
+    return (
+        _has_nearby_required_checklist_request(lines, header_index)
+        and _has_multiple_checklist_bullets(lines, header_index)
+    )
+
+
 def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
     """
     状態遷移:
@@ -1248,6 +1315,11 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
             line,
             allow_parenthesized_label_sections=allow_parenthesized_label_sections,
         )
+
+        # CHECK-04限定: 「スキル確認項目」単独は一般化せず、近接する必須回答依頼と
+        # 直下の複数箇条書きが揃う場合だけrequired sectionとして扱う。
+        if _is_required_checklist_header(lines, line_index):
+            kind, inline = 'required_header', ''
 
         # 確認済みの人材スキル要件ブロック内だけ、必須宣言と加点切替を扱う。
         if norm in ('必須経験', '尚可経験'):

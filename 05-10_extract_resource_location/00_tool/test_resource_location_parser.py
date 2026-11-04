@@ -49,6 +49,19 @@ class ResourceLocationParserTest(unittest.TestCase):
         self.assertEqual(actual, "関東地方")
         self.assertEqual(source, "label")
 
+    def test_corrected_kinki_station_categories(self):
+        cases = {
+            "滝谷駅（南海高野線）": "近畿地方",
+            "大正（大阪）": "近畿地方",
+        }
+        for location_text, expected in cases.items():
+            with self.subTest(location_text=location_text):
+                actual, _raw, source = parse_location(
+                    f"最寄駅: {location_text}", self.entries
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(source, "label")
+
 
 if __name__ == "__main__":
     unittest.main()

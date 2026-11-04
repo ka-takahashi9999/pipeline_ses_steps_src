@@ -947,6 +947,109 @@ def is_auxiliary_link_text(text: str) -> bool:
     return any(keyword.casefold() in normalized for keyword in HTML_LINK_NEGATIVE_KEYWORDS)
 
 
+ADJACENT_SKILLSHEET_CONTEXT_KEYWORDS = (
+    "スキルシート",
+    "経歴書",
+    "職務経歴書",
+    "技術経歴書",
+)
+ADJACENT_SKILLSHEET_CONTEXT_WINDOW = 50
+GENERIC_HTML_ANCHOR_TEXTS = {
+    "こちら",
+    "詳細",
+    "url",
+    "link",
+    "ホームページ",
+    "会社サイト",
+    "line",
+    "お問い合わせ",
+}
+CONTEXTUAL_ANCHOR_NEGATIVE_DOMAINS = {
+    "line.me",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+}
+CONTEXTUAL_ANCHOR_NEGATIVE_URL_MARKERS = (
+    "unsubscribe",
+    "optout",
+    "opt-out",
+)
+HIGH_CONFIDENCE_URL_CATEGORIES = {
+    "google_drive",
+    "one_drive",
+    "ctsu_public_talent",
+    "cloudinary_raw",
+    "extension_file",
+}
+
+
+def is_generic_html_anchor_text(text: str) -> bool:
+    """周辺文脈だけで用途を特定できないgeneric anchorか判定する。"""
+    normalized = unicodedata.normalize("NFKC", text or "").strip().casefold()
+    normalized = re.sub(r"[\s　:：・\-_/]+", "", normalized)
+    normalized = re.sub(r"(?:はこちら|へ)$", "", normalized)
+    return normalized in GENERIC_HTML_ANCHOR_TEXTS
+
+
+def is_contextual_anchor_url_excluded(url: str) -> bool:
+    """隣接文脈fallbackで新規routingしない明示negative URLを判定する。"""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() not in ("http", "https"):
+        return True
+    host = parsed.netloc.lower()
+    if any(host_matches(host, domain) for domain in CONTEXTUAL_ANCHOR_NEGATIVE_DOMAINS):
+        return True
+    normalized_url = unicodedata.normalize("NFKC", url or "").casefold()
+    return any(marker in normalized_url for marker in CONTEXTUAL_ANCHOR_NEGATIVE_URL_MARKERS)
+
+
+def has_adjacent_skillsheet_context(body_text: str, anchor_text: str) -> bool:
+    """同一行のanchor直前50文字以内にskillsheet明示語があるか確認する。"""
+    body = unicodedata.normalize("NFKC", body_text or "")
+    anchor = unicodedata.normalize("NFKC", anchor_text or "").strip()
+    if not body or not anchor:
+        return False
+
+    start = 0
+    while True:
+        index = body.find(anchor, start)
+        if index < 0:
+            return False
+        line_start = body.rfind("\n", 0, index) + 1
+        window_start = max(line_start, index - ADJACENT_SKILLSHEET_CONTEXT_WINDOW)
+        context = body[window_start:index].casefold()
+        if any(keyword.casefold() in context for keyword in ADJACENT_SKILLSHEET_CONTEXT_KEYWORDS):
+            return True
+        start = index + len(anchor)
+
+
+def extract_contextual_skillsheet_urls_from_html_links(
+    mail_record: Optional[Dict[str, Any]],
+    cleanup_record: Optional[Dict[str, Any]],
+    excluded_urls: Optional[Set[str]] = None,
+) -> List[str]:
+    """明示文脈に隣接する非generic anchorだけを限定fallback候補として返す。"""
+    body_text = (cleanup_record or {}).get("body_text", "") or ""
+    excluded = excluded_urls or set()
+    urls: List[str] = []
+    for link in (mail_record or {}).get("html_links") or []:
+        if not isinstance(link, dict):
+            continue
+        href = (link.get("href") or "").strip()
+        anchor_text = (link.get("text") or "").strip()
+        if not href or href in excluded:
+            continue
+        if is_auxiliary_link_text(anchor_text) or is_generic_html_anchor_text(anchor_text):
+            continue
+        if is_contextual_anchor_url_excluded(href):
+            continue
+        if has_adjacent_skillsheet_context(body_text, anchor_text):
+            urls.append(href)
+    return urls
+
+
 def extract_auxiliary_hrefs_from_html_links(
     mail_record: Optional[Dict[str, Any]],
 ) -> Set[str]:
@@ -998,6 +1101,23 @@ def build_url_candidates(
     auxiliary_hrefs = removed_body_urls | extract_auxiliary_hrefs_from_html_links(mail_record)
     html_urls = extract_skillsheet_urls_from_html_links(mail_record, auxiliary_hrefs)
     eligible_body_urls = [url for url in body_urls if url not in auxiliary_hrefs]
+
+    # CHECK-05限定: 既存の高信頼候補がない場合だけ、本文上のskillsheet明示語に
+    # 隣接する非generic HTML anchorをfallback候補へ追加する。
+    has_high_confidence_candidate = (
+        any(is_eligible_attachment(att) for att in (mail_record or {}).get("attachments") or [])
+        or bool(html_urls)
+        or any(
+            classify_url_candidate(url) in HIGH_CONFIDENCE_URL_CATEGORIES
+            for url in eligible_body_urls
+        )
+    )
+    if not has_high_confidence_candidate:
+        for url in extract_contextual_skillsheet_urls_from_html_links(
+            mail_record, cleanup_record, auxiliary_hrefs
+        ):
+            if url not in html_urls:
+                html_urls.append(url)
 
     ordered: List[Tuple[str, str]] = []
     seen: Set[str] = set()

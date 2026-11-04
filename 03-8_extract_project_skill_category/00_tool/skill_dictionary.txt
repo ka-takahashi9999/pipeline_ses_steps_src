@@ -115,6 +115,10 @@
   - Seasar2
   - CakePHP
   - "Oracle Forms"
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - FuelPHP
+  - actix-web
+  - Express-JS
 
 フロントエンド:
   - JavaScript
@@ -170,6 +174,10 @@
   # DICT-02（2026-11-03 skill confirmation unit）
   - Riverpod
   - ActionScript
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - Nuxt
+  - AngularJS
+  - TailwindCSS
 
 インフラ:
   - IaC
@@ -406,6 +414,8 @@
   - CodePipeline
   # DICT-02（2026-11-03 skill confirmation unit）
   - "Cloud Build"
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - "Amazon Bedrock"
 
 DB:
   - "SQL Server"
@@ -462,6 +472,9 @@ DB:
   - SnowPark
   # DICT-02（2026-11-03 skill confirmation unit）
   - DDL
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - Athena
+  - Neo4j
 
 モバイル:
   - iOS
@@ -523,6 +536,14 @@ DB:
   - 自然言語処理
   # DICT-02（2026-11-03 skill confirmation unit）
   - テキストデータマイニング
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - RF-DETR
+  - SAM2
+  - Optuna
+  - YOLO
+  - Keras
+  - SparkSQL
+  - PySpark
 
 データ分析:
   - Redash
@@ -659,6 +680,8 @@ AI:
   - Netskope
   - Zscaler
   - セキュリティインシデント
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - "Burp Suite"
 
 テスト/品質:
   - Vitest
@@ -736,6 +759,11 @@ AI:
   - E2Studio
   # DICT-02（2026-11-03 skill confirmation unit）
   - ラダー言語
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - μITRON
+  - AUTOSAR
+  - RAMScope
+  - WinAMS
 
 業務系:
   - mcframe
@@ -789,6 +817,10 @@ AI:
   - ECC6.0
   # DICT-02（2026-11-03 skill confirmation unit）
   - RICEF
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - "Oracle FLEXCUBE"
+  - S4HANA
+  - Dataverse
 
 ミドルウェア・基盤:
   - HULFT
@@ -804,6 +836,8 @@ AI:
   # DICT-02（2026-10-30）
   - WildFly
   - SiteScope
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - "Apache Tomcat"
 
 営業系:
   - 法人営業
@@ -893,6 +927,8 @@ CAD系:
   - "PL/1"
   # DICT-02（2026-10-30）
   - CICS
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - IBMホスト
 
 RPA系:
   - RPA
@@ -961,6 +997,8 @@ CMS系:
   - CMS
   # DICT-02（2026-11-03 skill confirmation unit）
   - "Adobe Experience Manager"
+  # DICT-02（2026-11-04 skill confirmation unit）
+  - EC-CUBE
 
 #ネットワークのファイアーウォールとバックエンドのフレームワークと混在する恐れがあるので独立
 #FW:
