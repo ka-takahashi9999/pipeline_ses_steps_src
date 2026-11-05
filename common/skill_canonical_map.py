@@ -23,10 +23,12 @@ SKILL_CANONICAL_MAP = {
     "NodeJS": "Node.js",
     "SQLServer": "SQL Server",
     "SQL-Server": "SQL Server",
+    "Aurora": "Amazon Aurora",
 }
 
 SKILL_ALIAS_MAP = {
     "Spring Boot": ["Spring Boot", "Springboot", "SpringBoot"],
     "Node.js": ["Node.js", "NodeJS"],
     "SQL Server": ["SQL Server", "SQLServer", "SQL-Server"],
+    "Amazon Aurora": ["Amazon Aurora", "Aurora"],
 }

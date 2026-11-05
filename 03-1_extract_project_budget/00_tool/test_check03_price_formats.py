@@ -102,6 +102,37 @@ class Check03ProjectPriceFormatsTest(unittest.TestCase):
                     record["unit_price_sub_infor"]["range"], expected_range
                 )
 
+    def test_hourly_prefix_open_high_requires_explicit_price_context(self):
+        positive_cases = (
+            "単価：時給 ～2,500円",
+            "単価：時給 〜2500円",
+            "単価：時給 ～ 2,500 円",
+        )
+        for body in positive_cases:
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertEqual(record["unit_price"], 400000)
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["range"],
+                    {"min": None, "max": 400000},
+                )
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["reason"],
+                    "hourly-yen-open-high",
+                )
+
+        negative_cases = (
+            "～2,500円",
+            "交通費：～2,500円",
+            "精算：140～180h",
+            "年齢：～45歳",
+            "稼働：～80%",
+        )
+        for body in negative_cases:
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertIsNone(record["unit_price"])
+
     def test_monthly_amount_precedes_hourly_equivalent(self):
         record = target.build_record(
             "fixture", "単価:184万円(時給11000円相当)"

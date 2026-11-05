@@ -20,6 +20,13 @@ sys.path.insert(0, str(project_root))
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import merge_match_info, read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.skill_registry import canonicalize_skill_values
+from common.skill_registry_runtime import (
+    SkillRegistryRuntime,
+    load_step_runtime,
+    require_step_fingerprints,
+    write_step_fingerprint,
+)
 
 from config import ENABLE_SKILL_CATEGORY_MATCH, SKILL_MATCH_EXCLUDED
 
@@ -101,6 +108,21 @@ def judge_skill_category_match(
     )
 
 
+def normalize_registry_owned_skills(
+    project_skills: list,
+    resource_skills: list,
+    primary_skills: list,
+    runtime: SkillRegistryRuntime,
+) -> tuple:
+    if not runtime.overlay_enabled:
+        return project_skills, resource_skills, primary_skills
+    return (
+        canonicalize_skill_values(project_skills, runtime.snapshot, {"production"}),
+        canonicalize_skill_values(resource_skills, runtime.snapshot, {"production"}),
+        canonicalize_skill_values(primary_skills, runtime.snapshot, {"production"}),
+    )
+
+
 def main():
     logger = get_logger(STEP_NAME)
     dirs = ensure_result_dirs(str(STEP_DIR))
@@ -110,6 +132,15 @@ def main():
     logger.info(f"ENABLE_SKILL_CATEGORY_MATCH: {ENABLE_SKILL_CATEGORY_MATCH}")
 
     try:
+        runtime = load_step_runtime(project_root)
+        require_step_fingerprints(
+            project_root,
+            (
+                "03-8_extract_project_skill_category",
+                "05-8_extract_resource_skill_category",
+            ),
+            runtime,
+        )
         pairs = read_jsonl_as_list(str(INPUT_PAIRS))
         logger.info(f"入力ペア数: {len(pairs)}")
 
@@ -118,6 +149,7 @@ def main():
             logger.info("feature flagがOFFのためpass-through出力")
             write_jsonl(str(OUTPUT_MATCHED), pairs)
             write_jsonl(str(OUTPUT_NO_MATCHED), [])
+            write_step_fingerprint(STEP_DIR, STEP_NAME, runtime)
 
             elapsed = time.time() - start_time
             write_execution_time(
@@ -149,6 +181,12 @@ def main():
             project_skills = project_rec.get("skills", [])
             resource_skills = resource_rec.get("skills", [])
             primary_skills = project_rec.get("primary_skills", [])
+            project_skills, resource_skills, primary_skills = normalize_registry_owned_skills(
+                project_skills,
+                resource_skills,
+                primary_skills,
+                runtime,
+            )
 
             (
                 is_match,
@@ -185,6 +223,7 @@ def main():
 
         write_jsonl(str(OUTPUT_MATCHED), matched)
         write_jsonl(str(OUTPUT_NO_MATCHED), no_matched)
+        write_step_fingerprint(STEP_DIR, STEP_NAME, runtime)
 
         elapsed = time.time() - start_time
         write_execution_time(

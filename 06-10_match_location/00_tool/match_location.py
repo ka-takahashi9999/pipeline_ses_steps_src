@@ -20,6 +20,11 @@ sys.path.insert(0, str(project_root))
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import merge_match_info, read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.skill_registry_runtime import (
+    load_step_runtime,
+    require_step_fingerprints,
+    write_step_fingerprint,
+)
 
 STEP_NAME = "06-10_match_location"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -58,6 +63,10 @@ def main():
     logger.info("処理開始")
 
     try:
+        runtime = load_step_runtime(project_root)
+        require_step_fingerprints(
+            project_root, ("06-9_match_phase_category",), runtime
+        )
         pairs = read_jsonl_as_list(str(INPUT_PAIRS))
         logger.info(f"入力ペア数: {len(pairs)}")
 
@@ -100,6 +109,7 @@ def main():
 
         write_jsonl(str(OUTPUT_MATCHED), matched)
         write_jsonl(str(OUTPUT_NO_MATCHED), no_matched)
+        write_step_fingerprint(STEP_DIR, STEP_NAME, runtime)
 
         elapsed = time.time() - start_time
         write_execution_time(

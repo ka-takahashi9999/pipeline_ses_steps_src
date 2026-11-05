@@ -45,6 +45,20 @@ from common.file_utils import ensure_result_dirs, write_error_log, write_executi
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from common.skill_canonical_map import SKILL_CANONICAL_MAP
+from common.skill_registry import (
+    SkillMatcher,
+    RegistrySnapshot,
+    build_effective_matcher,
+    build_registry_matcher,
+    hits_to_skill_output,
+    hits_to_skills_raw,
+    shadow_primary_skills,
+)
+from common.skill_registry_runtime import (
+    SkillRegistryRuntime,
+    load_step_runtime,
+    write_step_fingerprint,
+)
 
 STEP_NAME = "03-8_extract_project_skill_category"
 logger = get_logger(STEP_NAME)
@@ -239,6 +253,43 @@ def build_extracted_record(
     }
 
 
+def build_registry_overlay_record(
+    mid: str,
+    body: str,
+    matcher: SkillMatcher,
+    required_matcher: SkillMatcher,
+    snapshot: RegistrySnapshot,
+    required_skills_map: Optional[Dict] = None,
+) -> Tuple[Dict, List[Dict]]:
+    """Build the production overlay record without changing the JSONL schema."""
+    hits = matcher.find_hits(body)
+    skills, skills_by_category = hits_to_skill_output(hits)
+    req_rec = (required_skills_map or {}).get(mid, {})
+    req_texts = [s.get("skill", "") for s in req_rec.get("required_skills", [])]
+    legacy_compatible_primary = classify_primary_skills(skills, req_texts)
+    primary_skills, required_hits = shadow_primary_skills(
+        hits,
+        req_texts,
+        required_matcher,
+        snapshot.production_canonical_names,
+        legacy_compatible_primary,
+    )
+    audit_hits = [hit.to_dict() for hit in hits if hit.source == "registry"]
+    for canonical, values in required_hits.items():
+        for value in values:
+            audit_value = dict(value)
+            audit_value["canonical"] = canonical
+            audit_value["scope"] = "required_text"
+            audit_hits.append(audit_value)
+    return {
+        "message_id": mid,
+        "skills": skills,
+        "skills_by_category": skills_by_category,
+        "skills_raw": hits_to_skills_raw(body, hits),
+        "primary_skills": primary_skills,
+    }, audit_hits
+
+
 def _is_valid(rec: Dict) -> bool:
     """skills/skills_by_category が list/dict 型であること。"""
     return (
@@ -254,6 +305,13 @@ def main() -> None:
     result_dir = dirs["result"]
 
     logger.info(f"ENABLE_SKILL_CATEGORY = {ENABLE_SKILL_CATEGORY}")
+
+    try:
+        runtime = load_step_runtime(_PROJECT_ROOT)
+    except Exception as e:
+        write_error_log(str(result_dir), e, "skill registry runtime initialization")
+        logger.error(f"skill registry runtime initialization failed: {e}")
+        sys.exit(1)
 
     for path in [INPUT_PROJECTS, INPUT_CLEANED]:
         if not Path(path).exists():
@@ -276,6 +334,7 @@ def main() -> None:
         null_path = str(result_dir / OUTPUT_NULL)
         write_jsonl(out_path, extracted)
         write_jsonl(null_path, null_records)
+        write_step_fingerprint(_STEP_DIR, STEP_NAME, runtime)
         elapsed = time.time() - start
         write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, len(project_ids))
         logger.ok(
@@ -298,6 +357,18 @@ def main() -> None:
     try:
         skill_dict = load_skill_dictionary(SKILL_DICT_PATH)
         cleaned_map = read_jsonl_as_dict(INPUT_CLEANED)
+        overlay_matcher = None
+        required_matcher = None
+        if runtime.overlay_enabled:
+            overlay_matcher, _ = build_effective_matcher(
+                runtime.snapshot,
+                Path(SKILL_DICT_PATH),
+                SKILL_CANONICAL_MAP,
+                {"production"},
+            )
+            required_matcher = build_registry_matcher(
+                runtime.snapshot, {"production"}
+            )
     except Exception as e:
         write_error_log(str(result_dir), e, "初期化エラー")
         logger.error(f"初期化エラー: {e}")
@@ -323,10 +394,30 @@ def main() -> None:
 
     extracted_list: list = []
     null_records = []
+    registry_audit_hits: list = []
 
     for mid in project_ids:
         body = (cleaned_map.get(mid) or {}).get("body_text", "")
-        rec  = build_extracted_record(mid, body, skill_dict, required_skills_map)
+        if runtime.overlay_enabled:
+            rec, audit_hits = build_registry_overlay_record(
+                mid,
+                body,
+                overlay_matcher,
+                required_matcher,
+                runtime.snapshot,
+                required_skills_map,
+            )
+            for value in audit_hits:
+                value.update(
+                    {
+                        "message_id": mid,
+                        "scope": value.get("scope", "body"),
+                        "registry_fingerprint": runtime.registry_fingerprint,
+                    }
+                )
+            registry_audit_hits.extend(audit_hits)
+        else:
+            rec = build_extracted_record(mid, body, skill_dict, required_skills_map)
 
         if not _is_valid(rec):
             null_records.append(rec)
@@ -345,6 +436,8 @@ def main() -> None:
     null_path = str(result_dir / OUTPUT_NULL)
     write_jsonl(out_path,  extracted_list)
     write_jsonl(null_path, null_records)
+    write_jsonl(str(dirs["confirm"] / "skill_registry_hits.jsonl"), registry_audit_hits)
+    write_step_fingerprint(_STEP_DIR, STEP_NAME, runtime)
 
     elapsed = time.time() - start
     total   = len(project_ids)

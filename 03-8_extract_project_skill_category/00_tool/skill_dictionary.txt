@@ -119,6 +119,10 @@
   - FuelPHP
   - actix-web
   - Express-JS
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - Erlang
+  - Phalcon
+  - "Play Framework"
 
 フロントエンド:
   - JavaScript
@@ -178,6 +182,10 @@
   - Nuxt
   - AngularJS
   - TailwindCSS
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - "Inertia.js"
+  - Vuetify
+  - "Windows Forms"
 
 インフラ:
   - IaC
@@ -387,6 +395,12 @@
   - Netcool
   - PRTG
   - ksh
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - Senju
+  - "Application Insights"
+  - XAMPP
+  - Cygwin
+  - NetBackup
 
 クラウドサービス:
   - Amazon Connect
@@ -475,6 +489,9 @@ DB:
   # DICT-02（2026-11-04 skill confirmation unit）
   - Athena
   - Neo4j
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - CloudSQL
+  - Aurora
 
 モバイル:
   - iOS
@@ -544,6 +561,12 @@ DB:
   - Keras
   - SparkSQL
   - PySpark
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - SageMaker
+  - BERT
+  - spaCy
+  - DSPy
+  - Haystack
 
 データ分析:
   - Redash
@@ -594,6 +617,10 @@ DB:
   - Cognos
   - "AWS Glue"
   - "ASTERIA Warp"
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - "Jupyter Notebook"
+  - Kinesis
+  - DataStage
 
 AI:
   - Whisper
@@ -682,6 +709,8 @@ AI:
   - セキュリティインシデント
   # DICT-02（2026-11-04 skill confirmation unit）
   - "Burp Suite"
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - マイクロセグメンテーション
 
 テスト/品質:
   - Vitest
@@ -715,6 +744,8 @@ AI:
   - Autify
   # DICT-02（2026-10-30）
   - PHPUnit
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - ServerSpec
 
 プロジェクト管理:
   - Agile
@@ -821,6 +852,8 @@ AI:
   - "Oracle FLEXCUBE"
   - S4HANA
   - Dataverse
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - Pega
 
 ミドルウェア・基盤:
   - HULFT
@@ -838,6 +871,8 @@ AI:
   - SiteScope
   # DICT-02（2026-11-04 skill confirmation unit）
   - "Apache Tomcat"
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - HACMP
 
 営業系:
   - 法人営業
@@ -889,6 +924,9 @@ CAD系:
   - GLSL
   - HLSL
   - UnrealEngine  # 主な開発環境・ツールにUnrealEngineが含まれている
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - UniRx
+  - UniTask
 
 デザイン系:
   - Figma
@@ -1023,6 +1061,8 @@ CMS系:
   - RPM
   - YAML
   - n8n
+  # DICT-02（2026-11-05 skill confirmation unit）
+  - ActiveX
 
 #Excel/Word/PowerPoint系: #汎用的すぎて広範囲で一致が発生する為除外
 #  - Excel

@@ -8,6 +8,13 @@ if [[ -z "${PIPELINE_LOG:-}" ]]; then
 fi
 LOG="${PIPELINE_LOG:-$ROOT/00_pipeline/01_result/pipeline_script_exec.log}"
 RUN_DATE="${RUN_DATE:-$(date '+%Y%m%d')}"
+SKILL_REGISTRY_RUN_ID="${RUN_ID:-standalone-$RUN_DATE}"
+SKILL_REGISTRY_CONTEXT="$(python3 "$ROOT/common/skill_registry_runtime.py" create \
+  --root "$ROOT" \
+  --output-root "$ROOT/00_pipeline/01_result/skill_registry_context" \
+  --run-date "$RUN_DATE" \
+  --run-id "$SKILL_REGISTRY_RUN_ID")" || exit 2
+export SKILL_REGISTRY_CONTEXT
 MODE_CONFIG="$ROOT/08-5_high_score_required_skill_recheck/00_tool/config.py"
 STEP_08_5_EXECUTION_MODE="$(python3 "$MODE_CONFIG" --print-mode)" || exit 2
 export STEP_08_5_EXECUTION_MODE
@@ -66,6 +73,7 @@ suspend_for_batch_wait() {
 
 log "########## pipeline start ##########"
 log "RUN_DATE=$RUN_DATE"
+log "SKILL_REGISTRY_CONTEXT=$SKILL_REGISTRY_CONTEXT"
 log "STEP_08_5_EXECUTION_MODE=$STEP_08_5_EXECUTION_MODE"
 
 # RUN_DATEを処理対象データ日とする。S3 LastModifiedのJST当日00:00以上、

@@ -42,6 +42,62 @@ def _load_required_match_module():
 
 
 class Check04RequiredOptionalTest(unittest.TestCase):
+    def test_optional_header_with_trailing_scope_clause(self):
+        for heading in (
+            "■尚可スキル 以下のいずれかを満たす。",
+            "尚可スキル：以下のいずれか",
+            "WANT：以下の条件",
+            "歓迎スキル（下記いずれか）",
+        ):
+            with self.subTest(heading=heading):
+                self.assertEqual(
+                    extractor._classify_line(heading),
+                    ("optional_header", ""),
+                )
+
+    def test_existing_optional_headers_remain_recognized(self):
+        for heading in ("尚可", "尚可スキル", "WANT", "歓迎"):
+            with self.subTest(heading=heading):
+                self.assertEqual(
+                    extractor._classify_line(heading),
+                    ("optional_header", ""),
+                )
+
+    def test_optional_scope_header_does_not_match_explanatory_text(self):
+        for text in (
+            "尚可ですが必須ではありません",
+            "尚可経験について面談で確認",
+            "以下は尚可ではなく必須です",
+            "この経験はあると尚可ですが選考条件ではありません",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    extractor._classify_line(text)[0],
+                    "optional_header",
+                )
+
+    def test_optional_scope_header_transitions_following_items(self):
+        required, optional = extractor.rule_extract_skills(
+            """■必須スキル
+・AWS設計、構築経験
+
+■尚可スキル 以下のいずれかを満たす。
+・API Gatewayの設計、構築経験
+・CloudFormationによるIaC構築経験
+"""
+        )
+        self.assertEqual(
+            [x["skill"] for x in required],
+            ["AWS設計、構築経験"],
+        )
+        self.assertEqual(
+            [x["skill"] for x in optional],
+            [
+                "API Gatewayの設計、構築経験",
+                "CloudFormationによるIaC構築経験",
+            ],
+        )
+
     def test_parenthesized_optional_skill_header(self):
         required, optional = extractor.rule_extract_skills(
             """スキル(必須):

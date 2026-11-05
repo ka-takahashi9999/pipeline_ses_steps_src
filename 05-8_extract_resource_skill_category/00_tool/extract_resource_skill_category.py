@@ -45,6 +45,14 @@ from common.file_utils import ensure_result_dirs, write_error_log, write_executi
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from common.skill_canonical_map import SKILL_CANONICAL_MAP
+from common.skill_registry import (
+    RegistrySnapshot,
+    SkillMatcher,
+    build_effective_matcher,
+    hits_to_skill_output,
+    hits_to_skills_raw,
+)
+from common.skill_registry_runtime import load_step_runtime, write_step_fingerprint
 
 STEP_NAME = "05-8_extract_resource_skill_category"
 logger = get_logger(STEP_NAME)
@@ -206,6 +214,21 @@ def build_extracted_record(
     }
 
 
+def build_registry_overlay_record(
+    mid: str,
+    body: str,
+    matcher: SkillMatcher,
+) -> Tuple[Dict, List[Dict]]:
+    hits = matcher.find_hits(body)
+    skills, skills_by_category = hits_to_skill_output(hits)
+    return {
+        "message_id": mid,
+        "skills": skills,
+        "skills_by_category": skills_by_category,
+        "skills_raw": hits_to_skills_raw(body, hits),
+    }, [hit.to_dict() for hit in hits if hit.source == "registry"]
+
+
 def _is_valid(rec: Dict) -> bool:
     """skills/skills_by_category が list/dict 型であること。"""
     return (
@@ -221,6 +244,13 @@ def main() -> None:
     result_dir = dirs["result"]
 
     logger.info(f"ENABLE_SKILL_CATEGORY = {ENABLE_SKILL_CATEGORY}")
+
+    try:
+        runtime = load_step_runtime(_PROJECT_ROOT)
+    except Exception as e:
+        write_error_log(str(result_dir), e, "skill registry runtime initialization")
+        logger.error(f"skill registry runtime initialization failed: {e}")
+        sys.exit(1)
 
     for path in [INPUT_RESOURCES, INPUT_CLEANED]:
         if not Path(path).exists():
@@ -243,6 +273,7 @@ def main() -> None:
         null_path = str(result_dir / OUTPUT_NULL)
         write_jsonl(out_path,  extracted)
         write_jsonl(null_path, null_records)
+        write_step_fingerprint(_STEP_DIR, STEP_NAME, runtime)
         elapsed = time.time() - start
         write_execution_time(str(dirs["execution_time"]), STEP_NAME, elapsed, len(resource_ids))
         logger.ok(
@@ -265,6 +296,14 @@ def main() -> None:
     try:
         skill_dict  = load_skill_dictionary(SKILL_DICT_PATH)
         cleaned_map = read_jsonl_as_dict(INPUT_CLEANED)
+        overlay_matcher = None
+        if runtime.overlay_enabled:
+            overlay_matcher, _ = build_effective_matcher(
+                runtime.snapshot,
+                Path(SKILL_DICT_PATH),
+                SKILL_CANONICAL_MAP,
+                {"production"},
+            )
     except Exception as e:
         write_error_log(str(result_dir), e, "初期化エラー")
         logger.error(f"初期化エラー: {e}")
@@ -277,10 +316,23 @@ def main() -> None:
 
     extracted_list: list = []
     null_records = []
+    registry_audit_hits: list = []
 
     for mid in resource_ids:
         body = (cleaned_map.get(mid) or {}).get("body_text", "")
-        rec  = build_extracted_record(mid, body, skill_dict)
+        if runtime.overlay_enabled:
+            rec, audit_hits = build_registry_overlay_record(mid, body, overlay_matcher)
+            for value in audit_hits:
+                value.update(
+                    {
+                        "message_id": mid,
+                        "scope": "body",
+                        "registry_fingerprint": runtime.registry_fingerprint,
+                    }
+                )
+            registry_audit_hits.extend(audit_hits)
+        else:
+            rec = build_extracted_record(mid, body, skill_dict)
 
         if not _is_valid(rec):
             null_records.append(rec)
@@ -297,6 +349,8 @@ def main() -> None:
     null_path = str(result_dir / OUTPUT_NULL)
     write_jsonl(out_path,  extracted_list)
     write_jsonl(null_path, null_records)
+    write_jsonl(str(dirs["confirm"] / "skill_registry_hits.jsonl"), registry_audit_hits)
+    write_step_fingerprint(_STEP_DIR, STEP_NAME, runtime)
 
     elapsed = time.time() - start
     total   = len(resource_ids)

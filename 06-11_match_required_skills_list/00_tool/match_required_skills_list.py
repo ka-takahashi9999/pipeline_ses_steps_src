@@ -26,6 +26,13 @@ from common.file_utils import ensure_result_dirs, write_error_log, write_executi
 from common.json_utils import merge_match_info, read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from common.skill_canonical_map import SKILL_ALIAS_MAP
+from common.skill_registry_runtime import (
+    SkillRegistryRuntime,
+    load_step_runtime,
+    require_step_fingerprints,
+    write_step_fingerprint,
+)
+from common.skill_registry_shadow import judge_required_gate_legacy_substring
 
 STEP_NAME = "06-11_match_required_skills_list"
 STEP_DIR = Path(__file__).resolve().parents[1]
@@ -208,6 +215,40 @@ def judge_match(
     return False, best_skill_hits, best_phase_hits, []
 
 
+def judge_match_with_runtime(
+    required_skill_keywords: List[str],
+    strong_required_phase_keywords: List[str],
+    weak_required_phase_keywords: List[str],
+    skillsheet_text: Optional[str],
+    email_body_text: Optional[str],
+    runtime: SkillRegistryRuntime,
+) -> Tuple[bool, List[str], List[str], List[str]]:
+    if not runtime.overlay_enabled:
+        return judge_match(
+            required_skill_keywords,
+            strong_required_phase_keywords,
+            weak_required_phase_keywords,
+            skillsheet_text,
+            email_body_text,
+        )
+    result = judge_required_gate_legacy_substring(
+        required_skill_keywords,
+        strong_required_phase_keywords,
+        weak_required_phase_keywords,
+        skillsheet_text or "",
+        email_body_text or "",
+        runtime.snapshot,
+        SKILL_ALIAS_MAP,
+        runtime.snapshot.production_canonical_names,
+    )
+    return (
+        result.passed,
+        list(result.matched_keywords),
+        list(result.matched_phase_keywords),
+        list(result.matched_in),
+    )
+
+
 def main():
     logger = get_logger(STEP_NAME)
     dirs = ensure_result_dirs(str(STEP_DIR))
@@ -230,6 +271,17 @@ def main():
             sys.exit(1)
 
     try:
+        runtime = load_step_runtime(project_root)
+        require_step_fingerprints(
+            project_root,
+            (
+                "03-8_extract_project_skill_category",
+                "05-8_extract_resource_skill_category",
+                "06-8_match_skill_category",
+                "06-10_match_location",
+            ),
+            runtime,
+        )
         pairs            = read_jsonl_as_list(str(INPUT_PAIRS))
         project_kws_map  = read_jsonl_as_dict(str(INPUT_PROJECT_KWS),  key="message_id")
         skillsheet_map   = read_jsonl_as_dict(str(INPUT_SKILLSHEET),    key="message_id")
@@ -273,12 +325,13 @@ def main():
             unavailable_skillsheet_resource_ids.add(resource_message_id)
         email_body_text   = email_body_rec.get("body_text") or ""
 
-        is_match, matched_skill_kws, matched_phase_kws, matched_in = judge_match(
+        is_match, matched_skill_kws, matched_phase_kws, matched_in = judge_match_with_runtime(
             required_skill_keywords,
             strong_required_phase_keywords,
             weak_required_phase_keywords,
             skillsheet_text,
             email_body_text,
+            runtime,
         )
 
         match_info_update = {"match_required_skills_list": is_match}
@@ -318,6 +371,7 @@ def main():
 
     write_jsonl(str(OUTPUT_MATCHED), matched)
     write_jsonl(str(OUTPUT_NO_MATCHED), no_matched)
+    write_step_fingerprint(STEP_DIR, STEP_NAME, runtime)
 
     elapsed = time.time() - start_time
     write_execution_time(

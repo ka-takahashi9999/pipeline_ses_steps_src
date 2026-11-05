@@ -197,6 +197,11 @@ RX_PRICE_FIELD_HOURLY_YEN = re.compile(
     + r"(?P<raw>時給\s*(?P<yen>" + _YEN_INTEGER + r")\s*円)"
     + r"(?:\s*\([^()\n]{1,80}\))?\s*"
 )
+RX_PRICE_FIELD_HOURLY_PREFIX_OPEN_HIGH = re.compile(
+    _PRICE_FIELD_PREFIX
+    + r"(?P<raw>時給\s*[〜~]\s*(?P<yen>" + _YEN_INTEGER + r")\s*円)"
+    + r"(?:\s*\([^()\n]{1,80}\))?\s*"
+)
 RX_PRICE_FIELD_HOURLY_SETTLEMENT = re.compile(
     _PRICE_FIELD_PREFIX
     + r"(?P<raw>[〜~]?\s*(?P<yen>" + _YEN_INTEGER + r")\s*円"
@@ -280,6 +285,7 @@ def _get_segments(text: str) -> List[str]:
             or RX_HOURLY_MAN.search(line)
             or RX_HOURLY_YEN_VALUE_COMMA.search(line)
             or RX_HOURLY_SETTLEMENT_VALUE.fullmatch(line)
+            or RX_PRICE_FIELD_HOURLY_PREFIX_OPEN_HIGH.fullmatch(line)
             or RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(line)
             or RX_PRICE_FIELD_DAILY_YEN_SYMBOL.fullmatch(line)
             or RX_PRICE_FIELD_HOURLY_OPEN_HIGH.fullmatch(line)
@@ -395,17 +401,21 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
         v = _yen_to_int(m.group("yen")) * DAILY_TO_MONTHLY
         return v, None, "daily-yen-slash", 0.80, "monthly", m.group("raw")
 
-    m = RX_PRICE_FIELD_HOURLY_OPEN_HIGH.fullmatch(seg)
-    if m:
-        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
-        return (
-            v,
-            {"min": None, "max": v},
-            "hourly-yen-open-high",
-            0.82,
-            "monthly",
-            m.group("raw"),
-        )
+    for pattern in (
+        RX_PRICE_FIELD_HOURLY_PREFIX_OPEN_HIGH,
+        RX_PRICE_FIELD_HOURLY_OPEN_HIGH,
+    ):
+        m = pattern.fullmatch(seg)
+        if m:
+            v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+            return (
+                v,
+                {"min": None, "max": v},
+                "hourly-yen-open-high",
+                0.82,
+                "monthly",
+                m.group("raw"),
+            )
 
     m = RX_HOURLY_YEN_RANGE.search(seg)
     if m:

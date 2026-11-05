@@ -219,6 +219,25 @@ _PROJECT_CONTEXT_PATTERNS = [
 _RESOURCE_CONTEXT_RE = [re.compile(p) for p in _RESOURCE_CONTEXT_PATTERNS]
 _PROJECT_CONTEXT_RE = [re.compile(p) for p in _PROJECT_CONTEXT_PATTERNS]
 
+# 案件・要員の双方を並べた営業挨拶は、どちらの分類意図も表さない。
+# 「見合う案件」「要員情報」単独の既存判定は維持し、完全な挨拶だけを
+# score_text の入力から除外する。
+_BIDIRECTIONAL_SALES_GREETING_RE = re.compile(
+    r"(?:見合う\s*)?案件\s*[・、,/]\s*(?:要員|人材)情報\s*"
+    r"(?:が\s*)?ございましたら\s*"
+    r"(?:"
+    r"ご紹介(?:ください|下さい|いただけますと幸いです|頂けますと幸いです|"
+    r"を?お願い(?:します|いたします))"
+    r"|ご連絡(?:ください|下さい|を?お願い(?:します|いたします))"
+    r"|(?:よろしく\s*)?お願い(?:します|いたします)"
+    r")[。.]?"
+)
+
+
+def _strip_bidirectional_sales_greetings(text: str) -> str:
+    """案件・要員双方を求める定型営業挨拶だけをスコア対象外にする。"""
+    return _BIDIRECTIONAL_SALES_GREETING_RE.sub(" ", text)
+
 # subject の強力な判別パターン（本文が薄い場合も有効）
 _SUBJ_RESOURCE_RE = [re.compile(p) for p in [
     r"直人材",
@@ -400,8 +419,10 @@ def score_text(
     (resource_score, project_score, res_hits, proj_hits, resource_context_score, project_context_score)
     を返す。
     """
-    norm_subj = _normalize(subject or "")
-    norm_body = _remove_cjk_inner_spaces(_normalize(body or ""))
+    norm_subj = _strip_bidirectional_sales_greetings(_normalize(subject or ""))
+    norm_body = _strip_bidirectional_sales_greetings(
+        _remove_cjk_inner_spaces(_normalize(body or ""))
+    )
     txt = norm_subj + "\n" + norm_body
 
     # ノイズ除去（URL・電話番号等）

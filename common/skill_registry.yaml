@@ -1,0 +1,93 @@
+schema_version: 2
+
+allowed_categories:
+  - バックエンド
+  - フロントエンド
+  - インフラ
+  - クラウドサービス
+  - DB
+  - モバイル
+  - データ分析/AI
+  - データ分析
+  - AI
+  - セキュリティ
+  - テスト/品質
+  - プロジェクト管理
+  - 組み込み
+  - 業務系
+  - ミドルウェア・基盤
+  - 営業系
+  - ヘルプデスク
+  - 秘書系
+  - CAD系
+  - 基地局系
+  - ロースキル系
+  - ゲーム系
+  - デザイン系
+  - 言語系
+  - 汎用機系
+  - RPA系
+  - VBA系
+  - M365系
+  - Google系
+  - ブロックチェーン
+  - CMS系
+  - その他
+
+skills:
+  - canonical: Spring Boot
+    ownership: shadow
+    category: バックエンド
+    aliases:
+      - Springboot
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: existing canonical map / M0 shadow migration
+    note: SpringBoot is absorbed by case-insensitive matching.
+
+  - canonical: Node.js
+    ownership: shadow
+    category: バックエンド
+    aliases:
+      - NodeJS
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: existing canonical map / M0 shadow migration
+    note: Existing NodeJS alias behavior is preserved.
+
+  - canonical: SQL Server
+    ownership: shadow
+    category: DB
+    aliases:
+      - SQLServer
+      - SQL-Server
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: existing canonical map / M0 shadow migration
+    note: Existing SQL Server aliases are preserved.
+
+  - canonical: Amazon Aurora
+    ownership: shadow
+    category: DB
+    aliases:
+      - Aurora
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: DICT-02 / M0 shadow migration
+    note: Aurora is canonicalized to Amazon Aurora.
+
+  - canonical: Power BI
+    ownership: production
+    category: データ分析
+    aliases:
+      - PowerBI
+      - Power-BI
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: CHECK-07 / M0 shadow migration
+    note: Power BI spacing and hyphen variants.

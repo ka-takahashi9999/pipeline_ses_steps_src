@@ -65,6 +65,28 @@ _PROFILE_OR_PROJECT_RE = re.compile(
     r"氏\s*名|名\s*前|年\s*齢|最\s*寄|単\s*価|単\s*金|"
     r"案件名|案件概要|業務内容|作業内容|必須スキル|【案件】"
 )
+_ADDITIONAL_MATCHING_DETAIL_RE = re.compile(
+    r"イニシャル|所\s*属|希望\s*単\s*(?:価|金)|"
+    r"稼\s*(?:働|動)\s*開始|入場日|参画可能|"
+    r"勤務地|作業場所|就業場所|精算|募集人数|要望スキル|契約形態"
+)
+_INLINE_MATCHING_DETAIL_RES = (
+    re.compile(r"(?:^|[\s/|｜])(?:[A-Z][.．]){1,2}[A-Z]?(?:$|[\s/|｜])"),
+    re.compile(r"(?<![0-9])[0-9]{2}歳(?!まで|以下|迄)"),
+    re.compile(r"[^\s/|｜]{1,20}駅(?:[（(][^)）]+[)）])?"),
+    re.compile(r"(?<![0-9])[0-9]{2,3}万(?:円)?(?![0-9])"),
+)
+_LIST_PORTAL_LABEL_RE = re.compile(
+    r"(?:要員|人材|案件)(?:一覧(?:リスト)?|リスト)"
+)
+_LIST_PORTAL_CONTEXT_RE = re.compile(
+    r"(?:要員|人材|案件)(?:一覧(?:リスト)?|リスト)|"
+    r"営業中(?:の)?[^\n]{0,40}(?:人材|要員)"
+)
+_EXTERNAL_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+_LIST_LINK_SEPARATOR_RE = re.compile(
+    r"^[\s【】\[\]■◆◇●・:：_\-ー―‐－━—─]*$"
+)
 _CHO_LINK_URL = r"https://u29046571\.ct\.sendgrid\.net/ls/click\?\S+"
 _CHO_INVITE_BODY_RE = re.compile(
     r"(?P<company>[^\n]+?)の(?P<person>[^\n]+?)様より、チョータツでの連携のご依頼です\n+"
@@ -472,6 +494,67 @@ _COMPLETE_RESOURCE_PROFILE_ATTRIBUTE_RES = tuple(
         r"スキル",
     )
 )
+
+
+def _has_matching_target_detail(subject: str, body: str) -> bool:
+    """個別profileまたは個別案件として扱う根拠があるかを確認する。"""
+    combined = unicodedata.normalize("NFKC", "{}\n{}".format(subject, body))
+    if _PROFILE_OR_PROJECT_RE.search(combined):
+        return True
+    if _ADDITIONAL_MATCHING_DETAIL_RE.search(combined):
+        return True
+    inline_count = sum(
+        bool(pattern.search(combined)) for pattern in _INLINE_MATCHING_DETAIL_RES
+    )
+    return inline_count >= 2
+
+
+def _has_list_portal_url(body: str, html_links: List) -> bool:
+    """一覧ラベルが直接示す外部URLだけを一覧portalとして認識する。"""
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        label_match = _LIST_PORTAL_LABEL_RE.search(line)
+        if not label_match:
+            continue
+        segments = [line[label_match.end():]]
+        for next_line in lines[index + 1:index + 7]:
+            segments.append(next_line)
+        for segment_index, segment in enumerate(segments):
+            url_match = _EXTERNAL_URL_RE.search(segment)
+            if url_match:
+                before_url = segments[:segment_index] + [segment[:url_match.start()]]
+                if all(_LIST_LINK_SEPARATOR_RE.fullmatch(part) for part in before_url):
+                    return True
+                break
+            if not _LIST_LINK_SEPARATOR_RE.fullmatch(segment):
+                break
+
+    for link in html_links:
+        if not isinstance(link, dict):
+            continue
+        text = link.get("text")
+        href = link.get("href")
+        if (isinstance(text, str) and isinstance(href, str)
+                and _LIST_PORTAL_LABEL_RE.search(text)
+                and _EXTERNAL_URL_RE.fullmatch(href)):
+            return True
+    return False
+
+
+def _is_external_list_portal_without_detail(
+    record: Dict,
+    subject: str,
+    body: str,
+) -> bool:
+    """個別情報を持たず外部一覧だけを案内するメールを限定判定する。"""
+    if record["attachments"]:
+        return False
+    combined = "{}\n{}".format(subject, body)
+    if not _LIST_PORTAL_CONTEXT_RE.search(combined):
+        return False
+    if _has_matching_target_detail(subject, body):
+        return False
+    return _has_list_portal_url(body, record["html_links"])
 
 
 def _repeated_resource_profile_count(subject: str, body: str) -> int:
@@ -957,6 +1040,14 @@ def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
             and subject == "ご提案可能な営業中Python人材のご紹介"
             and _IDENTITY_LIST_MAIN_RE.fullmatch(body.partition("━━")[0].strip())):
         return "list_or_portal_notice", "identity_python_list_portal_v1"
+
+    # 既存の個別templateを優先したうえで、職種名・会社名には依存せず、
+    # 一覧ラベル + 外部URL + 個別情報不存在の構造だけをfallback判定する。
+    if _is_external_list_portal_without_detail(record, subject, body):
+        return (
+            "list_or_portal_notice",
+            "external_list_portal_without_individual_detail_v1",
+        )
     return None
 
 

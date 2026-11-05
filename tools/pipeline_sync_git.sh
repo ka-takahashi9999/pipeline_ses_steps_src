@@ -48,6 +48,7 @@ EXCLUDE_GLOBS=('*.jsonl' '*.json' '*.log' '*.pyc' '*.zip' '*.gz' 'nohup.out' 'se
 INCLUDE_ALWAYS=(
   '.claude/settings.json'
   '00_pipeline/02_confirm/gmail_s3_migration_handoff_20261001.md'
+  '00_pipeline/10_assistance_tool/skill_registry_expected_differences_20261104.json'
 )
 
 # 除外ディレクトリ配下でも同期する例外（相対パスのglob一致）

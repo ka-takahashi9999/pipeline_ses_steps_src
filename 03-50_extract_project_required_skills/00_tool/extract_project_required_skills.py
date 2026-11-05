@@ -343,6 +343,25 @@ _LIMITED_OPTIONAL_HDR_NORM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CHECK-04限定: 既存optional見出しに、後続箇条書きの範囲だけを示す
+# 短い導入句が付く場合もoptional sectionとして扱う。
+# 行全体のfullmatchを前提とし、尚可を含む一般説明文には広げない。
+_OPTIONAL_SCOPE_HDR_NORM_RE = re.compile(
+    r'^(?:'
+    r'尚可(?:スキル(?:[・/／]経験)?|経験|条件|要件)?'
+    r'|歓迎(?:スキル(?:[/／]経験)?|条件|要件|する経験)?'
+    r'|Preferred|WANT(?:スキル)?'
+    r')'
+    r'[:：]?\(?'
+    r'(?:以下|下記|次の)'
+    r'(?:'
+    r'(?:の)?いずれか(?:を満たす(?:こと)?|に該当(?:する)?(?:こと)?)?'
+    r'|の?(?:条件|項目|要件|スキル)'
+    r')?'
+    r'\)?[。.]?$',
+    re.IGNORECASE,
+)
+
 # CHECK-04限定: requiredセクション内の独立否定行だけを除外する。
 # 別のrequired条件が同じ行に続く場合は、明示的な接続語の後半だけを保持する。
 _STANDALONE_NEGATED_REQUIRED_RE = re.compile(
@@ -505,7 +524,10 @@ def _classify_line(
     # 確認済みの限定見出しだけstop判定より先に確定する。
     if norm and _LIMITED_REQUIRED_HDR_NORM_RE.fullmatch(norm):
         return 'required_header', ''
-    if norm and _LIMITED_OPTIONAL_HDR_NORM_RE.fullmatch(norm):
+    if norm and (
+        _LIMITED_OPTIONAL_HDR_NORM_RE.fullmatch(norm)
+        or _OPTIONAL_SCOPE_HDR_NORM_RE.fullmatch(norm)
+    ):
         return 'optional_header', ''
 
     # 上記の限定例外以外は既存どおり停止条件を最優先する。
