@@ -362,6 +362,63 @@ _OPTIONAL_SCOPE_HDR_NORM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CHECK-04限定: 装飾delimiterで囲まれたheaderの後ろに、提案時の短い
+# 回答指示だけが続く形式を扱う。suffixを無条件に捨てず、許可familyへの
+# 完全一致と既存header grammarへの完全一致を両方満たす場合だけ採用する。
+_DECORATED_HEADER_WITH_RESPONSE_SUFFIX_RE = re.compile(
+    r'^\s*(?:'
+    r'《(?P<double_angle>[^》\r\n]{1,40})》'
+    r'|【(?P<square>[^】\r\n]{1,40})】'
+    r'|<(?P<angle>[^>\r\n]{1,40})>'
+    r')\s*(?P<suffix>※[^\r\n]{1,30})\s*$',
+)
+
+_RESPONSE_INSTRUCTION_SUFFIX_RE = re.compile(
+    r'^※\s*(?:'
+    r'(?:[〇○◯●×△?？/／・]+|可否)(?:の)?(?:ご)?(?:記載|回答|確認)'
+    r'\s*(?:を)?\s*(?:希望(?:します)?|お願い(?:します|いたします)?|ください)'
+    r'|(?:ご)?回答\s*(?:を)?\s*'
+    r'(?:希望(?:します)?|お願い(?:します|いたします)?|ください)'
+    r')\s*[。.!！]?$',
+)
+
+
+# genericな装飾header coreと、同一行のrequired scope clauseを分離して判定する。
+# 「要件」単独や本文中の「必須」は対象にせず、双方の限定grammarが揃う場合だけ
+# required sectionを開始する。
+_GENERIC_HEADER_WITH_SCOPE_RE = re.compile(
+    r'^\s*【(?P<core>[^】\r\n]{1,20})】\s*(?P<scope>[^\r\n]{1,30})\s*$',
+)
+_GENERIC_REQUIREMENTS_HEADER_CORE_RE = re.compile(r'^要件$')
+_REQUIRED_SCOPE_CLAUSE_RE = re.compile(
+    r'^(?:以下|下記)(?:の)?必須(?:項目)?[。.]?$',
+)
+
+
+def _is_generic_header_with_required_scope(line: str) -> bool:
+    """generic header core + 限定required scope clauseの組合せを判定する。"""
+    match = _GENERIC_HEADER_WITH_SCOPE_RE.fullmatch(_n(line.strip()))
+    if not match:
+        return False
+    core = _normalize_hdr(match.group('core'))
+    scope = _HDR_INNER_SPACE_RE.sub('', _n(match.group('scope')).strip())
+    return bool(
+        _GENERIC_REQUIREMENTS_HEADER_CORE_RE.fullmatch(core)
+        and _REQUIRED_SCOPE_CLAUSE_RE.fullmatch(scope)
+    )
+
+
+def _decorated_header_core_with_response_suffix(line: str) -> str:
+    """限定された回答指示suffixを持つ装飾headerの正規化coreを返す。"""
+    match = _DECORATED_HEADER_WITH_RESPONSE_SUFFIX_RE.fullmatch(_n(line.strip()))
+    if not match or not _RESPONSE_INSTRUCTION_SUFFIX_RE.fullmatch(match.group('suffix')):
+        return ''
+    core = next(
+        (match.group(name) for name in ('double_angle', 'square', 'angle') if match.group(name)),
+        '',
+    )
+    return _normalize_hdr(core)
+
 # CHECK-04限定: requiredセクション内の独立否定行だけを除外する。
 # 別のrequired条件が同じ行に続く場合は、明示的な接続語の後半だけを保持する。
 _STANDALONE_NEGATED_REQUIRED_RE = re.compile(
@@ -519,6 +576,20 @@ def _classify_line(
       ※ required_skill / optional_skill は one-shot 抽出（STATE_NONE に戻る）
     """
     norm = _normalize_hdr(line)
+
+    # 装飾header coreと短い回答指示suffixを構造的に分離する。
+    # core/suffixの双方が限定grammarへ完全一致した場合だけsectionを開始する。
+    decorated_response_core = _decorated_header_core_with_response_suffix(line)
+    if decorated_response_core:
+        if _REQUIRED_HDR_NORM_RE.fullmatch(decorated_response_core):
+            return 'required_header', ''
+        if _OPTIONAL_HDR_NORM_RE.fullmatch(decorated_response_core):
+            return 'optional_header', ''
+
+    # genericな装飾header coreとrequired scope clauseが同一行に揃う場合だけ、
+    # required sectionを開始する。header単独やoptional/説明suffixには広げない。
+    if _is_generic_header_with_required_scope(line):
+        return 'required_header', ''
 
     # 「業務内容・必須スキル」は通常のstop判定にも一致するため、
     # 確認済みの限定見出しだけstop判定より先に確定する。

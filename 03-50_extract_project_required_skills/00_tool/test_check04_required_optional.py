@@ -42,6 +42,66 @@ def _load_required_match_module():
 
 
 class Check04RequiredOptionalTest(unittest.TestCase):
+    def test_decorated_required_optional_headers_with_response_suffix(self):
+        cases = {
+            "《必須スキル》": "required_header",
+            "《歓迎スキル》": "optional_header",
+            "《必須スキル》※〇×記載希望": "required_header",
+            "《歓迎スキル》※〇×記載希望": "optional_header",
+            "【必須スキル】※〇×記載希望": "required_header",
+            "【歓迎スキル】※〇×記載希望": "optional_header",
+            "＜必須スキル＞※〇×記載希望": "required_header",
+        }
+        for heading, expected_kind in cases.items():
+            with self.subTest(heading=heading):
+                self.assertEqual(extractor._classify_line(heading), (expected_kind, ""))
+
+    def test_decorated_header_response_suffix_family(self):
+        for suffix in (
+            "※可否記載希望",
+            "※回答お願いします",
+            "※ご回答ください",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    extractor._classify_line("《必須スキル》" + suffix),
+                    ("required_header", ""),
+                )
+                self.assertEqual(
+                    extractor._classify_line("《歓迎スキル》" + suffix),
+                    ("optional_header", ""),
+                )
+
+    def test_decorated_response_headers_preserve_both_transitions(self):
+        required, optional = extractor.rule_extract_skills(
+            """《必須スキル》※〇×記載希望
+・Java開発経験
+《歓迎スキル》※可否記載希望
+・AWS構築経験
+《必須スキル》※ご回答ください
+・Python開発経験
+"""
+        )
+        self.assertEqual(
+            [x["skill"] for x in required],
+            ["Java開発経験", "Python開発経験"],
+        )
+        self.assertEqual([x["skill"] for x in optional], ["AWS構築経験"])
+
+    def test_decorated_header_does_not_drop_non_instruction_text(self):
+        for text in (
+            "《必須スキル》※以下の経験をすべて満たす方を希望します",
+            "本文中では必須スキルについて詳しく説明します",
+            "業務内容:必須となる作業を記載します",
+            "人物像:必須条件を満たす方",
+            "備考:尚可条件は面談時に説明します",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(
+                    extractor._classify_line(text)[0],
+                    {"required_header", "optional_header"},
+                )
+
     def test_optional_header_with_trailing_scope_clause(self):
         for heading in (
             "■尚可スキル 以下のいずれかを満たす。",

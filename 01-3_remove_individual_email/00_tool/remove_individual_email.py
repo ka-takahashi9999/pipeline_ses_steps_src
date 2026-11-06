@@ -706,8 +706,8 @@ def _has_counted_complete_project_blocks(subject: str, body: str) -> bool:
     return len(titles) == expected_count
 
 
-def _has_repeated_complete_resource_blocks(body: str) -> bool:
-    """氏名境界と追加profile属性3種類以上が揃うblockが2件以上ならTrue。"""
+def _complete_resource_profile_block_count(body: str) -> int:
+    """氏名境界と追加profile属性3種類以上が揃うblock数を返す。"""
     normalized_body = unicodedata.normalize("NFKC", body)
     profile_boundaries = list(_COMPLETE_RESOURCE_PROFILE_NAME_RE.finditer(normalized_body))
     complete_block_count = 0
@@ -724,7 +724,71 @@ def _has_repeated_complete_resource_blocks(body: str) -> bool:
         )
         if attribute_count >= 3:
             complete_block_count += 1
-    return complete_block_count >= 2
+    return complete_block_count
+
+
+def _has_repeated_complete_resource_blocks(body: str) -> bool:
+    """氏名境界と追加profile属性3種類以上が揃うblockが2件以上ならTrue。"""
+    return _complete_resource_profile_block_count(body) >= 2
+
+
+def _has_complete_project_structure(body: str) -> bool:
+    """既存の案件block evidenceで、完全な案件構造が1件以上あるか判定する。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+
+    bracketed_blocks = _COMPLETE_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
+    if any(
+        all(pattern.search(block) for pattern in _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES)
+        for block in bracketed_blocks
+    ):
+        return True
+
+    headers = list(_FLEX_PROJECT_NAME_BLOCK_HEADER_RE.finditer(normalized_body))
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(normalized_body)
+        block = normalized_body[header.start():block_end]
+        has_content = bool(_COMPLETE_NAMED_PROJECT_CONTENT_RE.search(block))
+        has_rate = bool(_COMPLETE_NAMED_PROJECT_RATE_RE.search(block))
+        other_attribute_count = sum(
+            bool(pattern.search(block))
+            for pattern in _COMPLETE_NAMED_PROJECT_OTHER_ATTRIBUTE_RES
+        )
+        if has_content and has_rate and other_attribute_count >= 2:
+            return True
+    return False
+
+
+def _can_rescue_single_complete_resource_profile(
+    record: Dict,
+    p1_reason: Optional[str],
+    template: Optional[Tuple[str, str]],
+) -> bool:
+    """manual除外より優先できる、完全な単一resource profileだけを判定する。"""
+    if p1_reason or template:
+        return False
+    if not all(isinstance(record.get(k), str) for k in ("from", "subject", "body_text")):
+        return False
+    if not all(isinstance(record.get(k), list) for k in ("attachments", "html_links")):
+        return False
+
+    subject = record["subject"]
+    body = record["body_text"]
+    normalized_body = unicodedata.normalize("NFKC", body)
+    profile_boundaries = list(_COMPLETE_RESOURCE_PROFILE_NAME_RE.finditer(normalized_body))
+
+    # 完全blockが1件でも、別人物の氏名境界があれば単一人物とはみなさない。
+    if len(profile_boundaries) != 1:
+        return False
+    if _complete_resource_profile_block_count(body) != 1:
+        return False
+    if _has_complete_project_structure(body):
+        return False
+
+    combined = "{}\n{}".format(subject, body)
+    if (_LIST_PORTAL_CONTEXT_RE.search(combined)
+            and _has_list_portal_url(body, record["html_links"])):
+        return False
+    return True
 
 
 def detect_template_exclusion(record: Dict) -> Optional[Tuple[str, str]]:
@@ -1283,13 +1347,17 @@ def determine_exclusion_reason(
     from_only_set: Set[str],
     from_subj_rules: List[Tuple[str, str]],
 ) -> Optional[str]:
-    """manual → P1 → 限定テンプレートの順で評価し、既存除外理由を保つ。"""
-    if is_excluded(record, from_only_set, from_subj_rules):
-        return "manual_exclude_list"
+    """manual除外を保ち、完全な単一profileだけ構造根拠で救済する。"""
+    manual_excluded = is_excluded(record, from_only_set, from_subj_rules)
     p1_reason = detect_p1_exclusion_reason(record.get("subject") or "")
+    template = detect_template_exclusion(record)
+
+    if manual_excluded:
+        if _can_rescue_single_complete_resource_profile(record, p1_reason, template):
+            return None
+        return "manual_exclude_list"
     if p1_reason:
         return p1_reason
-    template = detect_template_exclusion(record)
     return template[0] if template else None
 
 

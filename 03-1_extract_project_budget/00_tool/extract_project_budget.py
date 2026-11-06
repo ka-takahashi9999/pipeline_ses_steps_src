@@ -113,6 +113,15 @@ RX_MAN1 = re.compile(r"(\d{1,3})\s*万[円]?")
 # 円整数（カンマ区切りまたは3〜6桁）。数値途中の部分一致は各pattern側で防ぐ。
 _YEN_INTEGER = r"(?:\d{1,3}(?:,\d{3})+|\d{3,6})"
 
+# standaloneの時給欄は、価格labelとhourly unitを同じfieldとしてtokenizeする。
+# 「万円」「時間」はfield自体は認識するが、unit矛盾として価格には変換しない。
+RX_STANDALONE_HOURLY_FIELD = re.compile(
+    r"^[ \t]*(?:[■●◇・][ \t]*)?"
+    r"(?:時給[ \t]*[:：]|【[ \t]*時給[ \t]*】[ \t]*[:：]?)"
+    r"[ \t]*(?P<amount>(?:\d{1,3}(?:,\d{3})+|\d{1,6}))[ \t]*"
+    r"(?P<unit>万円?|円|時間)[ \t]*$"
+)
+
 # 価格欄のカンマ付き円額range。時給・日給は別ruleで換算する。
 _COMMA_YEN_INTEGER = r"\d{1,3}(?:,\d{3})+"
 RX_COMMA_YEN_RANGE = re.compile(
@@ -298,6 +307,16 @@ def _get_segments(text: str) -> List[str]:
         )
 
     for idx, line in enumerate(lines):
+        hourly_field, hourly_amount, _ = _tokenize_standalone_hourly_field(line)
+        if hourly_field:
+            if hourly_amount is not None:
+                seg = line.strip()
+                if seg and seg not in seen:
+                    seen.add(seg)
+                    segs.append(seg)
+            # unit矛盾や妥当範囲外のstandalone時給欄は、他の金額ruleへ流さない。
+            continue
+
         if not _PRICE_KW_RE.search(line):
             continue
 
@@ -332,6 +351,25 @@ def _get_segments(text: str) -> List[str]:
 
 def _yen_to_int(value: str) -> int:
     return int(value.replace(",", ""))
+
+
+def _tokenize_standalone_hourly_field(
+    text: str,
+) -> Tuple[bool, Optional[int], str]:
+    """standalone時給欄を (認識可否, 時給円額, raw) に正規化する。"""
+    match = RX_STANDALONE_HOURLY_FIELD.fullmatch(text)
+    if not match:
+        return False, None, ""
+
+    raw = match.group(0).strip()
+    if match.group("unit") != "円":
+        return True, None, raw
+
+    hourly_amount = _yen_to_int(match.group("amount"))
+    monthly_amount = hourly_amount * HOURLY_TO_MONTHLY
+    if not (_PRICE_MIN <= monthly_amount <= _PRICE_MAX):
+        return True, None, raw
+    return True, hourly_amount, raw
 
 
 def _is_range_num_only_allowed(seg: str, match: re.Match) -> bool:
@@ -381,6 +419,19 @@ def _monthly_with_hourly_equivalent(seg: str) -> Optional[Tuple]:
 
 def _hourly_daily(seg: str) -> Optional[Tuple]:
     """時給・日給を検出して月換算で返す"""
+    hourly_field, hourly_amount, raw = _tokenize_standalone_hourly_field(seg)
+    if hourly_field:
+        if hourly_amount is None:
+            return None
+        return (
+            hourly_amount * HOURLY_TO_MONTHLY,
+            None,
+            "hourly-yen",
+            0.82,
+            "monthly",
+            raw,
+        )
+
     m = RX_PRICE_FIELD_HOURLY_SETTLEMENT.fullmatch(seg)
     if m:
         v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
@@ -690,6 +741,9 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[Dict], str, float, 
         result = _hourly_daily(seg)
         if result:
             return result
+        hourly_field, _, _ = _tokenize_standalone_hourly_field(seg)
+        if hourly_field:
+            continue
 
         # 万円パターン
         result = _man_patterns(seg)

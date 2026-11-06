@@ -29,12 +29,9 @@ Feature flag (config.py の ENABLE_PHASE_CATEGORY):
   01_result/99_phase_null_extract_project_phase_category.jsonl
 """
 
-import re
 import sys
 import time
-import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 _STEP_DIR = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _STEP_DIR.parent
@@ -47,6 +44,15 @@ from config import ENABLE_PHASE_CATEGORY
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
 from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
+from common.phase_extractor import (
+    PHASE_DICTIONARY_PATH,
+    build_extracted_record,
+    build_passthrough_record,
+    extract_phases,
+    is_valid_phase_record,
+    load_phase_dictionary,
+    normalize_phase_text,
+)
 
 STEP_NAME = "03-9_extract_project_phase_category"
 logger = get_logger(STEP_NAME)
@@ -57,128 +63,14 @@ INPUT_CLEANED = str(
 INPUT_PROJECTS = str(
     _PROJECT_ROOT / "02-2_classify_output_file_project_resource" / "01_result" / "projects.jsonl"
 )
-PHASE_DICT_PATH = str(_STEP_DIR / "00_tool" / "phase_dictionary.txt")
+PHASE_DICT_PATH = str(PHASE_DICTIONARY_PATH)
 OUTPUT_EXTRACTED = "extract_project_phase_category.jsonl"
 OUTPUT_NULL      = "99_phase_null_extract_project_phase_category.jsonl"
 
 
-# ── 正規化 ────────────────────────────────────────────────
-def _n(s: str) -> str:
-    return unicodedata.normalize("NFKC", s or "")
-
-
-# ── 辞書ロード ────────────────────────────────────────────
-def load_phase_dictionary(path: str) -> Dict[str, List[Tuple[str, re.Pattern]]]:
-    """
-    YAML形式の工程辞書を読み込む。
-
-    Returns:
-        {正規工程名: [(keyword, compiled_pattern), ...]}
-        ・長いキーワードが先にマッチするよう長さ降順でソート済み
-    """
-    import yaml
-
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-
-    result: Dict[str, List[Tuple[str, re.Pattern]]] = {}
-    for phase_name, keywords in (data or {}).items():
-        if not isinstance(keywords, list):
-            continue
-        entries: List[Tuple[str, re.Pattern]] = []
-        for kw in keywords:
-            if not kw:
-                continue
-            kw_str = str(kw).strip()
-            escaped = re.escape(kw_str)
-            # 英数字のみのキーワード（UT/IT/ST/BD/DD/PG/RD/PMO等）は
-            # ASCII英数字境界を使用。\b だと日本語に隣接したケース（例: PMO業務）を
-            # 拾えないため、前後にASCII英数字がないことを条件にする。
-            if re.match(r"^[A-Za-z0-9]+$", kw_str):
-                pattern = re.compile(
-                    r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])",
-                    re.IGNORECASE,
-                )
-            else:
-                pattern = re.compile(escaped)
-            entries.append((kw_str, pattern))
-        # 長いキーワード優先
-        entries.sort(key=lambda x: len(x[0]), reverse=True)
-        result[phase_name] = entries
-
-    return result
-
-
-# ── 工程抽出 ──────────────────────────────────────────────
-def extract_phases(
-    body: str,
-    phase_dict: Dict[str, List[Tuple[str, re.Pattern]]],
-) -> Tuple[List[str], Optional[str]]:
-    """
-    本文から工程を抽出する。
-
-    Returns:
-        (phases, phases_raw)
-          phases: 検出された正規工程名リスト（出現順、重複なし）
-          phases_raw: 最初にマッチした前後コンテキスト
-    """
-    text = _n(body)
-
-    matched_phases: List[str] = []
-    seen_phases: set = set()
-    first_match_pos = len(text)
-    last_match_pos  = 0
-
-    for phase_name, entries in phase_dict.items():
-        for kw_str, pattern in entries:
-            m = pattern.search(text)
-            if m:
-                if phase_name not in seen_phases:
-                    seen_phases.add(phase_name)
-                    matched_phases.append((phase_name, m.start()))
-                first_match_pos = min(first_match_pos, m.start())
-                last_match_pos  = max(last_match_pos, m.end())
-                break  # 同じ工程内で最初にマッチしたキーワードのみ使用
-
-    if not matched_phases:
-        return [], None
-
-    # 出現位置順にソート
-    matched_phases.sort(key=lambda x: x[1])
-    phases = [p for p, _ in matched_phases]
-
-    # phases_raw: 最初〜最後のマッチ位置の前後コンテキスト
-    raw_start = max(0, first_match_pos - 20)
-    raw_end   = min(len(text), last_match_pos + 30)
-    phases_raw: Optional[str] = text[raw_start:raw_end].strip()[:200] or None
-
-    return phases, phases_raw
-
-
-# ── レコード構築 ──────────────────────────────────────────
-def build_passthrough_record(mid: str) -> Dict:
-    return {
-        "message_id": mid,
-        "phases": [],
-        "phases_raw": None,
-    }
-
-
-def build_extracted_record(
-    mid: str,
-    body: str,
-    phase_dict: Dict[str, List[Tuple[str, re.Pattern]]],
-) -> Dict:
-    phases, phases_raw = extract_phases(body, phase_dict)
-    return {
-        "message_id": mid,
-        "phases": phases,
-        "phases_raw": phases_raw,
-    }
-
-
-def _is_valid(rec: Dict) -> bool:
-    return isinstance(rec.get("phases"), list)
+# 既存のfocused test・呼び出し互換を保つstep公開名。
+_n = normalize_phase_text
+_is_valid = is_valid_phase_record
 
 
 # ── メイン ────────────────────────────────────────────────

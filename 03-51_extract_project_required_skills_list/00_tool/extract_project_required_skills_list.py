@@ -7,7 +7,7 @@ LLM使用禁止。辞書ベース・文字列処理のみ。
 入力:
   03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl
   03-8_extract_project_skill_category/00_tool/skill_dictionary.txt
-  03-9_extract_project_phase_category/00_tool/phase_dictionary.txt
+  common/phase_dictionary.txt
 
 出力①（抽出結果）:
   01_result/extract_project_required_skills_list.jsonl
@@ -45,7 +45,7 @@ SKILL_DICT_PATH = str(
     _PROJECT_ROOT / "03-8_extract_project_skill_category" / "00_tool" / "skill_dictionary.txt"
 )
 PHASE_DICT_PATH = str(
-    _PROJECT_ROOT / "03-9_extract_project_phase_category" / "00_tool" / "phase_dictionary.txt"
+    _PROJECT_ROOT / "common" / "phase_dictionary.txt"
 )
 
 OUTPUT_EXTRACTED = "extract_project_required_skills_list.jsonl"

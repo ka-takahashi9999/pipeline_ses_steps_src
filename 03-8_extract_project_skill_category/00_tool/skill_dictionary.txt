@@ -5,6 +5,8 @@
 # ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
 
 バックエンド:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - Haskell
   - VB6
   - Celery
   - VBScript
@@ -125,6 +127,8 @@
   - "Play Framework"
 
 フロントエンド:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - face-api.js
   - JavaScript
   - TypeScript
   - "React.js"
@@ -188,6 +192,12 @@
   - "Windows Forms"
 
 インフラ:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - 無線LANアクセスポイント
+  - KornShell
+  - "HPE ProLiant"
+  - "EventLog Analyzer"
+  - "Firewall Analyzer"
   - IaC
   - VPS
   - CentOS
@@ -403,6 +413,8 @@
   - NetBackup
 
 クラウドサービス:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - "Azure Arc"
   - Amazon Connect
   - CloudFront
   - "AWS Bedrock"
@@ -432,6 +444,9 @@
   - "Amazon Bedrock"
 
 DB:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - SSIS
+  - SSAS
   - "SQL Server"
   - MySQL
   - PostgreSQL
@@ -520,6 +535,8 @@ DB:
   - CocoaPods
 
 データ分析/AI:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - "Google Colab"
   - MLOps
   - "Machine Learning"
   - "Deep Learning"
@@ -569,6 +586,8 @@ DB:
   - Haystack
 
 データ分析:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - Informatica
   - Redash
   - QuickSight
   - Fivetran
@@ -623,6 +642,8 @@ DB:
   - DataStage
 
 AI:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - Genspark
   - Whisper
   - "OpenAI API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
   - "Anthropic API"  # 最新の生成AIツールやAI API（OpenAI／Anthropic／Gemini など）
@@ -713,6 +734,10 @@ AI:
   - マイクロセグメンテーション
 
 テスト/品質:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - Cppcheck
+  - Coverity
+  - k6
   - Vitest
   - JUnit
   - pytest
@@ -766,6 +791,8 @@ AI:
   - テックリード
 
 組み込み:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - CANalyzer
   - "C++"
   - RTOS
   - 組み込み
@@ -856,6 +883,8 @@ AI:
   - Pega
 
 ミドルウェア・基盤:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - CLUSTERPRO
   - HULFT
   - WebLogic
   - Postfix
@@ -1020,6 +1049,8 @@ M365系:
   - "Exchange Online"
 
 Google系:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - AppSheet
   - GoogleApps
   - GoogleWorkspace
   - "Google Workspace"
@@ -1044,6 +1075,11 @@ CMS系:
 
 #分類不可の為
 その他:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - OpenAPI
+  - MFC
+  - "Win32 API"
+  - Doxygen
   - SVFCloud
   - Solidity
   - GPU負荷軽減
