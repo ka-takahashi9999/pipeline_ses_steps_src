@@ -42,6 +42,49 @@ def _load_required_match_module():
 
 
 class Check04RequiredOptionalTest(unittest.TestCase):
+    def test_required_state_one_shot_optional_lines(self):
+        required, optional = extractor.rule_extract_skills(
+            """必須スキル
+・Java開発経験
+尚可 ・基本設計
+※リーダー経験があれば尚可
+(CloudFormation経験もあると尚可)
+・SQL経験
+"""
+        )
+        self.assertEqual(
+            [item["skill"] for item in required],
+            ["Java開発経験", "SQL経験"],
+        )
+        self.assertEqual(
+            [item["skill"] for item in optional],
+            [
+                "基本設計",
+                "リーダー経験があれば尚可",
+                "(CloudFormation経験もあると尚可)",
+            ],
+        )
+
+    def test_parenthetical_optional_modifier_stays_required(self):
+        required, optional = extractor.rule_extract_skills(
+            """必須スキル
+・性能試験の経験(Linuxであれば尚可)
+・Java経験(AWS経験があれば尚可)
+・(補足) Java経験(AWS経験があれば尚可)
+・通常のrequired行
+"""
+        )
+        self.assertEqual(
+            [item["skill"] for item in required],
+            [
+                "性能試験の経験(Linuxであれば尚可)",
+                "Java経験(AWS経験があれば尚可)",
+                "(補足) Java経験(AWS経験があれば尚可)",
+                "通常のrequired行",
+            ],
+        )
+        self.assertEqual(optional, [])
+
     def test_decorated_required_optional_headers_with_response_suffix(self):
         cases = {
             "《必須スキル》": "required_header",

@@ -193,6 +193,8 @@
 
 インフラ:
   # DICT-02（2026-11-06 skill confirmation unit）
+  - IP-PBX
+  - CTI
   - 無線LANアクセスポイント
   - KornShell
   - "HPE ProLiant"
@@ -414,6 +416,8 @@
 
 クラウドサービス:
   # DICT-02（2026-11-06 skill confirmation unit）
+  - V-ONEクラウド
+  - "Apple Business Manager"
   - "Azure Arc"
   - Amazon Connect
   - CloudFront
@@ -445,6 +449,7 @@
 
 DB:
   # DICT-02（2026-11-06 skill confirmation unit）
+  - SQLAlchemy
   - SSIS
   - SSAS
   - "SQL Server"
@@ -509,6 +514,8 @@ DB:
   - Aurora
 
 モバイル:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - RxAndroid
   - iOS
   - Android
   - Swift
@@ -587,6 +594,10 @@ DB:
 
 データ分析:
   # DICT-02（2026-11-06 skill confirmation unit）
+  - Polars
+  - "Treasure Data"
+  - PlazmaDB
+  - Digdag
   - Informatica
   - Redash
   - QuickSight
@@ -687,6 +698,12 @@ AI:
   - Kiro
 
 セキュリティ:
+  # DICT-02（2026-11-06 skill confirmation unit）
+  - i-FILTER
+  - SSO
+  - DLP
+  - APIセキュリティ
+  - Logstorage
   - IDS/IPS
   - Prisma Access
   - OAuth
@@ -792,6 +809,8 @@ AI:
 
 組み込み:
   # DICT-02（2026-11-06 skill confirmation unit）
+  - CAPL
+  - MPLAB
   - CANalyzer
   - "C++"
   - RTOS

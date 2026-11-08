@@ -954,6 +954,25 @@ ADJACENT_SKILLSHEET_CONTEXT_KEYWORDS = (
     "技術経歴書",
 )
 ADJACENT_SKILLSHEET_CONTEXT_WINDOW = 50
+RAW_ONLY_SKILLSHEET_CONTEXT_KEYWORDS = tuple(dict.fromkeys(
+    URL_CONTEXT_POSITIVE_KEYWORDS
+    + ADJACENT_SKILLSHEET_CONTEXT_KEYWORDS
+    + ("Resume",)
+))
+RAW_ONLY_NEGATIVE_CONTEXT_KEYWORDS = tuple(dict.fromkeys(
+    URL_CONTEXT_NEGATIVE_KEYWORDS
+    + HTML_LINK_NEGATIVE_KEYWORDS
+    + (
+        "会社案内",
+        "ホームページ",
+        "会社サイト",
+        "広告",
+        "portal",
+        "一覧表",
+        "営業リスト",
+        "unsubscribe",
+    )
+))
 GENERIC_HTML_ANCHOR_TEXTS = {
     "こちら",
     "詳細",
@@ -1064,6 +1083,41 @@ def extract_auxiliary_hrefs_from_html_links(
     return auxiliary_hrefs
 
 
+def is_safe_raw_only_skillsheet_url(body_text: str, url: str) -> bool:
+    """cleanupで落ちたURLのうち、明示的な個人資料候補だけを救済する。"""
+    if classify_url_candidate(url) not in HIGH_CONFIDENCE_URL_CATEGORIES:
+        return False
+    if is_contextual_anchor_url_excluded(url):
+        return False
+
+    normalized_body = unicodedata.normalize("NFKC", body_text or "")
+    normalized_url = unicodedata.normalize("NFKC", url or "")
+    start = 0
+    while normalized_url:
+        index = normalized_body.find(normalized_url, start)
+        if index < 0:
+            break
+        window_start = max(0, index - 100)
+        line_end = normalized_body.find("\n", index + len(normalized_url))
+        window_end = len(normalized_body) if line_end < 0 else line_end
+        context = (
+            normalized_body[window_start:index]
+            + normalized_body[index + len(normalized_url):window_end]
+        ).casefold()
+        has_positive = any(
+            keyword.casefold() in context
+            for keyword in RAW_ONLY_SKILLSHEET_CONTEXT_KEYWORDS
+        )
+        has_negative = any(
+            keyword.casefold() in context
+            for keyword in RAW_ONLY_NEGATIVE_CONTEXT_KEYWORDS
+        )
+        if has_positive and not has_negative:
+            return True
+        start = index + len(normalized_url)
+    return False
+
+
 def extract_skillsheet_urls_from_html_links(
     mail_record: Optional[Dict[str, Any]],
     excluded_urls: Optional[Set[str]] = None,
@@ -1098,7 +1152,18 @@ def build_url_candidates(
     raw_body_text = (mail_record or {}).get("body_text", "") or ""
     raw_body_urls = extract_urls_from_text(raw_body_text)
     removed_body_urls = set(raw_body_urls) - set(body_urls)
-    auxiliary_hrefs = removed_body_urls | extract_auxiliary_hrefs_from_html_links(mail_record)
+    explicit_auxiliary_hrefs = extract_auxiliary_hrefs_from_html_links(mail_record)
+    rescued_raw_urls = [
+        url
+        for url in raw_body_urls
+        if url in removed_body_urls
+        and url not in explicit_auxiliary_hrefs
+        and is_safe_raw_only_skillsheet_url(raw_body_text, url)
+    ]
+    rescued_raw_url_set = set(rescued_raw_urls)
+    auxiliary_hrefs = (
+        (removed_body_urls - rescued_raw_url_set) | explicit_auxiliary_hrefs
+    )
     html_urls = extract_skillsheet_urls_from_html_links(mail_record, auxiliary_hrefs)
     eligible_body_urls = [url for url in body_urls if url not in auxiliary_hrefs]
 
@@ -1107,6 +1172,7 @@ def build_url_candidates(
     has_high_confidence_candidate = (
         any(is_eligible_attachment(att) for att in (mail_record or {}).get("attachments") or [])
         or bool(html_urls)
+        or bool(rescued_raw_urls)
         or any(
             classify_url_candidate(url) in HIGH_CONFIDENCE_URL_CATEGORIES
             for url in eligible_body_urls
@@ -1127,13 +1193,19 @@ def build_url_candidates(
         seen.add(url)
         ordered.append((url, classify_url_candidate(url)))
 
+    for url in rescued_raw_urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        ordered.append((url, classify_url_candidate(url)))
+
     for url, category in sort_urls_by_priority(eligible_body_urls, body_text):
         if url in seen:
             continue
         seen.add(url)
         ordered.append((url, category))
 
-    return ordered, html_urls, eligible_body_urls
+    return ordered, html_urls, rescued_raw_urls + eligible_body_urls
 
 
 def detect_ooxml_attachment_type(attachment: Dict[str, Any]) -> Optional[str]:

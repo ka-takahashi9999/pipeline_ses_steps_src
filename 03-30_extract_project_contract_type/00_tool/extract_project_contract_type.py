@@ -55,11 +55,24 @@ EXCLUDED_LINE_PATTERNS = [
     re.compile(r"有料職業紹介事業"),
 ]
 
-QUASI_MANDATE_PATTERNS = [
+EXPLICIT_MULTI_OPTION_PATTERNS = [
+    # 同一contract field内で、契約種別が明示的に列挙されている表記。
+    # 2語が別行・別sectionにあるだけのケースや「応相談」等は対象にしない。
+    re.compile(r"派遣(?:契約)?\s*[,、・]\s*準委任(?:契約)?(?=$|\s|[)\]】])"),
+    re.compile(r"準委任(?:契約)?\s*[,、・]\s*派遣(?:契約)?(?=$|\s|[)\]】])"),
+    re.compile(r"準委任(?:契約)?\s*\(\s*派遣(?:契約)?\s*でも可\s*\)"),
     re.compile(r"派遣\s*(?:または|or|/|／)\s*準委任"),
     re.compile(r"準委任\s*(?:または|or|/|／)\s*派遣"),
     re.compile(r"契約(?:形態)?\s*[:：]\s*派遣\s*(?:または|or|/|／)\s*準委任"),
     re.compile(r"契約(?:形態)?\s*[:：]\s*準委任\s*(?:または|or|/|／)\s*派遣"),
+]
+
+MULTI_OPTION_VETO_PATTERNS = [
+    re.compile(r"原則\s*派遣"),
+    re.compile(r"派遣\s*優先"),
+    re.compile(
+        r"準委任(?:契約)?\s*(?:不可|NG|は\s*応相談|検討可|の\s*可能性あり)"
+    ),
 ]
 
 DISPATCH_PATTERNS = [
@@ -104,10 +117,21 @@ def _find_first_match(lines: List[str], patterns: List[re.Pattern]) -> Optional[
     return None
 
 
+def _find_explicit_multi_option(lines: List[str]) -> Optional[str]:
+    for line in lines:
+        if _is_excluded_line(line):
+            continue
+        if any(pattern.search(line) for pattern in MULTI_OPTION_VETO_PATTERNS):
+            continue
+        if any(pattern.search(line) for pattern in EXPLICIT_MULTI_OPTION_PATTERNS):
+            return line
+    return None
+
+
 def detect_contract_type(body_text: str) -> Tuple[str, str, Optional[str]]:
     lines = _iter_candidate_lines(body_text)
 
-    quasi_line = _find_first_match(lines, QUASI_MANDATE_PATTERNS)
+    quasi_line = _find_explicit_multi_option(lines)
     if quasi_line:
         return "quasi_mandate", "extracted", quasi_line
 

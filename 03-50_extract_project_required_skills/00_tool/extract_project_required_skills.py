@@ -1146,6 +1146,50 @@ _DESIRABLE_RE = re.compile(
     r'.{3,}(?:だと望ましい|が望ましい|であることが望ましい|であれば尚可|あると望ましい)'
 )
 
+# required section内で行全体がoptionalとして完結する場合だけ、one-shotで振り分ける。
+# required主節の括弧内modifier（例: Java経験(AWS経験があれば尚可)）は対象外。
+_REQUIRED_ONE_SHOT_OPTIONAL_RE = re.compile(
+    r'^(?:尚\s*可\s*[・]\s*(?P<prefix>.+\S)'
+    r'|(?P<suffix>.+?(?:あれば|あると)尚可[。.]?))$'
+)
+
+
+def _required_one_shot_optional_skill(text: str) -> str:
+    """required stateを維持したまま、行全体optionalのskillだけを返す。"""
+    skill_text = _strip_bullet(text).strip()
+    candidate = _n(skill_text)
+    if candidate.startswith('(') and candidate.endswith(')'):
+        depth = 0
+        fully_parenthesized = True
+        for index, char in enumerate(candidate):
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0 and index != len(candidate) - 1:
+                    fully_parenthesized = False
+                    break
+        if fully_parenthesized and depth == 0:
+            candidate = candidate[1:-1].strip()
+
+    match = _REQUIRED_ONE_SHOT_OPTIONAL_RE.fullmatch(candidate)
+    if not match:
+        return ''
+    if match.group('prefix'):
+        return _strip_bullet(match.group('prefix')).strip()
+
+    marker_start = min(
+        index for index in (
+            candidate.find('あれば尚可'),
+            candidate.find('あると尚可'),
+        ) if index >= 0
+    )
+    prefix = candidate[:marker_start]
+    depth = prefix.count('(') - prefix.count(')')
+    if depth > 0:
+        return ''
+    return skill_text
+
 
 def _make_skill(text: str) -> Dict[str, Any]:
     return {"skill": text, "match": None, "note": None}
@@ -1546,6 +1590,12 @@ def rule_extract_skills(body: str) -> Tuple[List[Dict], List[Dict]]:
                 pseudo_parent_header = ''
                 continue
             # ──────────────────────────────────────────────────────────────
+            if state == STATE_REQUIRED:
+                optional_skill = _required_one_shot_optional_skill(line)
+                if optional_skill:
+                    optional.append(optional_skill)
+                    pseudo_parent_header = ''
+                    continue
             indented = _has_leading_indent(raw_line)
             if not _is_skill_line(line, in_section=True, indented=indented):
                 if not _is_pseudo_context_child_line(line, pseudo_parent_header):

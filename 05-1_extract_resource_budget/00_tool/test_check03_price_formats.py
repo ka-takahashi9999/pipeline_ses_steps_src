@@ -7,6 +7,76 @@ import extract_resource_budget as target
 
 
 class Check03ResourcePriceFormatsTest(unittest.TestCase):
+    def test_labeled_bare_comma_monthly_with_trailing_hyphen(self):
+        cases = (
+            "月 額:750,000-",
+            "月額：750,000-",
+            "単価:750,000-",
+            "単 価：７５０，０００－",
+            "■単金■\n750,000-",
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                result = target.rule_extract(body)
+                self.assertEqual(result[:3], (750000, None, None))
+                self.assertEqual(
+                    result[3], "labeled-comma-yen-trailing-hyphen"
+                )
+                self.assertEqual(result[4], "750,000-")
+
+    def test_new_scalar_rule_rejects_ambiguous_or_non_monthly_values(self):
+        cases = (
+            "750,000-",
+            "時給:750,000-",
+            "日給:750,000-",
+            "単価:750,000-850,000",
+            "単価:750,000～850,000",
+            "単価:750,000- / 予算:850,000-",
+            "単価:62",
+            "時給:65万円",
+            "年齢:45歳",
+            "精算幅:140-180h",
+            "稼働率:80%",
+            "人数:3名",
+            "勤務時間:9:00-18:00",
+            "電話番号:03-7500-0000",
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    target._bare_comma_monthly_labeled(target._n(body))
+                )
+
+        # 既存のclosed rangeは新ruleでscalar化せず、従来どおり保持する。
+        self.assertEqual(
+            target.rule_extract("単価:750,000-850,000")[:3],
+            (800000, 750000, 850000),
+        )
+
+        for body in (
+            "時給単価:750,000-",
+            "時給 単価:750,000-",
+            "日給単価:750,000-",
+            "日給 単価:750,000-",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(target.rule_extract(body)[0])
+
+    def test_existing_scalar_range_and_billing_units_are_preserved(self):
+        cases = {
+            "単価:750,000円": (750000, None, None),
+            "単価:¥750,000": (750000, None, None),
+            "単価:650,000-850,000円/月": (750000, 650000, 850000),
+            "単価:〜75万円": (750000, None, 750000),
+            "単価:75万円〜": (750000, 750000, None),
+            "単価:時給4,000円": (640000, None, None),
+            "単価:日給11,000円": (220000, None, None),
+            "単価:750,000円（税別）": (750000, None, None),
+        }
+        for body, expected in cases.items():
+            with self.subTest(body=body):
+                self.assertEqual(target.rule_extract(body)[:3], expected)
+
     def test_limited_new_monthly_formats(self):
         cases = {
             r"月額：\620,000-": (620000, None, None),

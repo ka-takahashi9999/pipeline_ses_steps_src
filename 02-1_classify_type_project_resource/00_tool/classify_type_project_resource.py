@@ -310,30 +310,37 @@ _PROJECT_STRUCT_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
 ]]
 
 # 要員単人構造ラベル: 4種類以上ヒット → resource 確定
-# 個人プロフィール行（氏名:, 【氏名】, 年齢:, 【年齢】, 所属:等）が4つ以上
+# 個人プロフィール行（氏名:, 【氏名】, 〔氏名〕, 年齢:, 所属:等）が4つ以上
 # = 要員紹介メール固有の構造
 _RESOURCE_LABEL_HORIZONTAL_SPACE = r'[ \t\u3000]*'
+
+
+def _decorated_resource_profile_label(label_pattern: str) -> str:
+    """既存profile labelの安全な同義括弧装飾を返す。"""
+    return rf'(?:【{label_pattern}】|〔{label_pattern}〕)'
+
+
 _RESOURCE_SINGLE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     rf'氏名{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【氏名[】]',
+    _decorated_resource_profile_label(r'氏名'),
     rf'年齢{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【年齢[】]',
+    _decorated_resource_profile_label(r'年齢'),
     rf'所属{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【所属[】]',
+    _decorated_resource_profile_label(r'所属'),
     rf'最寄.{{0,1}}駅{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「最寄駅：」「最寄り駅：」両方に対応
-    r'【最寄.{0,2}[】]',
+    _decorated_resource_profile_label(r'最寄.{0,2}'),
     rf'入場日{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【入場日[】]',
+    _decorated_resource_profile_label(r'入場日'),
     rf'単金{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【単金[】]',
+    _decorated_resource_profile_label(r'単金'),
     rf'単価{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「単価：80万」形式（括弧なし）
-    r'【単価[】]',
+    _decorated_resource_profile_label(r'単価'),
     rf'名前{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「名前：Y.T」形式（氏名の代替）
-    r'【名前[】]',
+    _decorated_resource_profile_label(r'名前'),
     rf'稼働{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',  # 「稼働：4月～」形式
     rf'稼動{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【稼働[】]',
-    r'【稼動[】]',
+    _decorated_resource_profile_label(r'稼働'),
+    _decorated_resource_profile_label(r'稼動'),
     rf'イニシャル{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
 ]]
 
@@ -350,13 +357,13 @@ _RESOURCE_IDENTITY_LABEL_RES: List[re.Pattern] = (
 # 強いresource提示signalとのAND条件でのみ使用する。
 _RESOURCE_AUX_PROFILE_LABEL_RES: List[re.Pattern] = [re.compile(p) for p in [
     rf'場所{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【場所[】]',
+    _decorated_resource_profile_label(r'場所'),
     rf'所在地{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【所在地[】]',
+    _decorated_resource_profile_label(r'所在地'),
     rf'時期{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【時期[】]',
+    _decorated_resource_profile_label(r'時期'),
     rf'稼働開始{_RESOURCE_LABEL_HORIZONTAL_SPACE}[：:]',
-    r'【稼働開始[】]',
+    _decorated_resource_profile_label(r'稼働開始'),
 ]]
 
 # 「要員募集」等の案件件名を拾わないよう、【…要員】で閉じる件名と
@@ -552,7 +559,7 @@ def rule_classify(
         return "resource", 0.9, []
 
     # 要員単人構造ラベル（4種類以上 = resource確定）
-    # 氏名：, 【氏名】, 年齢：, 【年齢】, 所属：, 【所属】 等が4つ以上 = 要員プロフィール
+    # 氏名：, 【氏名】, 〔氏名〕, 年齢：, 所属： 等が4つ以上 = 要員プロフィール
     res_struct = sum(1 for p in _RESOURCE_SINGLE_LABEL_RES if p.search(body_cjk))
     proj_struct = sum(1 for p in _PROJECT_STRUCT_LABEL_RES if p.search(body_cjk))
     has_resource_identity = any(

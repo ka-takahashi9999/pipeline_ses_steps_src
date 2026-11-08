@@ -399,6 +399,12 @@ _COUNTED_PROJECT_SUBJECT_PROJECT_COUNT_RE = re.compile(
     r"(?:(?:が[ \t]*)?(?:動いて(?:います|おります)|あります|ございます)|"
     r"(?:を[ \t]*)?ご紹介(?:いた)?します)"
 )
+# 「6案件／...」「6案件 ...」はsubject単独では除外せず、完全block数との
+# 一致確認にだけ使用する。
+_COUNTED_PROJECT_SUBJECT_BARE_PROJECT_COUNT_RE = re.compile(
+    r"(?<![0-9])(?P<count>(?:[2-9]|[1-9][0-9]+))[ \t]*案件"
+    r"(?=$|[ \t/／:：,，、・｜|【\[(（])"
+)
 _COUNTED_PROJECT_BLOCK_HEADER_RE = re.compile(
     r"(?m)^[ \t]*■[ \t]*案件名[ \t]*[:：]"
 )
@@ -419,6 +425,41 @@ _FLEX_PROJECT_NAME_BLOCK_HEADER_RE = re.compile(
     r"■[ \t]*案件名[ \t]*(?:■|[:：])?[ \t]*(?P<boxed_title>[^\n]*)|"
     r"案[ \t]*件(?:[ \t]*名)?[ \t]*[:：][ \t]*(?P<plain_title>[^\n]+)"
     r")[ \t]*$"
+)
+_COUNTED_BOXED_PROJECT_NAME_BLOCK_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*【案件名】[ \t]*(?P<title>[^\n]*)$"
+)
+_COUNTED_BOXED_PROJECT_CONTENT_RE = re.compile(
+    r"(?im)^[ \t]*【(?:案件概要|概要|業務内容|作業内容)】"
+)
+_COUNTED_BOXED_PROJECT_RATE_RE = re.compile(
+    r"(?im)^[ \t]*【単[ \t]*(?:価|金)】"
+)
+_COUNTED_BOXED_PROJECT_OTHER_ATTRIBUTE_RES = (
+    ("location", re.compile(
+        r"(?im)^[ \t]*【(?:場所|勤務地|勤務場所|作業場所|就業場所)】"
+    )),
+    ("period", re.compile(
+        r"(?im)^[ \t]*【(?:期間|時期|開始時期)】"
+    )),
+    ("skill", re.compile(
+        r"(?im)^[ \t]*【(?:スキル|必須スキル|必須要件|要望スキル)】"
+    )),
+    ("commercial_flow", re.compile(
+        r"(?im)^[ \t]*【(?:商流|商流制限)】"
+    )),
+    ("remote", re.compile(
+        r"(?im)^[ \t]*【(?:リモート|勤務形態|作業形態|勤務方式)】"
+    )),
+    ("settlement", re.compile(
+        r"(?im)^[ \t]*【(?:精算|精算幅)】"
+    )),
+    ("interview", re.compile(
+        r"(?im)^[ \t]*【(?:面談|面接|面談回数)】"
+    )),
+    ("contract", re.compile(
+        r"(?im)^[ \t]*【(?:契約|契約形態)】"
+    )),
 )
 _COMPLETE_NAMED_PROJECT_CONTENT_RE = re.compile(
     r"(?im)^[ \t]*(?:"
@@ -672,6 +713,68 @@ def _complete_distinct_named_project_block_titles(
     return titles
 
 
+def _complete_counted_boxed_project_block_titles(body: str) -> List[str]:
+    """件数一致判定用に、完全な`【案件名】` blockの異なる名称を返す。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+    headers = list(_COUNTED_BOXED_PROJECT_NAME_BLOCK_HEADER_RE.finditer(normalized_body))
+    if len(headers) < 2:
+        return []
+
+    titles = []
+    normalized_titles = []
+    existing_attribute_keys = (
+        "location", "period", "skill", "interview", "recruitment", "other"
+    )
+    for index, header in enumerate(headers):
+        block_end = headers[index + 1].start() if index + 1 < len(headers) else len(normalized_body)
+        block = normalized_body[header.start():block_end]
+
+        title = (header.group("title") or "").strip()
+        if not title:
+            following_lines = [
+                line.strip()
+                for line in normalized_body[header.end():block_end].splitlines()
+                if line.strip()
+            ]
+            if not following_lines or following_lines[0].startswith(("【", "■")):
+                return []
+            title = following_lines[0]
+
+        has_content = bool(
+            _COMPLETE_NAMED_PROJECT_CONTENT_RE.search(block)
+            or _COUNTED_BOXED_PROJECT_CONTENT_RE.search(block)
+        )
+        has_rate = bool(
+            _COMPLETE_NAMED_PROJECT_RATE_RE.search(block)
+            or _COUNTED_BOXED_PROJECT_RATE_RE.search(block)
+        )
+        attribute_keys = {
+            key
+            for key, pattern in zip(
+                existing_attribute_keys,
+                _COMPLETE_NAMED_PROJECT_OTHER_ATTRIBUTE_RES,
+            )
+            if pattern.search(block)
+        }
+        attribute_keys.update(
+            key
+            for key, pattern in _COUNTED_BOXED_PROJECT_OTHER_ATTRIBUTE_RES
+            if pattern.search(block)
+        )
+        if not (has_content and has_rate and len(attribute_keys) >= 2):
+            return []
+
+        normalized_title = re.sub(r"[ \t]+", "", title).lower()
+        if not normalized_title:
+            return []
+        titles.append(title)
+        normalized_titles.append(normalized_title)
+
+    if len(set(normalized_titles)) != len(normalized_titles):
+        return []
+    return titles
+
+
 def _has_counted_complete_project_blocks(subject: str, body: str) -> bool:
     """明示案件数と完全な案件block数が一致する場合だけTrue。"""
     normalized_subject = unicodedata.normalize("NFKC", subject)
@@ -688,22 +791,38 @@ def _has_counted_complete_project_blocks(subject: str, body: str) -> bool:
             explicit_project_count_text
         )
     )
-    if len(subject_counts) != 1:
+    if len(subject_counts) == 1:
+        expected_count = next(iter(subject_counts))
+
+        blocks = _COUNTED_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
+        if len(blocks) == expected_count and all(
+            all(pattern.search(block) for pattern in _COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES)
+            for block in blocks
+        ):
+            return True
+
+        # 既存の明示件数と、表記差を含む完全block数が一致する場合だけ補完。
+        titles = _complete_distinct_named_project_block_titles(
+            normalized_body, _FLEX_PROJECT_NAME_BLOCK_HEADER_RE
+        )
+        if len(titles) == expected_count:
+            return True
+
+    # `【案件名】` fallbackは、subject自身の一意なN案件だけをcount根拠にする。
+    # 既存のsubject N件やbody内N案件は、この新経路へ流用しない。
+    boxed_subject_counts = {
+        int(match.group("count"))
+        for pattern in (
+            _COUNTED_PROJECT_SUBJECT_PROJECT_COUNT_RE,
+            _COUNTED_PROJECT_SUBJECT_BARE_PROJECT_COUNT_RE,
+        )
+        for match in pattern.finditer(normalized_subject)
+    }
+    if len(boxed_subject_counts) != 1:
         return False
-    expected_count = next(iter(subject_counts))
-
-    blocks = _COUNTED_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
-    if len(blocks) == expected_count and all(
-        all(pattern.search(block) for pattern in _COUNTED_PROJECT_BLOCK_REQUIRED_LABEL_RES)
-        for block in blocks
-    ):
-        return True
-
-    # 明示件数と、表記差を含む完全block数が一致する場合だけ補完。
-    titles = _complete_distinct_named_project_block_titles(
-        normalized_body, _FLEX_PROJECT_NAME_BLOCK_HEADER_RE
-    )
-    return len(titles) == expected_count
+    expected_boxed_count = next(iter(boxed_subject_counts))
+    boxed_titles = _complete_counted_boxed_project_block_titles(normalized_body)
+    return len(boxed_titles) == expected_boxed_count
 
 
 def _complete_resource_profile_block_count(body: str) -> int:

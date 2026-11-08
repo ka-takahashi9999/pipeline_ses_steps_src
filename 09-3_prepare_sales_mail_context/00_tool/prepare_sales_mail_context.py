@@ -79,6 +79,20 @@ PAIR_TYPE = "project_resource"
 OUTPUT_FILE_TEMPLATE = "prepare_sales_mail_context_{date}.jsonl"
 MAX_QUOTE_LENGTH = 1600
 MAX_SUMMARY_LENGTH = 240
+PHASE_DISPLAY_ORDER = (
+    "要件調査",
+    "要件定義",
+    "基本設計",
+    "詳細設計",
+    "設計・構築",
+    "開発",
+    "製造",
+    "テスト",
+    "移行",
+    "リリース",
+    "運用保守",
+    "PMO",
+)
 LABEL_DECORATION_PATTERN = r"[■◇●・\-*◎○〇◆▼□]"
 LABEL_OPEN_PATTERN = r"(?:【|\[)?"
 LABEL_CLOSE_PATTERN = r"(?:】|\])?"
@@ -754,14 +768,28 @@ def format_interview_count(cleaned_body: str, record: Optional[Dict[str, Any]] =
     return None, "unavailable"
 
 
+def build_phase_display_view(phases: Optional[List[str]]) -> List[str]:
+    """営業表示用にphaseを重複排除し、既知順・unknown辞書順で返す。"""
+    unique_phases = {
+        phase for phase in (phases or []) if isinstance(phase, str) and phase
+    }
+    known = [phase for phase in PHASE_DISPLAY_ORDER if phase in unique_phases]
+    unknown = sorted(
+        phase for phase in unique_phases if phase not in PHASE_DISPLAY_ORDER
+    )
+    return known + unknown
+
+
 def summarize_resource_skills(skill_record: Optional[Dict[str, Any]], phase_record: Optional[Dict[str, Any]]) -> Tuple[Optional[str], str]:
     skills = skill_record.get("skills", []) if skill_record else []
-    phases = phase_record.get("phases", []) if phase_record else []
+    phases = build_phase_display_view(
+        phase_record.get("phases", []) if phase_record else []
+    )
     segments: List[str] = []
     if skills:
         segments.append("スキル: " + ", ".join(skills[:8]))
     if phases:
-        segments.append("工程: " + ", ".join(phases[:4]))
+        segments.append("工程: " + ", ".join(phases))
     summary = " / ".join(segments).strip()
     if summary:
         if len(summary) > MAX_SUMMARY_LENGTH:

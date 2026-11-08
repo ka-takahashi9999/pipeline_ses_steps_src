@@ -74,6 +74,14 @@ _PRICE_KW_RE = re.compile(
     r"|【稼働】|【希望】)"
 )
 
+# 通貨単位を省略した月額の帳票表記に使用する明示price label。
+# 【稼働】/【希望】や日給制は対象に含めず、月額・単価系のfieldだけに限定する。
+_MONTHLY_PRICE_LABEL_RE = re.compile(
+    r"(希望\s*単\s*価|希望\s*月\s*額|希望\s*報\s*酬|希望\s*金\s*額"
+    r"|人月単価|単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|フィー|予\s*算|費\s*用"
+    r"|【単価】|【単金】|【報酬】|【金額】|【希望単価】)"
+)
+
 # スキル見合い系
 _SKILL_RE = re.compile(
     r"スキル見合|スキルによ|スキル次第|経験見合|経験によ|能力次第"
@@ -147,6 +155,11 @@ RX_THOUSAND_YEN_FIELD_VALUE = re.compile(
 )
 RX_PRICE_FIELD_DECORATION_ONLY = re.compile(
     rf"^[{_PRICE_FIELD_DECORATION}]*$"
+)
+RX_BARE_COMMA_TRAILING_HYPHEN_VALUE = re.compile(
+    rf"^[{_PRICE_FIELD_DECORATION}]*"
+    r"(?P<raw>(?P<yen>" + _COMMA_YEN_INTEGER + r")\s*-)"
+    rf"[{_PRICE_FIELD_DECORATION}]*$"
 )
 
 # 時給・日給
@@ -416,6 +429,50 @@ def _thousand_yen_labeled(text: str) -> Optional[Tuple]:
     return value, None, None, "thousand-yen", match.group("raw")
 
 
+def _bare_comma_monthly_labeled(text: str) -> Optional[Tuple]:
+    """明示price field内の単一「750,000-」を月額として正規化する。"""
+    candidates = []
+    lines = text.splitlines()
+
+    for index, line in enumerate(lines):
+        for label_match in _MONTHLY_PRICE_LABEL_RE.finditer(line):
+            # 「時給単価」「日給 単価」内の単価は月額labelではない。
+            if re.search(r"(?:時給|日給)\s*$", line[:label_match.start()]):
+                continue
+            remainder = line[label_match.end():]
+            value_match = RX_BARE_COMMA_TRAILING_HYPHEN_VALUE.fullmatch(remainder)
+            field_text = line
+
+            if (value_match is None
+                    and RX_PRICE_FIELD_DECORATION_ONLY.fullmatch(remainder)
+                    and index + 1 < len(lines)):
+                field_text = lines[index + 1]
+                value_match = RX_BARE_COMMA_TRAILING_HYPHEN_VALUE.fullmatch(
+                    field_text
+                )
+
+            # field内に複数のカンマ金額があれば、後段label側だけを選ばない。
+            comma_amounts = re.findall(_COMMA_YEN_INTEGER, field_text)
+            if value_match is not None and len(comma_amounts) == 1:
+                candidates.append(value_match)
+
+    # 複数金額は選択せず、rangeや複数price fieldのscalar化を防ぐ。
+    if len(candidates) != 1:
+        return None
+
+    match = candidates[0]
+    value = _yen_to_int(match.group("yen"))
+    if not (_PRICE_MIN <= value <= _PRICE_MAX):
+        return None
+    return (
+        value,
+        None,
+        None,
+        "labeled-comma-yen-trailing-hyphen",
+        match.group("raw").strip(),
+    )
+
+
 def _fallback_start_date_slash_man(text: str) -> Optional[Tuple]:
     """価格キーワードなしの要員リスト形式から希望単価を抽出する。"""
     for line in text.splitlines():
@@ -482,6 +539,12 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int]
 
     # 千円表記は既存抽出を優先したうえで、明示価格欄だけを限定確認する。
     result = _thousand_yen_labeled(text)
+    if result:
+        price, p_min, p_max, reason, raw = result
+        return price, p_min, p_max, reason, raw
+
+    # 既存ruleで抽出できなかった明示月額fieldの「750,000-」だけを補完する。
+    result = _bare_comma_monthly_labeled(text)
     if result:
         price, p_min, p_max, reason, raw = result
         return price, p_min, p_max, reason, raw
