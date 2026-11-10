@@ -19,6 +19,7 @@ rotation時previous CURRENT snapshotを正本とする。
 """
 
 import json
+import importlib.util
 import re
 import sys
 from datetime import datetime
@@ -168,6 +169,55 @@ def main() -> None:
 
     # ⑥⑦: latest 80-9 summaryではなく、80-75実行時snapshotが正本。
     previous = summary.get("previous_current") or {}
+    manual_ok = False
+    if "manual_recovery" in summary:
+        try:
+            audit = summary["manual_recovery"]
+            baseline_kind = audit.get("previous_baseline_kind", "manual_receipt")
+            if baseline_kind == "verified_managed_publication":
+                context = audit.get("context") or {}
+                source_guard = audit.get("source_guard") or {}
+                manual_ok = (
+                    audit.get("verified") is True
+                    and audit.get("receipt") is None
+                    and audit.get("receipt_path") is None
+                    and summary.get("manual_lock_verified") is True
+                    and previous.get("run_date_source") == "env"
+                    and previous.get("run_id_source") == "env"
+                    and source_guard.get("enabled") is True
+                    and source_guard.get("eligible") is True
+                    and source_guard.get("target_run_date") == context.get("run_date")
+                    and source_guard.get("target_run_id") == context.get("run_id")
+                    and source_guard.get("failed_step")
+                    == f"80-7_manage_09_result_retention(RUN_DATE={context.get('run_date')})"
+                    and context.get("run_id") != context.get("recovery_id")
+                )
+                if not manual_ok:
+                    raise ValueError("managed previous baseline audit不一致")
+                lines.append("[OK] managed previous CURRENT / pre-publication source guard")
+            else:
+                path = project_root / "80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py"
+                spec = importlib.util.spec_from_file_location("receipt_confirm", path)
+                contract = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(contract)
+                _, publication, manifest = contract.validate_receipt_snapshot(audit["receipt"])
+                manual_ok = (
+                    audit.get("verified") is True
+                    and previous.get("run_id") == publication["run_id"]
+                    and previous.get("run_date") == publication["run_date"]
+                    and previous.get("run_id_source") == publication["run_id_source"]
+                    and previous.get("run_date_source") == publication["run_date_source"]
+                    and previous.get("file_count") == len(manifest)
+                    and previous.get("total_bytes") == sum(manifest.values())
+                    and (audit.get("context") is None or (
+                        summary.get("manual_lock_verified") is True
+                        and audit["context"]["run_id"] != audit["context"]["recovery_id"])))
+                if not manual_ok:
+                    raise ValueError("manual receipt audit不一致")
+                lines.append("[OK] manual recovery receipt snapshot/SHA-256/count/bytes")
+        except Exception as exc:
+            lines.append(f"[NG] manual recovery receipt: {exc}")
+            errors.append("manual recovery receipt")
     snapshot_files = previous.get("file_count")
     backup_files = verify.get("actual_file_count")
     verify_expected_files = verify.get("expected_file_count")
@@ -214,10 +264,10 @@ def main() -> None:
     elif not isinstance(run_id, str) or not RUN_ID_RE.match(run_id or ""):
         lines.append(f"[NG] previous CURRENTのrun_idが不正: {run_id!r}")
         errors.append("run_id")
-    elif previous.get("run_date_source") != "env":
+    elif previous.get("run_date_source") != "env" and not manual_ok:
         lines.append(f"[NG] previous CURRENTのrun_date_sourceが不正: {previous.get('run_date_source')!r}")
         errors.append("run_date source")
-    elif previous.get("run_id_source") != "env":
+    elif previous.get("run_id_source") != "env" and not manual_ok:
         lines.append(f"[NG] previous CURRENTのrun_id_sourceが不正: {previous.get('run_id_source')!r}")
         errors.append("run_id source")
     elif previous.get("destination") != EXPECTED_SOURCE_URI:

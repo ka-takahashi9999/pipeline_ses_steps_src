@@ -114,6 +114,57 @@ class TestManualReceipt(unittest.TestCase):
         self.assertEqual(self.s3.documents[self.key], self.failed)
         self.assertEqual(json.loads(self.path.read_text()), self.receipt)
 
+    def test_verified_managed_previous_baseline_rotation(self):
+        sync_dir = self.tmp / "managed-sync"
+        prepare_dir = self.tmp / "managed-prepare"
+        (sync_dir / "01_result").mkdir(parents=True)
+        (prepare_dir / "01_result").mkdir(parents=True)
+        manifest = prepare_dir / "01_result" / target.PREVIOUS_MANIFEST_FILENAME
+        manifest.write_text(self.manifest.read_text())
+        summary = fixtures.make_sync_summary(manifest_path=str(manifest))
+        (sync_dir / "01_result" / target.SYNC_SUMMARY_FILENAME).write_text(
+            json.dumps(summary)
+        )
+        args = self.args()
+        args.manual_recovery_receipt = None
+        args.manual_previous_managed = True
+        args.manual_prepublication_source = True
+        args.sync_dir = str(sync_dir)
+        args.prepare_dir = str(prepare_dir)
+        with patch.object(target, "build_s3_client", return_value=self.s3), \
+             patch.object(target, "build_stepfunctions_client", return_value=self.sfn), \
+             patch.object(target, "guard_manual_lock") as lock_guard, \
+             patch.object(target, "guard_pipeline_status", return_value={
+                 "status_key": self.key,
+                 "recovery": {
+                     "enabled": True,
+                     "eligible": True,
+                     "target_run_date": self.context["run_date"],
+                     "target_run_id": self.context["run_id"],
+                     "failed_step": (
+                         "80-7_manage_09_result_retention"
+                         f"(RUN_DATE={self.context['run_date']})"
+                     ),
+                 },
+             }), \
+             patch.object(target, "run_sync") as sync, patch.object(target.time, "sleep"):
+            result = target.run(args, self.logger)
+        self.assertTrue(result["verify"]["verified"])
+        self.assertEqual(
+            result["manual_recovery"]["previous_baseline_kind"],
+            "verified_managed_publication",
+        )
+        self.assertIsNone(result["manual_recovery"]["receipt_path"])
+        lock_guard.assert_called()
+        sync.assert_called_once()
+        output = self.tmp / "managed-baseline-summary.json"
+        confirm_result = self.tmp / "managed-baseline-confirm.txt"
+        output.write_text(json.dumps(result))
+        with patch.object(fixtures.confirm_target, "BACKUP_SUMMARY_PATH", output), \
+             patch.object(fixtures.confirm_target, "CONFIRM_RESULT", confirm_result):
+            fixtures.confirm_target.main()
+        self.assertIn("【結果】OK", confirm_result.read_text())
+
     def test_receipt_missing_rejected_before_sync(self):
         self.path.unlink()
         with self.assertRaises(Exception):

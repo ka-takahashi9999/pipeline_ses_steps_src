@@ -706,7 +706,12 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             raise SyncError("recovery IDは使用済みです")
         recovery_s3 = build_s3_client(region)
         recovery_sfn = recovery.build_stepfunctions_client(region)
-        recovery.guard_manual_lock(context, recovery_s3, recovery_sfn)
+        recovery.guard_manual_lock(
+            context,
+            recovery_s3,
+            recovery_sfn,
+            require_prepublication=getattr(args, "manual_prepublication_source", False),
+        )
         bk1_before = recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX)
 
     logger.info(f"同期先(lock済): {destination_uri} (region={region})")
@@ -789,7 +794,12 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         f"bytes={verify_result['actual_total_bytes']}"
     )
     if context is not None:
-        recovery.guard_manual_lock(context, recovery_s3, recovery_sfn)
+        recovery.guard_manual_lock(
+            context,
+            recovery_s3,
+            recovery_sfn,
+            require_prepublication=getattr(args, "manual_prepublication_source", False),
+        )
         if recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX) != bk1_before:
             raise SyncError("manual recovery公開中にBK1が変化しました")
         summary["publication_kind"] = "manual_recovery"

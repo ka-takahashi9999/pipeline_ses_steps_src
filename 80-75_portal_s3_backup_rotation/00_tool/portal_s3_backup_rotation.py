@@ -1999,6 +1999,16 @@ def add_manual_recovery_arguments(parser):
     parser.add_argument("--manual-source-run-id")
     parser.add_argument("--manual-source-run-date")
     parser.add_argument("--manual-source-execution-arn")
+    parser.add_argument(
+        "--manual-previous-managed",
+        action="store_true",
+        help="previous CURRENTが通常managed公開の場合に、verified summary/manifestをbaselineにする",
+    )
+    parser.add_argument(
+        "--manual-prepublication-source",
+        action="store_true",
+        help="元FAILED executionがpublication境界未到達であることを必須検証する",
+    )
 
 
 def manual_context(args):
@@ -2090,6 +2100,27 @@ def verify_manual_source(context, s3, sfn):
     if not events or events[-1]["type"] != "ExecutionFailed":
         raise RotationError("manual source FAILED historyが不完全です")
     return key, document
+
+
+def verify_manual_prepublication_source(context, s3, sfn):
+    """manual sourceが80-75より前で失敗し、publication未到達であることを検証する。"""
+    key, document = verify_manual_source(context, s3, sfn)
+    step_evidence = _validate_prepublication_step(document["current_step"])
+    events, history_pages = _get_execution_history(sfn, context["execution_arn"])
+    entered_states = [
+        event.get("stateEnteredEventDetails", {}).get("name")
+        for event in events
+        if isinstance(event.get("stateEnteredEventDetails"), dict)
+    ]
+    if PUBLICATION_BOUNDARY_STATE in entered_states:
+        raise RotationError("manual source executionはpublication境界へ到達済みです")
+    return key, document, {
+        **step_evidence,
+        "publication_boundary_state": PUBLICATION_BOUNDARY_STATE,
+        "publication_boundary_reached": False,
+        "history_pages_checked": history_pages,
+        "history_event_count": len(events),
+    }
 
 
 def validate_receipt_snapshot(receipt):
@@ -2229,7 +2260,7 @@ def finalize_manual_receipt(context, summary, manifest_path, s3, sfn):
     return path
 
 
-def guard_manual_lock(context, s3, sfn):
+def guard_manual_lock(context, s3, sfn, require_prepublication=False):
     """tailの共有lockを継承したprocessだけ許可。statusへの書込みはしない。"""
     lock = project_root / "00_pipeline/01_result/run_full_pipeline.lock"
     try:
@@ -2243,7 +2274,10 @@ def guard_manual_lock(context, s3, sfn):
     if os.environ.get("RUN_ID") != context["recovery_id"] or os.environ.get("RUN_DATE") != context["run_date"]:
         raise RotationError("manual recovery env identity不一致")
     guard_no_active_runs(s3, sfn, context["recovery_id"])
-    verify_manual_source(context, s3, sfn)
+    if require_prepublication:
+        verify_manual_prepublication_source(context, s3, sfn)
+    else:
+        verify_manual_source(context, s3, sfn)
 
 
 def guard_no_active_runs(s3, sfn, recovery_id=None):
@@ -2292,14 +2326,58 @@ def run_manual_rotation(args, logger):
             path = finalize_manual_receipt(context, summary, manifest, s3, sfn)
         return {"receipt_path": str(path), "publication_kind": "manual_recovery"}
     path = getattr(args, "manual_recovery_receipt", None)
-    if path is None:
-        raise RotationError("明示的なmanual recovery receiptが必要です")
-    receipt, provenance, status = verify_manual_receipt(path, s3, sfn)
+    previous_managed = getattr(args, "manual_previous_managed", False)
+    if path is not None and previous_managed:
+        raise RotationError("manual previous baselineのreceipt/managed同時指定はできません")
+    if path is None and not previous_managed:
+        raise RotationError("明示的なmanual recovery previous baselineが必要です")
+
+    receipt = None
+    if path is not None:
+        receipt, provenance, status = verify_manual_receipt(path, s3, sfn)
+    else:
+        if context is None:
+            raise RotationError("managed previous baselineにはmanual recovery contextが必要です")
+        guard_manual_lock(
+            context,
+            s3,
+            sfn,
+            require_prepublication=getattr(args, "manual_prepublication_source", False),
+        )
+        sync_dir = Path(args.sync_dir) if args.sync_dir else project_root / SYNC_STEP_DIR_NAME
+        prepare_dir = Path(args.prepare_dir) if args.prepare_dir else project_root / PREPARE_STEP_DIR_NAME
+        previous_summary = load_previous_sync_summary(
+            sync_dir / RESULT_DIR_NAME / SYNC_SUMMARY_FILENAME
+        )
+        provenance = validate_previous_sync_summary(previous_summary)
+        previous_manifest = prepare_dir / RESULT_DIR_NAME / PREVIOUS_MANIFEST_FILENAME
+        validate_recovery_manifest_reference(
+            previous_manifest, previous_summary.get("manifest_path")
+        )
+        manifest_inventory = load_recovery_manifest_inventory(previous_manifest)
+        status = guard_pipeline_status(
+            s3,
+            EXPECTED_BUCKET,
+            EXPECTED_BASE_PREFIX,
+            EXPECTED_STATUS_PREFIX,
+            provenance,
+            None,
+            logger,
+            recovery_target={"run_date": context["run_date"], "run_id": context["run_id"]},
+        )
+        current_inventory = complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX)
+        if {path: item["size"] for path, item in current_inventory.items()} != manifest_inventory:
+            raise RotationError("managed previous manifestとCURRENT実体が一致しません")
     execution_guard = None
     if context is not None:
         if receipt_path(context).parent.exists():
             raise RotationError("recovery IDは使用済みです")
-        guard_manual_lock(context, s3, sfn)
+        guard_manual_lock(
+            context,
+            s3,
+            sfn,
+            require_prepublication=getattr(args, "manual_prepublication_source", False),
+        )
     else:
         # 通常managed callerはenv/status/execution保護を維持。receiptはpreviousだけを承認。
         identity = resolve_current_managed_identity(args)
@@ -2323,7 +2401,9 @@ def run_manual_rotation(args, logger):
                 raise RotationError("receipt確定後に別runのstatusが更新されています")
     before = complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX)
     bk1 = complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX)
-    if before != receipt["current_fingerprint"] or bk1 != receipt["bk1_fingerprint"]:
+    if receipt is not None and (
+        before != receipt["current_fingerprint"] or bk1 != receipt["bk1_fingerprint"]
+    ):
         raise RotationError("rotation前にreceipt実体が変化しました")
     expected = {p: v["size"] for p, v in before.items()}
     summary = {"step": STEP_NAME, "operation": "rotation",
@@ -2334,8 +2414,16 @@ def run_manual_rotation(args, logger):
                "s3_destination_locked": True, "backup_status": "SUCCEEDED",
                "verify_wait_sec": wait, "wait_performed": False,
                "previous_current": {**provenance, **status},
-               "manual_recovery": {"receipt_path": str(path), "receipt": receipt,
-                                   "verified": True, "context": context},
+               "manual_recovery": {
+                   "previous_baseline_kind": (
+                       "manual_receipt" if receipt is not None else "verified_managed_publication"
+                   ),
+                   "receipt_path": str(path) if path is not None else None,
+                   "receipt": receipt,
+                   "verified": True,
+                   "context": context,
+                   "source_guard": status.get("recovery") if isinstance(status, dict) else None,
+               },
                "current_before": {"file_count": len(expected), "total_bytes": sum(expected.values())},
                "backup_before": {"file_count": len(bk1), "total_bytes": sum(v["size"] for v in bk1.values())},
                "expected_backup": {"file_count": len(expected), "total_bytes": sum(expected.values())}}

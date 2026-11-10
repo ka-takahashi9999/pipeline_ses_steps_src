@@ -13,7 +13,7 @@ production contract regression（(33)-(38)）:
 ⑥ 80-7 のlocal retentionが未変更であること
 ⑦ CURRENT destination / pipeline-status / pipeline-logs prefixが未変更であること
 ⑧ private mail master uploader が production wiring / file / config から削除済みであること
-⑨ 09-2 root ZIP writer が外部配布用の正式contractとしてcutover後も有効であること
+⑨ retired 09 producerとroot ZIPがactive runner / retention契約から外れていること
 ⑩ active runner が 80-75 rotation を通常経路で呼び出すこと（--bootstrapは使わない）
 
 full Pipeline実行・AWSアクセスは行わない。
@@ -23,7 +23,6 @@ full Pipeline実行・AWSアクセスは行わない。
 """
 
 import ast
-import hashlib
 import re
 import sys
 import unittest
@@ -54,18 +53,23 @@ NEW_STEPS = (
 ROTATION_STEP = "80-75_portal_s3_backup_rotation"
 ROTATION_SCRIPT = f"{ROTATION_STEP}/00_tool/portal_s3_backup_rotation.py"
 PRIVATE_UPLOADER = "01-1_fetch_gmail/00_tool/upload_mail_master_private_s3.py"
-ZIP_WRITER = SRC_ROOT / "09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py"
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class TestRunnerWiring(unittest.TestCase):
     def setUp(self):
         self.text = RUNNER.read_text(encoding="utf-8")
 
-    def test_runners_are_identical(self):
-        self.assertEqual(sha256(RUNNER), sha256(RUNNER_MASTER))
+    def test_runners_have_same_pipeline_body(self):
+        """runtime runner固有のlog rotation prologue以外のDAGを一致確認する。"""
+        runtime = RUNNER.read_text(encoding="utf-8")
+        prologue = (
+            'if [[ -z "${PIPELINE_LOG:-}" ]]; then\n'
+            '  python3 "$ROOT/00_pipeline/00_tool/manage_local_pipeline_retention.py" \\\n'
+            '    --rotate-log-only --apply\n'
+            'fi\n'
+        )
+        self.assertIn(prologue, runtime)
+        self.assertEqual(runtime.replace(prologue, "", 1), RUNNER_MASTER.read_text(encoding="utf-8"))
 
     def test_dictionary_suggestions_are_not_in_nightly_main_flow(self):
         self.assertNotIn("run_suggest_and_cleanup.sh", self.text)
@@ -200,22 +204,6 @@ class TestProductionContracts(unittest.TestCase):
         self.assertEqual(
             retention_targets,
             (
-                ("09-1_mail_display_format", "dir", r"^mail_display_format_(\d{8})$"),
-                (
-                    "09-2_extract_high_score_mail_display",
-                    "dir",
-                    r"^mail_display_extract_(\d{8})$",
-                ),
-                (
-                    "09-2_extract_high_score_mail_display",
-                    "file",
-                    r"^mail_display_extract_(\d{8})\.zip$",
-                ),
-                (
-                    "09-3_prepare_sales_proposal_input",
-                    "file",
-                    r"^proposal_input_(\d{8})\.jsonl$",
-                ),
                 (
                     "09-3_prepare_sales_mail_context",
                     "file",
@@ -285,11 +273,13 @@ class TestProductionContracts(unittest.TestCase):
                 "deleted_bytes",
                 "removed_dirs",
                 "delete_breakdown",
-                "root_zip",
+                "retired_artifacts_policy",
+                "retired_steps",
+                "retired_root_artifact",
             }.issubset(summary_keys)
         )
 
-    def test_33b_root_zip_rotation_is_in_production_code_path(self):
+    def test_33b_root_zip_is_outside_scheduled_retention_contract(self):
         retention = RETENTION_SCRIPT.read_text(encoding="utf-8")
         tree = ast.parse(retention)
         run_node = next(
@@ -302,14 +292,14 @@ class TestProductionContracts(unittest.TestCase):
             for node in ast.walk(run_node)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        self.assertIn("execute_root_distribution_zip_retention", run_calls)
+        self.assertNotIn("execute_root_distribution_zip_retention", run_calls)
 
         module_call_attributes = {
             node.func.attr
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
-        self.assertIn("delete_object", module_call_attributes)
+        self.assertNotIn("delete_object", module_call_attributes)
         self.assertNotIn("delete_objects", module_call_attributes)
         self.assertNotIn("aws s3 rm", retention)
         # 80-7はroot ZIPだけを削除可能。CURRENT/bk1へは関与しない。
@@ -335,21 +325,24 @@ class TestProductionContracts(unittest.TestCase):
             self.assertNotIn("private uploader", text)
             self.assertNotIn("private prefixへの二重保存", text)
 
-    # ---- (37) external distribution root ZIP contract --------------------
-    def test_37_root_zip_writer_is_permanent_external_distribution_contract(self):
-        source = ZIP_WRITER.read_text(encoding="utf-8")
-        self.assertIn("s3_client.upload_file(", source)
-        self.assertIn('S3_BUCKET = "technoverse"', source)
-        self.assertIn('S3_PREFIX = "pipeline_ses_steps"', source)
-        self.assertIn('s3_key = f"{S3_PREFIX}/{zip_path.name}"', source)
-        # local/CURRENT用ZIPとroot外部配布ZIPは同名の意図した二重配置。
-        self.assertIn('zip_path = STEP_DIR / "01_result"', source)
-        self.assertIn("local 01_result の ZIP は CURRENT mirror / SES Portal 用", source)
-        self.assertIn("S3 base prefix直下の", source)
-        self.assertIn(
-            "09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py",
-            self.text,
+    # ---- (37) retired producer contract ---------------------------------
+    def test_37_retired_sales_producers_are_not_active(self):
+        retired_markers = (
+            "09-1_mail_display_format/00_tool/",
+            "09-2_extract_high_score_mail_display/00_tool/",
+            "09-3_prepare_sales_proposal_input/00_tool/",
         )
+        for text in (self.text, RUNNER_MASTER.read_text(encoding="utf-8")):
+            for marker in retired_markers:
+                self.assertNotIn(marker, text)
+
+            active_positions = [
+                text.find("09-3_prepare_sales_mail_context/00_tool/"),
+                text.find("09-4_remove_category_mismatch_sales_candidates/00_tool/"),
+                text.find("09-5_generate_sales_reply_draft/00_tool/"),
+            ]
+            self.assertNotIn(-1, active_positions)
+            self.assertEqual(active_positions, sorted(active_positions))
 
     # ---- (38) active runner production path cutover ----------------------
     def test_38_runner_references_rotation_between_80_7_and_80_8(self):

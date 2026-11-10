@@ -2076,6 +2076,8 @@ if [[ "${FAIL_CALL_INDEX:-0}" == "$count" ]]; then exit 9; fi
         self.call_log = self.temp_path / "calls"
         self.env = {**os.environ, "PATH": str(self.temp_path) + ":" + os.environ["PATH"],
                     "RECOVERY_ID": "manual-fixture",
+                    "RECOVERY_SOURCE_RUN_DATE": "20260914",
+                    "RECOVERY_SOURCE_RUN_ID": "sfn-6e454f73-4f5c-46b4-bfa1-e3c633b52b3f",
                     "RECOVERY_SOURCE_EXECUTION_ARN": "fixture-arn",
                     "PREVIOUS_MANUAL_RECOVERY_RECEIPT": str(self.temp_path / "receipt.jsonl"),
                     "CALL_LOG": str(self.call_log)}
@@ -2093,19 +2095,26 @@ if [[ "${FAIL_CALL_INDEX:-0}" == "$count" ]]; then exit 9; fi
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.call_log.read_text().splitlines()
-        self.assertEqual(len(calls), 3)
-        for call, name in zip(calls, ("portal_s3_backup_rotation.py", "portal_s3_prepare.py", "portal_s3_sync.py")):
+        self.assertEqual(len(calls), 5)
+        for call, name in zip(calls, (
+            "portal_s3_backup_rotation.py",
+            "manage_09_result_retention.py",
+            "portal_s3_backup_rotation.py",
+            "portal_s3_prepare.py",
+            "portal_s3_sync.py",
+        )):
             self.assertIn(name, call)
-        self.assertNotIn("80-7_manage", self.original.read_text())
-        self.assertIn("--run-date 20260914", calls[1])
-        self.assertIn("--run-id manual-fixture", calls[1])
-        self.assertIn("sfn-6e454f73-4f5c-46b4-bfa1-e3c633b52b3f", calls[0])
-        self.assertIn("--prepare-dir " + str(self.root), calls[2])
+        self.assertIn("--dry-run", calls[0])
+        self.assertIn("--apply --run-date 20260914", calls[1])
+        self.assertIn("--run-date 20260914", calls[3])
+        self.assertIn("--run-id manual-fixture", calls[3])
+        self.assertIn("sfn-6e454f73-4f5c-46b4-bfa1-e3c633b52b3f", calls[2])
+        self.assertIn("--prepare-dir " + str(self.root), calls[4])
         self.assertFalse(list(self.root.rglob("status.json")))
         self.assertFalse(list(self.root.rglob("*08-5*")))
 
     def test_tail_runner_stops_at_each_failed_step(self):
-        for index in (1, 2, 3):
+        for index in (1, 2, 3, 4, 5):
             with self.subTest(index=index):
                 self.env["RECOVERY_ID"] = "manual-failure-" + str(index)
                 self.env["FAIL_CALL_INDEX"] = str(index)
@@ -2137,7 +2146,7 @@ if [[ "${FAIL_CALL_INDEX:-0}" == "$count" ]]; then exit 9; fi
     def test_tail_recovery_id_cannot_be_reused(self):
         self.assertEqual(self.invoke().returncode, 0)
         self.assertNotEqual(self.invoke().returncode, 0)
-        self.assertEqual(len(self.call_log.read_text().splitlines()), 3)
+        self.assertEqual(len(self.call_log.read_text().splitlines()), 5)
 
 
 # ---------------------------------------------------------------------------

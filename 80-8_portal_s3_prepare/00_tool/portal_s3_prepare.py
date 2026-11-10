@@ -75,6 +75,15 @@ SELF_STEP_DIRS: Tuple[str, ...] = (
 # Portal公開対象ではない検証専用step。01_result全体を除外する。
 NON_PUBLIC_STEP_DIRS: Tuple[str, ...] = ("99-1_multi_item_mail_lab",)
 
+# producer廃止済み。新規runのactive成果物とは扱わないが、CURRENT同期は
+# destinationの余剰objectを削除するため、既存historical Portal成果物の保護用に
+# manifestへ残す。ここから外す場合は別途migration契約が必要。
+HISTORICAL_RETIRED_STEP_DIRS: Tuple[str, ...] = (
+    "09-1_mail_display_format",
+    "09-2_extract_high_score_mail_display",
+    "09-3_prepare_sales_proposal_input",
+)
+
 EXCLUDE_BASENAMES: Tuple[str, ...] = (".gitkeep",)
 EXCLUDE_BASENAME_GLOBS: Tuple[str, ...] = ("*.bak_*",)
 
@@ -401,6 +410,10 @@ def run(args: argparse.Namespace, logger) -> Tuple[Dict[str, Any], List[Dict[str
         "pipeline_root": str(root),
         "selected_step_dirs": step_dirs,
         "selected_step_dir_count": len(step_dirs),
+        "historical_retired_step_dirs": [
+            step for step in HISTORICAL_RETIRED_STEP_DIRS if step in step_dirs
+        ],
+        "historical_retired_policy": "preserve_in_manifest_not_active_producer",
         "file_count": len(entries),
         "total_bytes": total_bytes,
         "excluded_counts": excluded_counts,

@@ -334,6 +334,22 @@ class TestPositiveSelection(PrepareTestBase):
             self.assertNotIn(name, summary["selected_step_dirs"])
         for name in target.NON_PUBLIC_STEP_DIRS:
             self.assertNotIn(name, summary["selected_step_dirs"])
+        self.assertEqual(
+            target.HISTORICAL_RETIRED_STEP_DIRS,
+            (
+                "09-1_mail_display_format",
+                "09-2_extract_high_score_mail_display",
+                "09-3_prepare_sales_proposal_input",
+            ),
+        )
+        self.assertEqual(
+            summary["historical_retired_policy"],
+            "preserve_in_manifest_not_active_producer",
+        )
+        self.assertEqual(
+            summary["historical_retired_step_dirs"],
+            ["09-1_mail_display_format"],
+        )
 
     def test_summary_keeps_manifest_provenance(self):
         args = self.make_args()

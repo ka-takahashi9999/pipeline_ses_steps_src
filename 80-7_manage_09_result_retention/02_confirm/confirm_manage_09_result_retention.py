@@ -7,7 +7,7 @@
 ③ 保持RUN_DATEの成果物が実際に残っている
 ④ HOLD対象（error_*.log 等の運用ログ）が維持されている
 ⑤ summaryの件数整合（breakdown合計 = planned / apply時は deleted = planned）
-⑥ root ZIPのcurrent / previous successfulが残存し、apply後のold canonicalが0件
+⑥ retired 09成果物とroot ZIPがscheduled retention対象外であること
 
 AWS APIは再実行せず、80-7 summaryとローカル状態のみで確認する。
 """
@@ -55,7 +55,6 @@ def main() -> None:
     current = summary.get("current_run_date")
     previous = summary.get("previous_successful_run_date")
     keep = summary.get("keep_run_dates") or []
-    root_zip_only = summary.get("root_zip_only") is True
     lines.append(f"[INFO] mode={mode}")
     lines.append(f"[INFO] current_run_date={current}")
     lines.append(f"[INFO] previous_successful_run_date={previous}")
@@ -72,29 +71,23 @@ def main() -> None:
     else:
         lines.append("[OK] 保持RUN_DATE = 今回RUN_DATE + 直前の正常終了RUN_DATE")
 
-    # ⑥ root ZIP
-    root_zip = summary.get("root_zip") or {}
-    expected_root_keys = [
-        f"pipeline_ses_steps/mail_display_extract_{run_date}.zip" for run_date in keep
+    # ⑥ retired artifact契約
+    expected_retired = [
+        "09-1_mail_display_format",
+        "09-2_extract_high_score_mail_display",
+        "09-3_prepare_sales_proposal_input",
     ]
-    missing_root_keep = [key for key in expected_root_keys if key not in root_zip.get("keep_keys", [])]
-    if missing_root_keep:
-        lines.append(f"[NG] root ZIPのKEEP対象が不足: {missing_root_keep}")
-        errors.append("root zip keep")
-    elif mode == "apply" and root_zip.get("verified") is not True:
-        lines.append("[NG] root ZIP apply後verifyが成功していない")
-        errors.append("root zip verify")
-    elif mode == "apply" and len(root_zip.get("deleted_keys") or []) != len(
-        root_zip.get("delete_candidate_keys") or []
-    ):
-        lines.append("[NG] root ZIPのDELETE候補と削除件数が不一致")
-        errors.append("root zip delete count")
+    if summary.get("retired_artifacts_policy") != "excluded_from_scheduled_retention":
+        lines.append("[NG] retired artifactがscheduled retention対象外になっていない")
+        errors.append("retired policy")
+    elif summary.get("retired_steps") != expected_retired:
+        lines.append("[NG] retired step定義が不正")
+        errors.append("retired steps")
+    elif summary.get("retired_root_artifact") != "mail_display_extract_YYYYMMDD.zip":
+        lines.append("[NG] retired root artifact定義が不正")
+        errors.append("retired root artifact")
     else:
-        lines.append(
-            f"[OK] root ZIP保持/rotation整合 "
-            f"(keep={len(root_zip.get('keep_keys') or [])} / "
-            f"deleted={len(root_zip.get('deleted_keys') or [])})"
-        )
+        lines.append("[OK] retired 09 / root ZIPはscheduled retention対象外")
 
     # ⑤ summary件数整合
     breakdown = summary.get("delete_breakdown") or []
@@ -133,12 +126,7 @@ def main() -> None:
         else:
             lines.append("[OK] dry-runでの削除は0件")
 
-    # ②③ ローカル再走査（root ZIP個別検証時は変更対象外）
-    if root_zip_only:
-        lines.append("[OK] root-zip-onlyのためローカル09成果物確認は対象外")
-        _write_and_exit(logger, lines, errors)
-        return
-
+    # ②③ active 09のローカル再走査
     try:
         artifacts, holds = scan_artifacts(project_root, current, logger)
     except RetentionError as exc:
