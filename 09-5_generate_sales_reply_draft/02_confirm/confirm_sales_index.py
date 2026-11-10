@@ -8,7 +8,7 @@ from collections import Counter, defaultdict
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, List, Tuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 project_root = Path(__file__).resolve().parents[2]
 tool_dir = Path(__file__).resolve().parents[1] / "00_tool"
@@ -25,19 +25,6 @@ from render_sales_index import (
 STEP_NAME = "09-5_sales_index_confirm"
 STEP_DIR = Path(__file__).resolve().parents[1]
 CONFIRM_RESULT = Path(__file__).resolve().parent / "confirm_result_sales_index.txt"
-KNOWN_20260820 = {
-    "proposal_ready": 36,
-    "high_initial": 55,
-    "high_additional": 59,
-    "other": 468,
-    "initial": 91,
-    "total": 618,
-    "previous_proposal": 9,
-    "previous_high_initial": 17,
-    "previous_initial": 26,
-}
-
-
 class SalesIndexParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -46,30 +33,31 @@ class SalesIndexParser(HTMLParser):
         self.rows: List[Dict[str, str]] = []
         self.external_assets: List[str] = []
         self.current_section = ""
-        self.current_project = ""
+        self.section_depth = 0
+        self.open_tags: List[str] = []
 
     def handle_starttag(self, tag, attrs):
+        self.open_tags.append(tag)
         attributes = dict(attrs)
         section = attributes.get("data-section")
         if section:
             self.current_section = section
+            self.section_depth = len(self.open_tags)
             self.sections.append((tag, section, "open" in attributes))
-        if tag == "article" and attributes.get("data-project-group"):
-            self.current_project = attributes["data-project-group"]
         if tag == "a" and attributes.get("href") is not None:
             self.links.append(attributes["href"])
         if tag == "tr" and attributes.get("data-resource-id"):
             attributes["_section"] = self.current_section
-            attributes["_project_group"] = self.current_project
             self.rows.append(attributes)
         if tag in ("script", "link") or (tag in ("img", "iframe") and attributes.get("src")):
             self.external_assets.append(tag)
 
     def handle_endtag(self, tag):
-        if tag == "article":
-            self.current_project = ""
-        if tag in ("section", "details"):
+        if self.current_section and len(self.open_tags) == self.section_depth and tag == self.open_tags[-1]:
             self.current_section = ""
+            self.section_depth = 0
+        if self.open_tags:
+            self.open_tags.pop()
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,7 +110,7 @@ def main() -> None:
         parser = SalesIndexParser()
         parser.feed(actual_html)
 
-        expected_sections = ["proposal_ready", "high_initial", "high_additional", "other"]
+        expected_sections = ["new_ready", "new_sales_review", "new_additional", "previous"]
         actual_sections = [section for _tag, section, _open in parser.sections]
         collapsed = {section: (tag == "details" and not opened) for tag, section, opened in parser.sections}
         row_keys = [
@@ -130,23 +118,24 @@ def main() -> None:
             for row in parser.rows
         ]
         section_counts = Counter(row.get("_section", "") for row in parser.rows)
-        high_ranks = defaultdict(list)
-        grouping_valid = True
+        required_rates = defaultdict(list)
         for row in parser.rows:
-            grouping_valid = grouping_valid and row.get("data-project-id") == row.get("_project_group")
-            if row.get("_section") in ("high_initial", "high_additional"):
-                try:
-                    rank = int(row.get("data-high-rank", ""))
-                except ValueError:
-                    rank = 0
-                high_ranks[(row.get("_section", ""), row.get("data-project-id", ""))].append(rank)
-        high_rank_order_valid = all(ranks == sorted(ranks) and all(rank > 0 for rank in ranks) for ranks in high_ranks.values())
+            try:
+                rate = float(row.get("data-required-rate", ""))
+            except ValueError:
+                rate = -1.0
+            required_rates[row.get("_section", "")].append(rate)
+        required_order_valid = all(
+            rates == sorted(rates, reverse=True) and all(rate >= 0 for rate in rates)
+            for rates in required_rates.values()
+        )
         previous_rows = [row for row in parser.rows if row.get("data-previous-candidate") == "true"]
-        previous_initial_rows = [
-            row for row in previous_rows if row.get("_section") in ("proposal_ready", "high_initial")
+        draft_links = [href for href in parser.links if not urlparse(href).scheme]
+        skillsheet_links = [
+            href for href in parser.links if urlparse(href).scheme in {"http", "https"}
         ]
         missing_links = 0
-        for href in parser.links:
+        for href in draft_links:
             target = preview_dir / unquote(href)
             if target.is_symlink() or not target.is_file():
                 missing_links += 1
@@ -160,11 +149,17 @@ def main() -> None:
                 f"HIGH initial: {summary['high_initial']}",
                 f"追加HIGH: {summary['high_additional']}",
                 f"OTHER: {summary['other']}",
+                f"NEW ready: {summary['new_ready']}",
+                f"NEW sales review: {summary['new_sales_review']}",
+                f"NEW additional: {summary['new_additional']}",
+                f"NEW total: {summary['new_total']}",
+                f"PREVIOUS: {summary['previous']}",
                 f"初回: {summary['initial']}",
                 f"total: {summary['total']}",
                 f"candidate loss: {summary['candidate_loss']}",
                 f"duplicate: {summary['duplicate']}",
-                f"draft link count: {len(parser.links)}",
+                f"draft link count: {len(draft_links)}",
+                f"skillsheet link count: {len(skillsheet_links)}",
                 f"draft link missing: {missing_links}",
                 f"previous badge proposal: {summary['previous_proposal']}",
                 f"previous badge HIGH initial: {summary['previous_high_initial']}",
@@ -183,42 +178,39 @@ def main() -> None:
             section_counts
             == Counter(
                 {
-                    "proposal_ready": summary["proposal_ready"],
-                    "high_initial": summary["high_initial"],
-                    "high_additional": summary["high_additional"],
-                    "other": summary["other"],
+                    "new_ready": summary["new_ready"],
+                    "new_sales_review": summary["new_sales_review"],
+                    "new_additional": summary["new_additional"],
+                    "previous": summary["previous"],
                 }
             ),
             "section掲載件数がqueue partitionと一致",
             f"section掲載件数不一致: {dict(section_counts)}",
         )
-        append_check(lines, errors, collapsed.get("high_additional") is True, "追加HIGHは初期折りたたみ", "追加HIGHが初期折りたたみではない")
-        append_check(lines, errors, collapsed.get("other") is True, "OTHERは初期折りたたみ", "OTHERが初期折りたたみではない")
-        append_check(lines, errors, grouping_valid, "全候補がproject_message_id単位でgrouping", "project grouping不整合あり")
-        append_check(lines, errors, high_rank_order_valid, "HIGHは案件内high_project_rank昇順", "HIGH rank順不整合あり")
+        append_check(lines, errors, collapsed.get("new_additional") is True, "NEW追加確認は初期折りたたみ", "NEW追加確認が初期折りたたみではない")
+        append_check(lines, errors, collapsed.get("previous") is True, "PREVIOUSは初期折りたたみ", "PREVIOUSが初期折りたたみではない")
+        append_check(lines, errors, required_order_valid, "各sectionはRequired一致率降順", "Required一致率順不整合あり")
         append_check(lines, errors, len(row_keys) == len(set(row_keys)) == summary["total"], "全pairを重複なく掲載", "掲載pairの欠落または重複あり")
         append_check(
             lines,
             errors,
             len(previous_rows) == summary["previous_all"]
-            and len(previous_initial_rows) == summary["previous_initial"],
-            "previous candidate badgeがqueue structured fieldと一致",
+            and all(row.get("_section") == "previous" for row in previous_rows),
+            "previous candidateがPREVIOUS sectionへ分離",
             "previous candidate badge件数不一致",
         )
-        append_check(lines, errors, len(parser.links) == summary["draft_link_count"] and missing_links == 0, "全draft_refs linkが存在", f"draft link不整合: missing={missing_links}")
+        append_check(
+            lines,
+            errors,
+            all(row.get("data-previous-candidate") == "false" for row in parser.rows if row.get("_section", "").startswith("new_")),
+            "NEW sectionへのprevious混入なし",
+            "NEW sectionへpreviousが混入",
+        )
+        append_check(lines, errors, len(draft_links) == summary["draft_link_count"] and missing_links == 0, "全draft_refs linkが存在", f"draft link不整合: missing={missing_links}")
         append_check(lines, errors, not parser.external_assets, "外部CSS/JavaScript/画像参照なし", f"外部asset要素あり: {parser.external_assets}")
         append_check(lines, errors, proposal == proposal_before and human == human_before and hashes_before == hashes_after, "queue JSONLとcanonical draftは不変", "queue JSONLまたはcanonical draftが変化")
         append_check(lines, errors, "前回提案済" not in actual_html and "確認済み" not in actual_html, "禁止previous表現なし", "禁止previous表現あり")
 
-        if date_part == "20260820":
-            for key, expected in KNOWN_20260820.items():
-                append_check(
-                    lines,
-                    errors,
-                    summary[key] == expected,
-                    f"20260820 {key}={expected}",
-                    f"20260820 {key}不一致: actual={summary[key]} expected={expected}",
-                )
     except Exception as error:
         message = f"[NG] confirm実行失敗: {error}"
         lines.append(message)

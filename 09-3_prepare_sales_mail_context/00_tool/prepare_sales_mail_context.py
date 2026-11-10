@@ -3,6 +3,8 @@
 高確度案件/要員ペアを営業メール作成用の構造化コンテキスト JSONL に統合する。
 """
 
+import json
+import hashlib
 import re
 import sys
 import time
@@ -23,9 +25,9 @@ from common.logger import get_logger
 STEP_NAME = "09-3_prepare_sales_mail_context"
 STEP_DIR = Path(__file__).resolve().parents[1]
 
-HIGH_SCORE_BASE_DIR = project_root / "09-2_extract_high_score_mail_display/01_result"
 RECHECK_RESULT_DIR = project_root / "08-5_high_score_required_skill_recheck/01_result"
-MATCH_SCORE_ORIGINAL_DIR = project_root / "08-4_match_score_sort/01_result"
+RECHECK_ALL_PATH = RECHECK_RESULT_DIR / "high_score_required_skill_recheck_all.jsonl"
+RECHECK_COMMIT_PATH = RECHECK_RESULT_DIR / "production_commit.json"
 MAIL_MASTER_PATH = project_root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
 CLEANED_BODY_PATH = project_root / "01-4_cleanup_email_text/01_result/cleanup_email_text_emails_raw.jsonl"
 PROJECT_BUDGET_PATH = project_root / "03-1_extract_project_budget/01_result/extract_project_budget.jsonl"
@@ -55,25 +57,14 @@ RESOURCE_SKILL_CATEGORY_PATH = (
 )
 RESOURCE_PHASE_PATH = project_root / "05-9_extract_resource_phase_category/01_result/extract_resource_phase_category.jsonl"
 RESOURCE_LOCATION_PATH = project_root / "05-10_extract_resource_location/01_result/extract_resource_location.jsonl"
+RESOURCE_SKILLSHEET_PATH = (
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
+)
 
-PAIR_CONFIGS = [
-    {
-        "score_band": "100percent",
-        "subdir_name": "00_mail_display_format_100percent",
-        "match_file": "match_score_sort_100percent.jsonl",
-        "file_glob": "mail_display_format_100percent_pair_*.txt",
-    },
-    {
-        "score_band": "80to99percent",
-        "subdir_name": "01_mail_display_format_80to99percent",
-        "match_file": "match_score_sort_80to99percent.jsonl",
-        "file_glob": "mail_display_format_80to99percent_pair_*.txt",
-    },
-]
-RECHECK_INPUT_FILES = [
-    "high_score_required_skill_recheck_confirmed.jsonl",
-    "high_score_required_skill_recheck_human_review.jsonl",
-]
+SALES_RECHECK_STATUSES = {
+    "required_skill_confirmed",
+    "required_skill_human_review",
+}
 
 PAIR_TYPE = "project_resource"
 OUTPUT_FILE_TEMPLATE = "prepare_sales_mail_context_{date}.jsonl"
@@ -173,23 +164,6 @@ def first_non_empty(*values: Any) -> Optional[Any]:
     return None
 
 
-def find_latest_dated_dir(base_dir: Path, prefix: str) -> Tuple[Path, str]:
-    pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8}})$")
-    candidates: List[Tuple[str, Path]] = []
-    if not base_dir.exists():
-        raise FileNotFoundError(f"入力ベースディレクトリが存在しません: {base_dir}")
-    for path in base_dir.iterdir():
-        if not path.is_dir():
-            continue
-        match = pattern.match(path.name)
-        if match:
-            candidates.append((match.group(1), path))
-    if not candidates:
-        raise FileNotFoundError(f"{prefix}YYYYMMDD ディレクトリが存在しません: {base_dir}")
-    date_str, latest_dir = max(candidates, key=lambda item: item[0])
-    return latest_dir, date_str
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-date", help="処理対象日付 YYYYMMDD")
@@ -204,14 +178,28 @@ def resolve_target_date(target_date: Optional[str]) -> Optional[str]:
     return target_date
 
 
-def resolve_input_dir(base_dir: Path, prefix: str, target_date: Optional[str]) -> Tuple[Path, str, str]:
-    if target_date:
-        target_dir = base_dir / f"{prefix}{target_date}"
-        if not target_dir.exists():
-            raise FileNotFoundError(f"対象日付の入力ディレクトリが存在しません: {target_dir}")
-        return target_dir, target_date, "target-date"
-    latest_dir, latest_date = find_latest_dated_dir(base_dir, prefix)
-    return latest_dir, latest_date, "latest"
+def resolve_recheck_run_date(target_date: Optional[str]) -> str:
+    commit = json.loads(RECHECK_COMMIT_PATH.read_text(encoding="utf-8"))
+    committed_date = normalize_text(commit.get("run_date"))
+    if not re.fullmatch(r"\d{8}", committed_date):
+        raise ValueError(f"08-5 production_commit run_dateが不正です: {committed_date}")
+    if target_date and target_date != committed_date:
+        raise ValueError(
+            f"--target-dateと08-5 production_commitが不一致です: "
+            f"target={target_date} committed={committed_date}"
+        )
+    artifact = (commit.get("artifacts") or {}).get("all") or {}
+    expected_records = artifact.get("records")
+    expected_sha256 = normalize_text(artifact.get("sha256"))
+    actual_bytes = RECHECK_ALL_PATH.read_bytes()
+    actual_records = sum(1 for line in actual_bytes.splitlines() if line.strip())
+    actual_sha256 = hashlib.sha256(actual_bytes).hexdigest()
+    if expected_records != actual_records or expected_sha256 != actual_sha256:
+        raise ValueError(
+            "08-5 production_commitとall artifactが不一致です: "
+            f"records={actual_records}/{expected_records} sha256={actual_sha256}/{expected_sha256}"
+        )
+    return committed_date
 
 
 def ensure_required_inputs(paths: List[Path]) -> None:
@@ -220,85 +208,43 @@ def ensure_required_inputs(paths: List[Path]) -> None:
         raise FileNotFoundError("必須入力が不足しています: " + ", ".join(missing))
 
 
-def parse_sequence(file_name: str) -> int:
-    match = re.search(r"_pair_(\d+)(?:_前回出力済)?\.txt$", file_name)
-    if not match:
-        raise ValueError(f"pair連番を抽出できません: {file_name}")
-    return int(match.group(1))
-
-
 def make_pair_key(record: Dict[str, Any]) -> Tuple[str, str]:
     project_mid = normalize_text(record.get("project_info", {}).get("message_id"))
     resource_mid = normalize_text(record.get("resource_info", {}).get("message_id"))
     return project_mid, resource_mid
 
 
-def load_rechecked_records(logger) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    records_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for filename in RECHECK_INPUT_FILES:
-        path = RECHECK_RESULT_DIR / filename
-        records = read_jsonl_as_list(str(path))
-        loaded_count = 0
-        for record in records:
-            if record.get("status") == "no_match":
-                continue
-            key = make_pair_key(record)
-            if not all(key):
-                logger.warn(f"08-5 record message_id不足のためskip: {filename}")
-                continue
-            records_by_key[key] = record
-            loaded_count += 1
-        logger.info(f"08-5採用入力: {filename} {loaded_count}件")
-    logger.info(f"08-5 confirmed/human_review 採用候補: {len(records_by_key)}件")
-    return records_by_key
-
-
-def load_pair_records(input_dir: Path, logger) -> List[Dict[str, Any]]:
+def load_pair_records(logger) -> List[Dict[str, Any]]:
+    """08-5正本から営業対象statusだけを直接読み込む。"""
     pair_records: List[Dict[str, Any]] = []
-    rechecked_records = load_rechecked_records(logger)
-    skipped_not_rechecked_count = 0
-    for config in PAIR_CONFIGS:
-        subdir = input_dir / config["subdir_name"]
-        if not subdir.exists():
-            raise FileNotFoundError(f"高確度pairサブディレクトリが存在しません: {subdir}")
-        match_records = read_jsonl_as_list(str(MATCH_SCORE_ORIGINAL_DIR / config["match_file"]))
-        if len(match_records) == 1 and match_records[0].get("status") == "no_match":
-            match_records = []
-        txt_files = sorted(subdir.glob(config["file_glob"]))
-        logger.info(f"{config['score_band']}: txt={len(txt_files)}件 / match={len(match_records)}件")
-        band_output_count = 0
-        band_skip_count = 0
-        for txt_file in txt_files:
-            seq = parse_sequence(txt_file.name)
-            if seq < 1 or seq > len(match_records):
-                raise IndexError(
-                    f"pairファイルと08-4結果の対応が取れません: {txt_file.name} seq={seq} match_count={len(match_records)}"
-                )
-            original_pair = match_records[seq - 1]
-            key = make_pair_key(original_pair)
-            rechecked_pair = rechecked_records.get(key)
-            if rechecked_pair is None:
-                skipped_not_rechecked_count += 1
-                band_skip_count += 1
-                continue
-            project_mid, resource_mid = key
-            score_band = normalize_text(rechecked_pair.get("source_score_band")) or config["score_band"]
-            pair_records.append(
-                {
-                    "pair_file_name": txt_file.name,
-                    "score_band": score_band,
-                    "pair_type": PAIR_TYPE,
-                    "project_message_id": project_mid,
-                    "resource_message_id": resource_mid,
-                    "match_record": rechecked_pair,
-                }
-            )
-            band_output_count += 1
-        logger.info(
-            f"{config['score_band']}: 09-3採用={band_output_count}件 / "
-            f"08-5未採用skip={band_skip_count}件"
+    seen_keys = set()
+    status_counts: Dict[str, int] = {}
+    for sequence, record in enumerate(read_jsonl_as_list(str(RECHECK_ALL_PATH)), start=1):
+        recheck_info = record.get("recheck_info") or {}
+        status = normalize_text(recheck_info.get("recheck_status"))
+        status_counts[status or "missing"] = status_counts.get(status or "missing", 0) + 1
+        if status not in SALES_RECHECK_STATUSES:
+            continue
+        key = make_pair_key(record)
+        if not all(key):
+            raise ValueError(f"08-5営業対象recordにmessage_id不足があります: seq={sequence}")
+        if key in seen_keys:
+            raise ValueError(f"08-5営業対象にpair重複があります: {key[0]} / {key[1]}")
+        seen_keys.add(key)
+        project_mid, resource_mid = key
+        score_band = normalize_text(record.get("source_score_band")) or "unknown"
+        pair_records.append(
+            {
+                "pair_file_name": f"08-5_pair_{sequence:04d}.json",
+                "score_band": score_band,
+                "pair_type": PAIR_TYPE,
+                "project_message_id": project_mid,
+                "resource_message_id": resource_mid,
+                "match_record": record,
+            }
         )
-    logger.info(f"08-5 confirmed/human_reviewに存在しないため除外: {skipped_not_rechecked_count}件")
+    logger.info(f"08-5 status集計: {dict(sorted(status_counts.items()))}")
+    logger.info(f"08-5 confirmed/human_review 営業候補: {len(pair_records)}件")
     return pair_records
 
 
@@ -1073,6 +1019,18 @@ def build_record(
     resource_skill_category = extracted_maps["resource_skill_category"].get(resource_mid)
     resource_phase = extracted_maps["resource_phase"].get(resource_mid)
     resource_location = extracted_maps["resource_location"].get(resource_mid)
+    resource_skillsheet = extracted_maps["resource_skillsheet"].get(resource_mid)
+    resource_skillsheet_available = bool(
+        resource_skillsheet
+        and resource_skillsheet.get("success") is True
+        and normalize_text(resource_skillsheet.get("skillsheet"))
+    )
+    resource_skillsheet_url = normalize_text((resource_skillsheet or {}).get("urls"))
+    if (
+        not resource_skillsheet_available
+        or not re.match(r"^https?://", resource_skillsheet_url, re.IGNORECASE)
+    ):
+        resource_skillsheet_url = ""
 
     project_start_date, project_start_date_source = format_start_date(project_side["body"], project_contract)
     resource_available_date, resource_available_date_source = format_available_date(resource_side["body"])
@@ -1222,6 +1180,11 @@ def build_record(
         "resource_skills_source": "05-8_extract_resource_skill_category" if resource_skill_category else "unavailable",
         "resource_skill_summary": resource_skill_summary,
         "resource_skill_summary_source": resource_skill_summary_source,
+        "resource_skillsheet_available": resource_skillsheet_available,
+        "resource_skillsheet_source": (
+            normalize_text((resource_skillsheet or {}).get("source")) or "unavailable"
+        ),
+        "resource_skillsheet_url": resource_skillsheet_url or None,
         "project_age_limit": (project_age or {}).get("age_max"),
         "project_age_limit_source": (
             normalize_text((project_age or {}).get("age_max_source")) or "03-2_extract_project_age"
@@ -1312,21 +1275,19 @@ def main() -> None:
         RESOURCE_SKILL_CATEGORY_PATH,
         RESOURCE_PHASE_PATH,
         RESOURCE_LOCATION_PATH,
-        RECHECK_RESULT_DIR / "high_score_required_skill_recheck_confirmed.jsonl",
-        RECHECK_RESULT_DIR / "high_score_required_skill_recheck_human_review.jsonl",
-        MATCH_SCORE_ORIGINAL_DIR / "match_score_sort_100percent.jsonl",
-        MATCH_SCORE_ORIGINAL_DIR / "match_score_sort_80to99percent.jsonl",
+        RESOURCE_SKILLSHEET_PATH,
+        RECHECK_ALL_PATH,
+        RECHECK_COMMIT_PATH,
     ]
 
     try:
         ensure_required_inputs(required_files)
         target_date = resolve_target_date(args.target_date)
-        input_dir, input_date, resolve_mode = resolve_input_dir(HIGH_SCORE_BASE_DIR, "mail_display_extract_", target_date)
-        logger.info(f"input resolve mode: {resolve_mode}")
+        input_date = resolve_recheck_run_date(target_date)
         logger.info(f"target date: {input_date}")
-        logger.info(f"入力ディレクトリ: {input_dir}")
+        logger.info(f"08-5正本入力: {RECHECK_ALL_PATH}")
 
-        pair_records = load_pair_records(input_dir, logger)
+        pair_records = load_pair_records(logger)
         mail_master = read_jsonl_as_dict(str(MAIL_MASTER_PATH))
         cleaned_map = read_jsonl_as_dict(str(CLEANED_BODY_PATH))
         extracted_maps = {
@@ -1351,6 +1312,7 @@ def main() -> None:
             "resource_skill_category": read_jsonl_as_dict(str(RESOURCE_SKILL_CATEGORY_PATH)),
             "resource_phase": read_jsonl_as_dict(str(RESOURCE_PHASE_PATH)),
             "resource_location": read_jsonl_as_dict(str(RESOURCE_LOCATION_PATH)),
+            "resource_skillsheet": read_jsonl_as_dict(str(RESOURCE_SKILLSHEET_PATH)),
         }
 
         output_records: List[Dict[str, Any]] = []

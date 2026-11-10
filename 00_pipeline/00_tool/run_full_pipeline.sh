@@ -226,14 +226,8 @@ run_step \
   "$ROOT/08-5_high_score_required_skill_recheck/00_tool/run_high_score_required_skill_recheck.py" \
   --phase phase-a --pipeline-run-id "${RUN_ID:-standalone-$RUN_DATE}" --run-date "$RUN_DATE"
 
-run_step "09-1_mail_display_format(RUN_DATE=$RUN_DATE)" "$ROOT/09-1_mail_display_format/00_tool/mail_display_format.py" --target-date "$RUN_DATE"
-
-run_step "09-2_extract_high_score_mail_display(RUN_DATE=$RUN_DATE)" "$ROOT/09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py" --target-date "$RUN_DATE"
-
-run_step "09-3_prepare_sales_proposal_input(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_prepare_sales_proposal_input/00_tool/prepare_sales_proposal_input.py" --target-date "$RUN_DATE"
-
-# 既存の 09-3_prepare_sales_proposal_input は現状維持で残す。
-# 新しい営業メール文脈生成/ドラフト生成は同一 RUN_DATE で固定して後続追加する。
+# 09-1 / 09-2 / legacy 09-3 は監査・過去成果物互換のため残すが営業本流では実行しない。
+# active 09-3 は08-5 production artifactを直接参照する。
 run_step "09-3_prepare_sales_mail_context(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_prepare_sales_mail_context/00_tool/prepare_sales_mail_context.py" --target-date "$RUN_DATE"
 
 run_step "09-4_remove_category_mismatch_sales_candidates(RUN_DATE=$RUN_DATE)" "$ROOT/09-4_remove_category_mismatch_sales_candidates/00_tool/remove_category_mismatch_sales_candidates.py" --target-date "$RUN_DATE"

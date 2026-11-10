@@ -64,9 +64,7 @@ run_step \
   --phase phase-b --pipeline-run-id "$RUN_ID" --run-date "$RUN_DATE"
 
 # marker gate成功後だけ09系と既存CURRENT/BK1 publication contractへ進む。
-run_step "09-1_mail_display_format(RUN_DATE=$RUN_DATE)" "$ROOT/09-1_mail_display_format/00_tool/mail_display_format.py" --target-date "$RUN_DATE"
-run_step "09-2_extract_high_score_mail_display(RUN_DATE=$RUN_DATE)" "$ROOT/09-2_extract_high_score_mail_display/00_tool/extract_high_score_mail_display.py" --target-date "$RUN_DATE"
-run_step "09-3_prepare_sales_proposal_input(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_prepare_sales_proposal_input/00_tool/prepare_sales_proposal_input.py" --target-date "$RUN_DATE"
+# 09-1 / 09-2 / legacy 09-3 は営業本流から外し、active 09-3を08-5へ直接接続する。
 run_step "09-3_prepare_sales_mail_context(RUN_DATE=$RUN_DATE)" "$ROOT/09-3_prepare_sales_mail_context/00_tool/prepare_sales_mail_context.py" --target-date "$RUN_DATE"
 run_step "09-4_remove_category_mismatch_sales_candidates(RUN_DATE=$RUN_DATE)" "$ROOT/09-4_remove_category_mismatch_sales_candidates/00_tool/remove_category_mismatch_sales_candidates.py" --target-date "$RUN_DATE"
 run_step "09-5_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-5_generate_sales_reply_draft/00_tool/generate_sales_reply_draft.py" --target-date "$RUN_DATE"

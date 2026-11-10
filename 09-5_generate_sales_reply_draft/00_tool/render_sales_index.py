@@ -6,10 +6,10 @@ import os
 import re
 import sys
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
@@ -41,9 +41,11 @@ REVIEW_ITEM_LABELS = {
     "error": "処理エラー",
     "skillsheet": "スキルシート",
 }
-LINK_DIRECTION_LABELS = {
-    "reply_to_project": "案件向け",
-    "reply_to_resource": "要員向け",
+LINK_LABELS = {
+    ("reply_to_project", "preview_file_path"): "案件Draft・原文",
+    ("reply_to_project", "note_file_path"): "案件確認メモ",
+    ("reply_to_resource", "preview_file_path"): "要員Draft・原文",
+    ("reply_to_resource", "note_file_path"): "要員確認メモ",
 }
 
 PairKey = Tuple[str, str]
@@ -145,7 +147,6 @@ def _render_links(record: Dict[str, Any], preview_dir: Path, output_base_dir: Pa
         if not isinstance(ref, dict):
             raise ValueError(f"draft_refs要素がobjectではありません: {pair_key(record)}")
         direction = normalize_text(ref.get("draft_direction"))
-        direction_label = LINK_DIRECTION_LABELS.get(direction, "draft")
         for path_key, artifact_label in (
             ("preview_file_path", "preview"),
             ("note_file_path", "note"),
@@ -154,25 +155,124 @@ def _render_links(record: Dict[str, Any], preview_dir: Path, output_base_dir: Pa
             if href in seen:
                 raise ValueError(f"draft_refs linkが重複しています: {pair_key(record)} / {href}")
             seen.add(href)
+            link_label = LINK_LABELS.get((direction, path_key), f"draft {artifact_label}")
             links.append(
                 f'<a href="{html.escape(href, quote=True)}">'
-                f"{html.escape(direction_label)}{artifact_label}</a>"
+                f"{html.escape(link_label)}</a>"
             )
     return " ".join(links), len(links)
 
 
-def _row_sort_key(record: Dict[str, Any], use_high_rank: bool) -> Tuple[Any, ...]:
-    if use_high_rank:
-        return (record.get("high_project_rank", 0), normalize_text(record.get("resource_message_id")))
-    return (normalize_text(record.get("resource_message_id")),)
+def _required_check_kind(check: Dict[str, Any]) -> str:
+    confidence = normalize_text(check.get("confidence"))
+    evidence = normalize_text(check.get("evidence"))
+    reason = normalize_text(check.get("reason"))
+    if confidence == "confirmed" and evidence:
+        return "grounded"
+    if confidence == "confirmed" and "営業確認前提" in reason:
+        return "sales_confirmation"
+    if confidence == "confirmed":
+        return "review"
+    if confidence == "human_review":
+        return "review"
+    return "missing"
 
 
-def _first_project_metadata(
-    project_rows: List[Dict[str, Any]], candidate_index: Dict[PairKey, Dict[str, Any]]
-) -> Dict[str, Any]:
-    candidates = [candidate_index[pair_key(record)] for record in project_rows]
-    candidates.sort(key=lambda record: pair_key(record)[1])
-    return candidates[0]
+def _required_stats(record: Dict[str, Any], recheck: Dict[str, Any]) -> Dict[str, Any]:
+    checks = record.get("required_skill_checks")
+    if not isinstance(checks, list):
+        checks = recheck.get("required_skill_checks")
+    if not isinstance(checks, list):
+        checks = []
+    kinds = Counter(_required_check_kind(check) for check in checks if isinstance(check, dict))
+    total = len(checks)
+    matched = kinds["grounded"] + kinds["sales_confirmation"]
+    rate = matched / total if total else 0.0
+    return {
+        "checks": checks,
+        "total": total,
+        "matched": matched,
+        "rate": rate,
+        "grounded": kinds["grounded"],
+        "sales_confirmation": kinds["sales_confirmation"],
+        "review": kinds["review"],
+        "missing": kinds["missing"],
+    }
+
+
+def _optional_rate(recheck: Dict[str, Any]) -> float:
+    value = (recheck.get("match_info") or {}).get("optional_skills_match_rate")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return 0.0
+
+
+def _category_rank(candidate: Dict[str, Any]) -> int:
+    return {"match": 0, "unclear": 1, "mismatch": 2}.get(
+        normalize_text(candidate.get("category_match")), 1
+    )
+
+
+def _sales_sort_key(
+    record: Dict[str, Any], candidate: Dict[str, Any], recheck: Dict[str, Any]
+) -> Tuple[Any, ...]:
+    stats = _required_stats(record, recheck)
+    return (
+        -stats["rate"],
+        stats["review"],
+        _category_rank(candidate),
+        -stats["grounded"],
+        stats["sales_confirmation"],
+        -_optional_rate(recheck),
+        normalize_text(record.get("project_message_id")),
+        normalize_text(record.get("resource_message_id")),
+    )
+
+
+def _render_required_details(stats: Dict[str, Any]) -> str:
+    rows: List[str] = []
+    labels = {
+        "grounded": "○ 根拠あり",
+        "sales_confirmation": "○ 営業確認前提",
+        "review": "△ 要確認",
+        "missing": "× 不足",
+    }
+    for check in stats["checks"]:
+        if not isinstance(check, dict):
+            continue
+        kind = _required_check_kind(check)
+        skill = normalize_text(check.get("skill")) or "必須条件（名称なし）"
+        evidence = normalize_text(check.get("evidence"))
+        reason = normalize_text(check.get("reason"))
+        detail = ""
+        if evidence:
+            detail += f'<div class="evidence">根拠: 「{html.escape(evidence)}」</div>'
+        if reason and kind != "sales_confirmation":
+            detail += f'<div class="reason">判定理由: {html.escape(reason)}</div>'
+        rows.append(
+            f'<li class="required-{kind}"><strong>{labels[kind]}</strong> '
+            f'{html.escape(skill)}{detail}</li>'
+        )
+    return "<ul class=\"required-list\">" + "".join(rows) + "</ul>"
+
+
+def _render_skillsheet_reference(candidate: Dict[str, Any]) -> str:
+    url = normalize_text(candidate.get("resource_skillsheet_url"))
+    parsed = urlparse(url)
+    if (
+        candidate.get("resource_skillsheet_available") is True
+        and parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and not parsed.username
+    ):
+        return (
+            f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+            'rel="noopener noreferrer">Skillsheet</a>'
+        )
+    if candidate.get("resource_skillsheet_available") is True:
+        source = normalize_text(candidate.get("resource_skillsheet_source")) or "取得済み"
+        return f'<span class="muted">Skillsheet: {html.escape(source)}から取得済み（リンクなし）</span>'
+    return '<span class="muted">Skillsheet参照なし</span>'
 
 
 def _render_candidate_row(
@@ -183,23 +283,12 @@ def _render_candidate_row(
     output_base_dir: Path,
 ) -> Tuple[str, int]:
     project_id, resource_id = pair_key(record)
-    subject = normalize_text(candidate.get("resource_subject")) or "件名記載なし"
+    project_subject = normalize_text(candidate.get("project_subject")) or "件名記載なし"
+    resource_subject = normalize_text(candidate.get("resource_subject")) or "件名記載なし"
     priority = "proposal_ready" if record.get("queue") == "proposal_ready" else normalize_text(record.get("review_priority"))
-    rank = record.get("high_project_rank") if priority == "HIGH" else None
-    rank_display = str(rank) if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0 else "—"
-    match_info = recheck.get("match_info") or {}
-    required_score = _format_percent(match_info.get("required_skills_match_rate"))
-    recheck_info = record.get("required_skill_recheck_info") or {}
-    confirmed = recheck_info.get("confirmed_count")
-    total = recheck_info.get("required_skill_count")
-    skill_count = (
-        f"{confirmed} / {total}"
-        if isinstance(confirmed, int)
-        and not isinstance(confirmed, bool)
-        and isinstance(total, int)
-        and not isinstance(total, bool)
-        else "記載なし"
-    )
+    stats = _required_stats(record, recheck)
+    required_score = _format_percent(stats["rate"])
+    optional_score = _format_percent(_optional_rate(recheck))
     labels = _review_labels(record)
     reasons = "、".join(labels) if labels else "—"
     links_html, link_count = _render_links(record, preview_dir, output_base_dir)
@@ -208,69 +297,62 @@ def _render_candidate_row(
         previous_date = normalize_text(record.get("previous_candidate_date"))
         badge_text = f"[前回も候補: {previous_date}]" if previous_date else "[前回も候補]"
         previous_html = f' <span class="badge previous">{html.escape(badge_text)}</span>'
+    duplicate_html = ""
+    if recheck.get("duplicate_proposal_check") is True:
+        duplicate_html = ' <span class="badge cache">過去AI判定を再利用</span>'
+    category = normalize_text(candidate.get("category_match")) or "unclear"
+    category_label = {"match": "適合", "unclear": "要確認", "mismatch": "不適合"}.get(category, "要確認")
+    required_details = _render_required_details(stats)
+    skillsheet_html = _render_skillsheet_reference(candidate)
 
     return (
         f'<tr data-project-id="{html.escape(project_id, quote=True)}" '
         f'data-resource-id="{html.escape(resource_id, quote=True)}" '
         f'data-priority="{html.escape(priority, quote=True)}" '
-        f'data-high-rank="{html.escape(rank_display, quote=True)}" '
+        f'data-required-rate="{stats["rate"]:.6f}" '
         f'data-previous-candidate="{str(record.get("previous_candidate") is True).lower()}">'
-        f'<td><div class="subject">{html.escape(subject)}</div>'
+        f'<td><div class="subject">{html.escape(project_subject)}</div>'
+        f'<div class="muted">{html.escape(_sender_display(candidate, "project"))}</div></td>'
+        f'<td><div class="subject">{html.escape(resource_subject)}</div>'
         f'<div class="muted">{html.escape(_sender_display(candidate, "resource"))}</div></td>'
-        f'<td><span class="badge priority">{html.escape(priority)}</span>{previous_html}</td>'
-        f"<td>{html.escape(rank_display)}</td>"
-        f"<td>{html.escape(required_score)}</td>"
-        f"<td>{html.escape(skill_count)}</td>"
-        f"<td>{html.escape(reasons)}</td>"
-        f'<td class="links">{links_html}</td>'
+        f'<td><span class="badge priority">{html.escape(priority)}</span>{previous_html}{duplicate_html}'
+        f'<div class="muted">Category: {html.escape(category_label)} ／ Optional: {html.escape(optional_score)}</div>'
+        f'<div class="required-summary">Required {html.escape(required_score)} '
+        f'○{stats["matched"]} / △{stats["review"]} / ×{stats["missing"]}</div>'
+        f'<details class="required-evidence"><summary>必須条件と根拠</summary>{required_details}</details>'
+        f'<div class="muted">確認理由: {html.escape(reasons)}</div></td>'
+        f'<td class="links">{skillsheet_html}<br>{links_html}</td>'
         "</tr>",
         link_count,
     )
 
 
-def _render_project_groups(
+def _render_candidate_table(
     records: List[Dict[str, Any]],
     candidate_index: Dict[PairKey, Dict[str, Any]],
     recheck_index: Dict[PairKey, Dict[str, Any]],
-    project_counts: Dict[str, Counter],
     preview_dir: Path,
     output_base_dir: Path,
-    use_high_rank: bool,
 ) -> Tuple[str, int]:
-    groups: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for record in records:
-        groups[pair_key(record)[0]].append(record)
-
-    parts: List[str] = []
+    ordered = sorted(
+        records,
+        key=lambda record: _sales_sort_key(
+            record, candidate_index[pair_key(record)], recheck_index[pair_key(record)]
+        ),
+    )
+    parts = [
+        '<table><thead><tr><th>案件</th><th>要員</th><th>Required・根拠</th>'
+        '<th>原文・Draft</th></tr></thead><tbody>'
+    ]
     total_links = 0
-    for project_id in sorted(groups):
-        project_rows = sorted(groups[project_id], key=lambda row: _row_sort_key(row, use_high_rank))
-        metadata = _first_project_metadata(project_rows, candidate_index)
-        subject = normalize_text(metadata.get("project_subject")) or "件名記載なし"
-        counts = project_counts[project_id]
-        parts.extend(
-            [
-                f'<article class="project" data-project-group="{html.escape(project_id, quote=True)}">',
-                f"<h3>{html.escape(subject)}</h3>",
-                f'<p class="project-meta">会社 / 送信者: {html.escape(_sender_display(metadata, "project"))}'
-                f" ／ proposal_ready {counts['proposal']}人 ／ HIGH {counts['high']}人 ／ OTHER {counts['other']}人</p>",
-                '<table><thead><tr><th>要員</th><th>priority</th><th>案件内rank</th>'
-                "<th>required score</th><th>confirmed / total</th><th>確認理由</th><th>preview / note</th>"
-                "</tr></thead><tbody>",
-            ]
+    for record in ordered:
+        key = pair_key(record)
+        row_html, link_count = _render_candidate_row(
+            record, candidate_index[key], recheck_index[key], preview_dir, output_base_dir
         )
-        for record in project_rows:
-            key = pair_key(record)
-            row_html, link_count = _render_candidate_row(
-                record,
-                candidate_index[key],
-                recheck_index[key],
-                preview_dir,
-                output_base_dir,
-            )
-            parts.append(row_html)
-            total_links += link_count
-        parts.extend(["</tbody></table>", "</article>"])
+        parts.append(row_html)
+        total_links += link_count
+    parts.append("</tbody></table>")
     return "\n".join(parts), total_links
 
 
@@ -318,36 +400,49 @@ def render_sales_index(
     if len(high_initial) + len(high_additional) + len(other) != len(human_review):
         raise ValueError("human_reviewのHIGH initial / 追加HIGH / OTHER partitionが不正です")
 
-    initial_keys = [pair_key(record) for record in proposal_ready + high_initial]
-    all_keys = [pair_key(record) for record in proposal_ready + high_initial + high_additional + other]
-    if len(initial_keys) != len(set(initial_keys)) or len(all_keys) != len(set(all_keys)):
+    all_records = proposal_ready + human_review
+    all_keys = [pair_key(record) for record in all_records]
+    if len(all_keys) != len(set(all_keys)):
         raise ValueError("index掲載pairに重複があります")
 
-    project_counts: DefaultDict[str, Counter] = defaultdict(Counter)
-    for record in proposal_ready:
-        project_counts[pair_key(record)[0]]["proposal"] += 1
-    for record in high_initial + high_additional:
-        project_counts[pair_key(record)[0]]["high"] += 1
-    for record in other:
-        project_counts[pair_key(record)[0]]["other"] += 1
+    new_ready = [record for record in proposal_ready if record.get("previous_candidate") is not True]
+    new_sales_review = []
+    for record in human_review:
+        if record.get("previous_candidate") is True:
+            continue
+        stats = _required_stats(record, recheck_index_all[pair_key(record)])
+        if (
+            stats["total"] > 0
+            and stats["matched"] == stats["total"]
+            and stats["sales_confirmation"] > 0
+        ):
+            new_sales_review.append(record)
+    new_sales_review_keys = {pair_key(record) for record in new_sales_review}
+    new_additional = [
+        record
+        for record in human_review
+        if record.get("previous_candidate") is not True and pair_key(record) not in new_sales_review_keys
+    ]
+    previous = [record for record in all_records if record.get("previous_candidate") is True]
+    new_keys = [pair_key(record) for record in new_ready + new_sales_review + new_additional]
+    if len(new_keys) + len(previous) != len(all_records):
+        raise ValueError("NEW / PREVIOUS partitionが不正です")
 
     section_specs = (
-        ("proposal_ready", "① そのまま提案", proposal_ready, False, False),
-        ("high_initial", "② 優先確認", high_initial, False, True),
-        ("high_additional", "③ 追加HIGH", high_additional, True, True),
-        ("other", "④ その他候補", other, True, False),
+        ("new_ready", "① NEW・すぐ提案", new_ready, False),
+        ("new_sales_review", "② NEW・営業確認あり", new_sales_review, False),
+        ("new_additional", "③ NEW・追加確認", new_additional, True),
+        ("previous", "④ PREVIOUS / 過去候補", previous, True),
     )
     section_html: List[str] = []
     draft_link_count = 0
-    for section_key, title, records, collapsed, use_high_rank in section_specs:
-        groups_html, section_links = _render_project_groups(
+    for section_key, title, records, collapsed in section_specs:
+        groups_html, section_links = _render_candidate_table(
             records,
             candidate_index_all,
             recheck_index_all,
-            project_counts,
             preview_dir,
             output_base_dir,
-            use_high_rank,
         )
         draft_link_count += section_links
         if collapsed:
@@ -377,7 +472,12 @@ def render_sales_index(
         "high_initial": len(high_initial),
         "high_additional": len(high_additional),
         "other": len(other),
-        "initial": len(initial_keys),
+        "new_ready": len(new_ready),
+        "new_sales_review": len(new_sales_review),
+        "new_additional": len(new_additional),
+        "new_total": len(new_keys),
+        "previous": len(previous),
+        "initial": len(new_ready) + len(new_sales_review),
         "total": len(all_keys),
         "duplicate": len(all_keys) - len(set(all_keys)),
         "candidate_loss": len(set(candidate_index_all) - set(all_keys)),
@@ -402,26 +502,30 @@ main {{ max-width:1500px; margin:0 auto; padding:20px; }}
 h1 {{ margin:0 0 8px; }}
 .lead {{ background:#fff; border-left:6px solid #1769aa; padding:12px; margin:0 0 20px; }}
 .sales-section {{ display:block; background:#fff; border:1px solid #ccc; margin:0 0 18px; padding:14px; }}
-.proposal_ready {{ border-left:7px solid #157347; }}
-.high_initial {{ border-left:7px solid #b26a00; }}
+.new_ready {{ border-left:7px solid #157347; }}
+.new_sales_review {{ border-left:7px solid #b26a00; }}
+.sales-section.previous {{ border-left:7px solid #6c757d; }}
 summary {{ cursor:pointer; font-size:1.25rem; font-weight:bold; }}
-.project {{ border-top:1px solid #ddd; margin-top:14px; padding-top:8px; }}
-.project h3 {{ margin:4px 0; font-size:1rem; }}
-.project-meta,.muted {{ color:#555; font-size:.86rem; }}
+.muted {{ color:#555; font-size:.86rem; }}
 table {{ border-collapse:collapse; width:100%; table-layout:fixed; }}
 th,td {{ border:1px solid #ddd; padding:7px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }}
 th {{ background:#eee; }}
-th:first-child {{ width:25%; }}
-th:last-child {{ width:16%; }}
+th:first-child,th:nth-child(2) {{ width:20%; }}
+th:last-child {{ width:14%; }}
 .subject {{ font-weight:bold; }}
 .badge {{ border:1px solid #777; border-radius:3px; display:inline-block; margin:1px; padding:2px 5px; font-size:.78rem; }}
-.previous {{ background:#fff3cd; }}
+.badge.previous {{ background:#fff3cd; }}
+.cache {{ background:#eef2f7; color:#555; }}
+.required-summary {{ font-weight:bold; margin:6px 0; }}
+.required-list {{ margin:8px 0; padding-left:20px; }}
+.required-list li {{ margin-bottom:8px; }}
+.evidence,.reason {{ color:#444; font-size:.86rem; margin-top:2px; }}
 .links a {{ display:inline-block; margin:0 6px 4px 0; }}
 </style>
 </head>
 <body><main>
 <h1>営業候補 {html.escape(date_part)}</h1>
-<p class="lead">初回確認対象 <strong>{summary['initial']}件</strong>：proposal_ready {summary['proposal_ready']}件 → HIGH initial {summary['high_initial']}件の順で確認してください。全候補 {summary['total']}件を掲載しています。</p>
+<p class="lead">通常営業対象はNEW <strong>{summary['new_total']}件</strong>です。各section内は08-5再確認後のRequired一致率が高い順です。PREVIOUS {summary['previous']}件は「以前にも候補として登場したpair」であり、実際の連絡状況とは別です。</p>
 {os.linesep.join(section_html)}
 </main></body>
 </html>
