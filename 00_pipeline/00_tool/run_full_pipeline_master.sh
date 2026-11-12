@@ -238,7 +238,13 @@ run_step "09-5_generate_sales_reply_draft(RUN_DATE=$RUN_DATE)" "$ROOT/09-5_gener
 # ──────────────────────────────────────────────────────────────────────
 run_step "80-7_manage_09_result_retention(RUN_DATE=$RUN_DATE)" "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" --apply --run-date "$RUN_DATE"
 
-run_step "80-75_portal_s3_backup_rotation" "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py"
+PUBLICATION_AUTHORITY="$ROOT/80-75_portal_s3_backup_rotation/01_result/publication_authority.json"
+run_step "80-74_resolve_publication_authority" \
+  "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
+  --resolve-publication-authority --authority-output "$PUBLICATION_AUTHORITY"
+
+run_step "80-75_portal_s3_backup_rotation" "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
+  --publication-authority-file "$PUBLICATION_AUTHORITY"
 
 run_step "80-8_portal_s3_prepare" "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py"
 

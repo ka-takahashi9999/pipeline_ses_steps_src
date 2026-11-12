@@ -1202,7 +1202,7 @@ class WiringAndAslTest(unittest.TestCase):
             encoding="utf-8"
         )
         gate = text.index("08-5_batch_collect_commit_gate")
-        first_09 = text.index('run_step "09-1_')
+        first_09 = text.index('run_step "09-3_')
         current = text.index('run_step "80-75_')
         self.assertLess(gate, first_09)
         self.assertLess(first_09, current)
@@ -1210,6 +1210,8 @@ class WiringAndAslTest(unittest.TestCase):
         self.assertNotIn('run_step "08-4_', text)
         self.assertIn("run_high_score_required_skill_recheck.py", text)
         self.assertIn("--phase phase-b", text)
+        self.assertIn("80-74_resolve_publication_authority", text)
+        self.assertIn("--publication-authority-file", text)
         self.assertNotIn("batch_aws_orchestration.py", text)
 
     def test_nightly_mode_resolution_uses_canonical_entrypoint(self):

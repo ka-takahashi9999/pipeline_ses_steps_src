@@ -99,7 +99,7 @@ class TestManualReceipt(unittest.TestCase):
     def rotate(self, args=None):
         with patch.object(target, "build_s3_client", return_value=self.s3), \
              patch.object(target, "build_stepfunctions_client", return_value=self.sfn), \
-             patch.object(target, "guard_manual_lock"), \
+             patch.object(target, "guard_manual_lock", return_value=None), \
              patch.object(target, "run_sync") as sync, patch.object(target.time, "sleep"):
             try:
                 return target.run(args or self.args(), self.logger)
@@ -133,7 +133,7 @@ class TestManualReceipt(unittest.TestCase):
         args.prepare_dir = str(prepare_dir)
         with patch.object(target, "build_s3_client", return_value=self.s3), \
              patch.object(target, "build_stepfunctions_client", return_value=self.sfn), \
-             patch.object(target, "guard_manual_lock") as lock_guard, \
+             patch.object(target, "guard_manual_lock", return_value=None) as lock_guard, \
              patch.object(target, "guard_pipeline_status", return_value={
                  "status_key": self.key,
                  "recovery": {
@@ -379,7 +379,7 @@ class TestManualReceipt(unittest.TestCase):
         with patch.object(sync, "recovery_module", return_value=target), \
              patch.object(sync, "build_s3_client", return_value=self.s3), \
              patch.object(target, "build_stepfunctions_client", return_value=self.sfn), \
-             patch.object(target, "guard_manual_lock"), patch.object(sync, "run_sync", return_value=[]) as publish, \
+             patch.object(target, "guard_manual_lock", return_value=None), patch.object(sync, "run_sync", return_value=[]) as publish, \
              patch.object(sync.time, "sleep"), patch.dict(os.environ, {"PORTAL_S3_VERIFY_WAIT_SEC": "0"}):
             publish.side_effect = sync.SyncError("simulated publication failure")
             with self.assertRaises(sync.SyncError):

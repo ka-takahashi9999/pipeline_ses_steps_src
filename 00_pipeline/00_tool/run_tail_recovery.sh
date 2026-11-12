@@ -50,14 +50,26 @@ PREVIOUS_ARGS=(--manual-previous-managed)
 if [[ -n "${PREVIOUS_MANUAL_RECOVERY_RECEIPT:-}" ]]; then
   PREVIOUS_ARGS=(--manual-recovery-receipt "$PREVIOUS_MANUAL_RECOVERY_RECEIPT")
 fi
+AUTHORITY_FILE="$STATE_DIR/publication_authority.json"
+run_step "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
+  --resolve-publication-authority --authority-output "$AUTHORITY_FILE"
 # いかなる削除・公開より前にsource FAILED / redrive / previous CURRENTを読取検証する。
 run_step "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
   --dry-run --step-dir "$STATE_DIR/80-75-preflight" \
+  --publication-authority-file "$AUTHORITY_FILE" \
   "${PREVIOUS_ARGS[@]}" "${MANUAL_ARGS[@]}"
-run_step "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" \
-  --apply --run-date "$RUN_DATE"
+RETENTION_PLAN="$(python3 "$ROOT/80-75_portal_s3_backup_rotation/00_tool/tail_recovery_plan.py" \
+  "$STATE_DIR/80-75-preflight/01_result/portal_s3_backup_rotation_summary.json")"
+if [[ "$RETENTION_PLAN" == "RUN_80_7" ]]; then
+  run_step "$ROOT/80-7_manage_09_result_retention/00_tool/manage_09_result_retention.py" \
+    --apply --run-date "$RUN_DATE"
+elif [[ "$RETENTION_PLAN" != "SKIP_80_7" ]]; then
+  echo "invalid retention recovery plan: $RETENTION_PLAN" >&2
+  exit 1
+fi
 run_step "$ROOT/80-75_portal_s3_backup_rotation/00_tool/portal_s3_backup_rotation.py" \
   --step-dir "$STATE_DIR/80-75" \
+  --publication-authority-file "$AUTHORITY_FILE" \
   "${PREVIOUS_ARGS[@]}" "${MANUAL_ARGS[@]}"
 run_step "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py" \
   --step-dir "$STATE_DIR/80-8" --run-date "$RUN_DATE" --run-id "$RECOVERY_ID"

@@ -37,6 +37,7 @@ SRC_ROOT = project_root
 
 RUNNER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline.sh"
 RUNNER_MASTER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline_master.sh"
+PHASE_B_RUNNER = SRC_ROOT / "00_pipeline/00_tool/run_full_pipeline_phase_b.sh"
 ASSISTANCE_RUNNER = SRC_ROOT / "00_pipeline/10_assistance_tool/run_suggest_and_cleanup.sh"
 CONFIG_ENV = SRC_ROOT / "00_pipeline/00_tool/pipeline_s3_config.env"
 RETENTION_SCRIPT = (
@@ -121,6 +122,13 @@ class TestRunnerWiring(unittest.TestCase):
         for step in NEW_STEPS:
             pattern = re.compile(rf'^run_step "{re.escape(step)}.*\$ROOT/{re.escape(step)}/00_tool/', re.M)
             self.assertRegex(self.text, pattern, msg=step)
+
+    def test_publication_authority_is_resolved_and_explicitly_handed_to_80_75(self):
+        for text in (self.text, PHASE_B_RUNNER.read_text(encoding="utf-8")):
+            self.assertIn('run_step "80-74_resolve_publication_authority"', text)
+            self.assertIn("--resolve-publication-authority", text)
+            self.assertIn("--authority-output \"$PUBLICATION_AUTHORITY\"", text)
+            self.assertIn("--publication-authority-file \"$PUBLICATION_AUTHORITY\"", text)
 
     def test_80_7_is_invoked_with_apply(self):
         line = [l for l in self.text.splitlines() if "manage_09_result_retention.py" in l]

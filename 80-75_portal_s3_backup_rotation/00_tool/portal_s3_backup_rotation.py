@@ -69,6 +69,8 @@ STEP_DIR = Path(__file__).resolve().parents[1]
 SYNC_STEP_DIR_NAME = "80-9_portal_s3_sync"
 SYNC_SUMMARY_FILENAME = "portal_s3_sync_summary.json"
 BACKUP_SUMMARY_FILENAME = "portal_s3_backup_rotation_summary.json"
+PUBLICATION_AUTHORITY_FILENAME = "publication_authority.json"
+PUBLICATION_AUTHORITY_SCHEMA_VERSION = 1
 IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION = 1
 PREPARE_STEP_DIR_NAME = "80-8_portal_s3_prepare"
 PREVIOUS_MANIFEST_FILENAME = "portal_s3_manifest.jsonl"
@@ -77,6 +79,13 @@ PREPUBLICATION_RECOVERY_MODE = "pre_publication_failed_runs"
 PUBLICATION_BOUNDARY_STEP_NAME = "80-75_portal_s3_backup_rotation"
 PUBLICATION_BOUNDARY_STATE = "SendPhaseBLauncherCommand"
 PIPELINE_STEP_RE = re.compile(r"^(\d{2})-(\d+)(?:_|\(|$)")
+
+PHASE_VALIDATING = "VALIDATING"
+PHASE_ROTATION_STARTED = "ROTATION_STARTED"
+PHASE_ROTATION_VERIFIED = "ROTATION_VERIFIED"
+ROTATION_PHASES = frozenset(
+    (PHASE_VALIDATING, PHASE_ROTATION_STARTED, PHASE_ROTATION_VERIFIED)
+)
 
 AWS_BIN = "/usr/bin/aws"
 RESULT_DIR_NAME = "01_result"
@@ -140,6 +149,42 @@ REQUIRED_SYNC_SUMMARY_VALUES = (
 
 class RotationError(Exception):
     """S3を変更しない / verify不成立で異常終了すべき状態。"""
+
+
+def _write_json_atomic(path: Path, document: Dict[str, Any]) -> None:
+    """80-75 control JSONを同一directory内の一時ファイル経由で確定する。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+        temporary.replace(path)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
+def _record_rotation_phase(args: argparse.Namespace, phase: str) -> None:
+    """副作用境界をsummary pathへ先行記録し、異常終了時もphaseを残す。"""
+    if phase not in ROTATION_PHASES:
+        raise RotationError(f"80-75 side-effect phaseが不正です: {phase!r}")
+    args._side_effect_phase = phase
+    path = getattr(args, "_summary_path", None)
+    if path is None:
+        return
+    document = {
+        "step": STEP_NAME,
+        "operation": "bootstrap" if getattr(args, "bootstrap", False) else "rotation",
+        "mode": "dry-run" if getattr(args, "dry_run", False) else "apply",
+        "backup_status": "RUNNING",
+        "side_effect_phase": phase,
+        "phase_updated_at": datetime.now(timezone.utc).isoformat(),
+        "run_date": os.environ.get("RUN_DATE"),
+        "run_id": os.environ.get("RUN_ID"),
+    }
+    _write_json_atomic(Path(path), document)
 
 
 # ---------------------------------------------------------------------------
@@ -522,13 +567,18 @@ def _pipeline_step_order(step_name: Any) -> Optional[Tuple[int, Fraction]]:
     return int(major_text), Fraction(int(minor_text), 10 ** len(minor_text))
 
 
-def _validate_prepublication_step(step_name: Any) -> Dict[str, Any]:
+def _validate_prepublication_step(
+    step_name: Any,
+    allow_validating_boundary: bool = False,
+) -> Dict[str, Any]:
     """failure reasonではなく、current_stepが80-75より前かだけを判定する。"""
     actual_order = _pipeline_step_order(step_name)
     boundary_order = _pipeline_step_order(PUBLICATION_BOUNDARY_STEP_NAME)
     if actual_order is None or boundary_order is None:
         raise RotationError(f"failure stepの順序を解決できません: {step_name!r}")
-    if actual_order >= boundary_order:
+    if actual_order > boundary_order or (
+        actual_order == boundary_order and not allow_validating_boundary
+    ):
         raise RotationError(
             "publication境界以降のFAILED runはrecoveryできません "
             f"(step={step_name!r} / boundary={PUBLICATION_BOUNDARY_STEP_NAME})"
@@ -536,7 +586,8 @@ def _validate_prepublication_step(step_name: Any) -> Dict[str, Any]:
     return {
         "current_step": step_name,
         "step_order_verified": True,
-        "before_publication_boundary": True,
+        "before_publication_boundary": actual_order < boundary_order,
+        "at_validating_boundary": actual_order == boundary_order,
     }
 
 
@@ -2102,22 +2153,129 @@ def verify_manual_source(context, s3, sfn):
     return key, document
 
 
-def verify_manual_prepublication_source(context, s3, sfn):
-    """manual sourceが80-75より前で失敗し、publication未到達であることを検証する。"""
+def _read_log_tail(path: Path, max_bytes: int = 2 * 1024 * 1024) -> str:
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - max_bytes))
+            return stream.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise RotationError(f"source pipeline.logを読めません: {path} ({exc})") from exc
+
+
+def _validating_boundary_evidence(
+    context: Dict[str, str],
+    document: Dict[str, Any],
+    authority_fingerprint_verified: bool,
+) -> Dict[str, Any]:
+    """80-75到達済みrunを、rotation開始前のvalidation failureに限定して証明する。"""
+    if authority_fingerprint_verified is not True:
+        raise RotationError("80-75 VALIDATING recoveryにはauthority fingerprint照合が必要です")
+    summary_path = STEP_DIR / RESULT_DIR_NAME / BACKUP_SUMMARY_FILENAME
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RotationError(f"80-75 failure summaryを読めません: {summary_path} ({exc})") from exc
+    if summary.get("backup_status") != "FAILED":
+        raise RotationError("80-75 failure summaryがFAILEDではありません")
+    phase = summary.get("side_effect_phase")
+    phase_source = "summary"
+    summary_run_date = summary.get("run_date")
+    summary_run_id = summary.get("run_id")
+    if summary_run_date is not None or summary_run_id is not None:
+        if (summary_run_date != context["run_date"]
+                or summary_run_id not in (context["run_id"], context["recovery_id"])):
+            raise RotationError("80-75 failure summaryのrun identityがsourceと一致しません")
+    if phase is None:
+        # phase導入前の既知validation failureだけを、既存errorとlogから安全側に復元する。
+        message = summary.get("error_message", "")
+        if not isinstance(message, str) or not message.startswith(
+            "previous verified SUCCEEDED後にCURRENTが変更されています"
+        ):
+            raise RotationError("legacy 80-75 failureをVALIDATINGと証明できません")
+        phase = PHASE_VALIDATING
+        phase_source = "legacy_summary_and_log_inference"
+    if phase != PHASE_VALIDATING:
+        raise RotationError(
+            "80-75 failureはrotation開始前ではありません "
+            f"(side_effect_phase={phase!r})"
+        )
+
+    log_path = (
+        project_root / "00_pipeline" / RESULT_DIR_NAME / "managed"
+        / context["run_date"] / context["run_id"] / "pipeline.log"
+    )
+    tail = _read_log_tail(log_path)
+    required = (
+        "=== START 80-75_portal_s3_backup_rotation ===",
+        "=== FAILED 80-75_portal_s3_backup_rotation",
+    )
+    if any(marker not in tail for marker in required):
+        raise RotationError("80-75 START/FAILED log evidenceが不足しています")
+    if phase_source == "legacy_summary_and_log_inference" and (
+        "previous verified SUCCEEDED後にCURRENTが変更されています" not in tail
+    ):
+        raise RotationError("legacy 80-75 validation errorが対象run logにありません")
+    forbidden = (
+        "=== DONE 80-75_portal_s3_backup_rotation",
+        "=== START 80-8_portal_s3_prepare",
+        "=== START 80-9_portal_s3_sync",
+    )
+    if any(marker in tail for marker in forbidden):
+        raise RotationError("80-75後続実行またはpartial publicationのlog evidenceがあります")
+    if document.get("current_step") != STEP_NAME:
+        raise RotationError("80-75 VALIDATING source statusのcurrent_stepが不正です")
+    return {
+        "side_effect_phase": PHASE_VALIDATING,
+        "side_effect_phase_source": phase_source,
+        "rotation_started": False,
+        "authority_fingerprint_verified": True,
+        "downstream_80_8_started": False,
+        "downstream_80_9_started": False,
+        "partial_publish_detected": False,
+        "failure_summary_path": str(summary_path),
+        "pipeline_log_path": str(log_path),
+    }
+
+
+def verify_manual_prepublication_source(
+    context,
+    s3,
+    sfn,
+    authority_fingerprint_verified: bool = False,
+):
+    """manual sourceがpublication副作用前で失敗したことを厳格に検証する。"""
     key, document = verify_manual_source(context, s3, sfn)
-    step_evidence = _validate_prepublication_step(document["current_step"])
+    actual_order = _pipeline_step_order(document["current_step"])
+    boundary_order = _pipeline_step_order(PUBLICATION_BOUNDARY_STEP_NAME)
+    at_boundary = actual_order is not None and actual_order == boundary_order
+    step_evidence = _validate_prepublication_step(
+        document["current_step"],
+        allow_validating_boundary=at_boundary and authority_fingerprint_verified,
+    )
+    phase_evidence = {}
+    if at_boundary:
+        phase_evidence = _validating_boundary_evidence(
+            context, document, authority_fingerprint_verified
+        )
     events, history_pages = _get_execution_history(sfn, context["execution_arn"])
     entered_states = [
         event.get("stateEnteredEventDetails", {}).get("name")
         for event in events
         if isinstance(event.get("stateEnteredEventDetails"), dict)
     ]
-    if PUBLICATION_BOUNDARY_STATE in entered_states:
+    launcher_state_reached = PUBLICATION_BOUNDARY_STATE in entered_states
+    if launcher_state_reached and not at_boundary:
         raise RotationError("manual source executionはpublication境界へ到達済みです")
     return key, document, {
         **step_evidence,
+        **phase_evidence,
+        "source_execution_redrive_count": 0,
         "publication_boundary_state": PUBLICATION_BOUNDARY_STATE,
         "publication_boundary_reached": False,
+        "launcher_state_reached": launcher_state_reached,
+        "publication_side_effect_boundary_reached": False,
         "history_pages_checked": history_pages,
         "history_event_count": len(events),
     }
@@ -2260,7 +2418,340 @@ def finalize_manual_receipt(context, summary, manifest_path, s3, sfn):
     return path
 
 
-def guard_manual_lock(context, s3, sfn, require_prepublication=False):
+def _read_s3_json(s3_client, key: str, label: str) -> Dict[str, Any]:
+    try:
+        response = s3_client.get_object(Bucket=EXPECTED_BUCKET, Key=key)
+        document = json.loads(response["Body"].read().decode("utf-8"))
+    except Exception as exc:
+        raise RotationError(f"{label}を読めません: s3://{EXPECTED_BUCKET}/{key} ({exc})") from exc
+    if not isinstance(document, dict):
+        raise RotationError(f"{label}がJSON objectではありません")
+    return document
+
+
+def _portal_current_identity(s3_client) -> Dict[str, str]:
+    key = (
+        f"{EXPECTED_CURRENT_PREFIX}/08-5_high_score_required_skill_recheck/"
+        "01_result/production_commit.json"
+    )
+    document = _read_s3_json(s3_client, key, "Portal CURRENT production_commit")
+    run_date, run_id = document.get("run_date"), document.get("run_id")
+    if not isinstance(run_date, str) or RUN_DATE_RE.fullmatch(run_date) is None:
+        raise RotationError("Portal CURRENT production_commit run_dateが不正です")
+    if not isinstance(run_id, str) or RUN_ID_RE.fullmatch(run_id) is None:
+        raise RotationError("Portal CURRENT production_commit run_idが不正です")
+    return {"run_date": run_date, "run_id": run_id, "source_key": key}
+
+
+def _managed_authority_candidate(
+    s3_client,
+    summary_path: Path,
+    manifest_path: Path,
+) -> Dict[str, Any]:
+    summary = load_previous_sync_summary(summary_path)
+    provenance = validate_previous_sync_summary(summary)
+    validate_recovery_manifest_reference(manifest_path, summary.get("manifest_path"))
+    manifest_raw = manifest_path.read_text(encoding="utf-8")
+    manifest = load_recovery_manifest_inventory(manifest_path)
+    if (len(manifest) != provenance["file_count"]
+            or sum(manifest.values()) != provenance["total_bytes"]):
+        raise RotationError("managed authority manifestと80-9 summaryのcount/bytesが不一致です")
+
+    runs = list_status_runs(
+        s3_client, EXPECTED_BUCKET, EXPECTED_BASE_PREFIX, EXPECTED_STATUS_PREFIX
+    )
+    matches = [
+        run for run in runs
+        if run["run_date"] == provenance["run_date"] and run["run_id"] == provenance["run_id"]
+    ]
+    if len(matches) != 1:
+        raise RotationError("managed authority pipeline-statusを一意に特定できません")
+    document = get_status_document(s3_client, EXPECTED_BUCKET, matches[0]["key"])
+    _validate_terminal_status_document(matches[0], document, "managed publication authority")
+    if document.get("status") != "SUCCEEDED" or document.get("exit_code") != 0:
+        raise RotationError("managed publication authorityがSUCCEEDED/exit=0ではありません")
+    verified_at = _parse_evidence_timestamp(
+        "managed authority finished_at", document.get("finished_at")
+    ).isoformat()
+    return {
+        "publication_kind": "managed",
+        "source": {"run_date": provenance["run_date"], "run_id": provenance["run_id"]},
+        "verified_at": verified_at,
+        "manifest_sha256": hashlib.sha256(manifest_raw.encode("utf-8")).hexdigest(),
+        "manifest_source_path": str(manifest_path.resolve()),
+        "summary_source_path": str(summary_path.resolve()),
+        "receipt_source_path": None,
+        "manifest_inventory": manifest,
+        "evidence_verified": True,
+    }
+
+
+def _manual_authority_candidate(path: Path, s3_client, sfn_client) -> Dict[str, Any]:
+    records = list(read_jsonl(str(path)))
+    if len(records) != 1:
+        raise RotationError("manual authority receiptは1行1件が必須です")
+    receipt = records[0]
+    context, summary, manifest = validate_receipt_snapshot(receipt)
+    _, failed = verify_manual_source(context, s3_client, sfn_client)
+    if failed != json.loads(receipt["failed_status_snapshot"]):
+        raise RotationError("manual authority source statusがreceipt snapshotから変更されています")
+    return {
+        "publication_kind": "manual_recovery",
+        "source": {"run_date": context["run_date"], "run_id": context["run_id"]},
+        "verified_at": receipt["verified_at"],
+        "manifest_sha256": receipt["manifest_sha256"],
+        "manifest_source_path": str(path.resolve()) + "#manifest_snapshot",
+        "summary_source_path": str(path.resolve()) + "#summary_snapshot",
+        "receipt_source_path": str(path.resolve()),
+        "current_fingerprint": receipt["current_fingerprint"],
+        "bk1_fingerprint": receipt["bk1_fingerprint"],
+        "manifest_inventory": manifest,
+        "publication_summary": summary,
+        "evidence_verified": True,
+    }
+
+
+def select_latest_publication_authority(
+    managed: Optional[Dict[str, Any]],
+    manuals: List[Dict[str, Any]],
+    live_current: Dict[str, Dict[str, Any]],
+    live_bk1: Dict[str, Dict[str, Any]],
+    portal_identity: Dict[str, str],
+    latest_managed_verified_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """verified evidenceの時刻順で正本を選び、選択authorityだけをlive実体照合する。"""
+    candidates = []
+    if managed is not None and managed.get("evidence_verified") is True:
+        candidates.append(managed)
+    candidates.extend(item for item in manuals if item.get("evidence_verified") is True)
+    if not candidates:
+        raise RotationError("verified publication authorityが存在しません")
+    ordered = sorted(
+        candidates,
+        key=lambda item: _parse_evidence_timestamp("authority verified_at", item["verified_at"]),
+    )
+    if len(ordered) > 1 and (
+        _parse_evidence_timestamp("latest authority", ordered[-1]["verified_at"])
+        == _parse_evidence_timestamp("previous authority", ordered[-2]["verified_at"])
+    ):
+        raise RotationError("latest publication authorityを一意に特定できません")
+    selected = dict(ordered[-1])
+
+    source = selected.get("source") or {}
+    if portal_identity.get("run_date") != source.get("run_date"):
+        raise RotationError("Portal CURRENT RUN_DATEとlatest authorityが一致しません")
+    if portal_identity.get("run_id") != source.get("run_id"):
+        raise RotationError("Portal CURRENT RUN_IDとlatest authorityが一致しません")
+
+    if selected["publication_kind"] == "manual_recovery":
+        if latest_managed_verified_at is not None:
+            manual_time = _parse_evidence_timestamp("manual authority", selected["verified_at"])
+            managed_time = _parse_evidence_timestamp(
+                "managed previous success", latest_managed_verified_at
+            )
+            if manual_time <= managed_time:
+                raise RotationError("manual authorityがmanaged previous successより新しくありません")
+        if selected.get("current_fingerprint") != live_current:
+            raise RotationError("latest manual authority CURRENT fingerprint実体不一致")
+        if selected.get("bk1_fingerprint") != live_bk1:
+            raise RotationError("latest manual authority BK1 fingerprint実体不一致")
+    elif selected["publication_kind"] == "managed":
+        manifest = selected.get("manifest_inventory")
+        if not isinstance(manifest, dict) or {
+            path: item["size"] for path, item in live_current.items()
+        } != manifest:
+            raise RotationError("latest managed authority manifestとCURRENT実体が一致しません")
+        selected["current_fingerprint"] = live_current
+        selected["bk1_fingerprint"] = live_bk1
+    else:
+        raise RotationError("publication_kindが不正です")
+
+    selected["current_fingerprint"] = _fingerprint_summary(live_current)
+    selected["bk1_fingerprint"] = _fingerprint_summary(live_bk1)
+    selected.pop("manifest_inventory", None)
+    selected.pop("publication_summary", None)
+    selected.pop("evidence_verified", None)
+    selected.update({
+        "schema_version": PUBLICATION_AUTHORITY_SCHEMA_VERSION,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+        "portal_identity_source_key": portal_identity.get("source_key"),
+    })
+    return selected
+
+
+def _fingerprint_summary(inventory: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(inventory, dict) or not inventory:
+        raise RotationError("fingerprint inventoryが空です")
+    canonical = json.dumps(
+        inventory, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "algorithm": "sha256-canonical-json-v1",
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "file_count": len(inventory),
+        "total_bytes": sum(item["size"] for item in inventory.values()),
+    }
+
+
+def _validate_fingerprint_summary(value: Any, label: str) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "algorithm", "sha256", "file_count", "total_bytes"
+    }:
+        raise RotationError(f"publication authority {label} schema不正")
+    if value["algorithm"] != "sha256-canonical-json-v1":
+        raise RotationError(f"publication authority {label} algorithm不正")
+    if re.fullmatch(r"[0-9a-f]{64}", str(value["sha256"])) is None:
+        raise RotationError(f"publication authority {label} SHA-256不正")
+    for key in ("file_count", "total_bytes"):
+        if type(value[key]) is not int or value[key] < 0:
+            raise RotationError(f"publication authority {label} {key}不正")
+    if value["file_count"] <= 0:
+        raise RotationError(f"publication authority {label} file_countが0です")
+
+
+def _latest_managed_success_verified_at(s3_client) -> Optional[str]:
+    """pipeline-status上の最新SUCCEEDED完了時刻をmanual authorityの下限にする。"""
+    succeeded = []
+    for run in list_status_runs(
+        s3_client, EXPECTED_BUCKET, EXPECTED_BASE_PREFIX, EXPECTED_STATUS_PREFIX
+    ):
+        document = get_status_document(s3_client, EXPECTED_BUCKET, run["key"])
+        if document.get("status") == "RUNNING":
+            # resolver自身を起動したmanaged run。80-75本体のexecution guardで厳格検証する。
+            continue
+        _validate_terminal_status_document(run, document, "managed publication history")
+        if document.get("status") == "SUCCEEDED":
+            if document.get("exit_code") != 0:
+                raise RotationError("SUCCEEDED managed statusのexit_codeが0ではありません")
+            succeeded.append(
+                _parse_evidence_timestamp(
+                    "managed publication history finished_at", document.get("finished_at")
+                )
+            )
+        elif document.get("status") != "FAILED":
+            raise RotationError("managed publication historyに非terminal statusがあります")
+    if not succeeded:
+        return None
+    return max(succeeded).isoformat()
+
+
+def resolve_latest_publication_authority(args, logger) -> Dict[str, Any]:
+    """managed summary/statusとverified manual receiptsからlatest authorityを解決する。"""
+    config = load_pipeline_s3_config()
+    lock_backup_route(
+        config["PIPELINE_S3_BUCKET"], config["PIPELINE_S3_BASE_PREFIX"],
+        config["PORTAL_S3_PREFIX"], config["PORTAL_S3_BACKUP_PREFIX"],
+    )
+    lock_status_prefix(config["PIPELINE_STATUS_PREFIX"])
+    s3 = build_s3_client(config["PIPELINE_AWS_REGION"])
+    sfn = build_stepfunctions_client(config["PIPELINE_AWS_REGION"])
+    sync_dir = Path(args.sync_dir) if args.sync_dir else project_root / SYNC_STEP_DIR_NAME
+    prepare_dir = Path(args.prepare_dir) if args.prepare_dir else project_root / PREPARE_STEP_DIR_NAME
+    rejected = []
+    try:
+        managed = _managed_authority_candidate(
+            s3,
+            sync_dir / RESULT_DIR_NAME / SYNC_SUMMARY_FILENAME,
+            prepare_dir / RESULT_DIR_NAME / PREVIOUS_MANIFEST_FILENAME,
+        )
+    except Exception as exc:
+        # canonical summaryがmanual recovery publicationならmanaged候補ではない。
+        # manual候補も無ければselectでfail closedする。
+        managed = None
+        rejected.append({
+            "path": str((sync_dir / RESULT_DIR_NAME / SYNC_SUMMARY_FILENAME).resolve()),
+            "reason": str(exc),
+            "candidate_kind": "managed",
+        })
+        logger.warn(f"managed authority candidate不採用: {exc}")
+
+    manuals = []
+    for path in sorted(RECEIPT_DIR.glob("*/receipt.jsonl")):
+        try:
+            manuals.append(_manual_authority_candidate(path, s3, sfn))
+        except Exception as exc:  # fail-openしない。invalid receiptはcandidateにしない。
+            rejected.append({"path": str(path.resolve()), "reason": str(exc)})
+            logger.warn(f"manual authority candidate不採用: {path} ({exc})")
+
+    authority = select_latest_publication_authority(
+        managed,
+        manuals,
+        complete_fingerprints(s3, EXPECTED_CURRENT_PREFIX),
+        complete_fingerprints(s3, EXPECTED_BACKUP_PREFIX),
+        _portal_current_identity(s3),
+        _latest_managed_success_verified_at(s3),
+    )
+    authority["rejected_receipts"] = rejected
+    output = Path(args.authority_output)
+    _write_json_atomic(output, authority)
+    logger.info(
+        "publication authority確定: "
+        f"kind={authority['publication_kind']} "
+        f"source={authority['source']['run_date']}/{authority['source']['run_id']}"
+    )
+    return authority
+
+
+def load_publication_authority(path: Path) -> Dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RotationError(f"publication authority fileを読めません: {path} ({exc})") from exc
+    if document.get("schema_version") != PUBLICATION_AUTHORITY_SCHEMA_VERSION:
+        raise RotationError("publication authority schema_version不一致")
+    if document.get("publication_kind") not in ("managed", "manual_recovery"):
+        raise RotationError("publication authority kind不一致")
+    source = document.get("source") or {}
+    if (not isinstance(source.get("run_date"), str)
+            or RUN_DATE_RE.fullmatch(source["run_date"]) is None
+            or not isinstance(source.get("run_id"), str)
+            or RUN_ID_RE.fullmatch(source["run_id"]) is None):
+        raise RotationError("publication authority source identity不正")
+    _parse_evidence_timestamp("publication authority verified_at", document.get("verified_at"))
+    if not re.fullmatch(r"[0-9a-f]{64}", str(document.get("manifest_sha256", ""))):
+        raise RotationError("publication authority manifest hash不正")
+    for key in ("current_fingerprint", "bk1_fingerprint"):
+        _validate_fingerprint_summary(document.get(key), key)
+    return document
+
+
+def _authority_summary(authority: Dict[str, Any]) -> Dict[str, Any]:
+    """巨大fingerprintをsummaryへ複製せず、検証済みauthorityの識別情報だけ固定する。"""
+    return {
+        "schema_version": authority["schema_version"],
+        "publication_kind": authority["publication_kind"],
+        "source": authority["source"],
+        "verified_at": authority["verified_at"],
+        "manifest_sha256": authority["manifest_sha256"],
+        "manifest_source_path": authority.get("manifest_source_path"),
+        "summary_source_path": authority.get("summary_source_path"),
+        "receipt_source_path": authority.get("receipt_source_path"),
+        "authority_file": authority.get("authority_file"),
+        "live_fingerprint_verified": True,
+    }
+
+
+def verify_publication_authority_live(
+    authority: Dict[str, Any],
+    s3_client,
+) -> None:
+    if _fingerprint_summary(
+        complete_fingerprints(s3_client, EXPECTED_CURRENT_PREFIX)
+    ) != authority["current_fingerprint"]:
+        raise RotationError("publication authority確定後にCURRENTが変化しました")
+    if _fingerprint_summary(
+        complete_fingerprints(s3_client, EXPECTED_BACKUP_PREFIX)
+    ) != authority["bk1_fingerprint"]:
+        raise RotationError("publication authority確定後にBK1が変化しました")
+
+
+def guard_manual_lock(
+    context,
+    s3,
+    sfn,
+    require_prepublication=False,
+    authority_fingerprint_verified=False,
+):
     """tailの共有lockを継承したprocessだけ許可。statusへの書込みはしない。"""
     lock = project_root / "00_pipeline/01_result/run_full_pipeline.lock"
     try:
@@ -2275,9 +2766,15 @@ def guard_manual_lock(context, s3, sfn, require_prepublication=False):
         raise RotationError("manual recovery env identity不一致")
     guard_no_active_runs(s3, sfn, context["recovery_id"])
     if require_prepublication:
-        verify_manual_prepublication_source(context, s3, sfn)
-    else:
-        verify_manual_source(context, s3, sfn)
+        _, _, evidence = verify_manual_prepublication_source(
+            context,
+            s3,
+            sfn,
+            authority_fingerprint_verified=authority_fingerprint_verified,
+        )
+        return evidence
+    verify_manual_source(context, s3, sfn)
+    return None
 
 
 def guard_no_active_runs(s3, sfn, recovery_id=None):
@@ -2333,17 +2830,25 @@ def run_manual_rotation(args, logger):
         raise RotationError("明示的なmanual recovery previous baselineが必要です")
 
     receipt = None
+    authority_fingerprint_verified = False
     if path is not None:
         receipt, provenance, status = verify_manual_receipt(path, s3, sfn)
+        authority = getattr(args, "_publication_authority", None)
+        if authority is not None:
+            if authority["publication_kind"] != "manual_recovery":
+                raise RotationError("manual receiptとpublication authority kindが一致しません")
+            if Path(authority["receipt_source_path"]).resolve() != Path(path).resolve():
+                raise RotationError("manual receipt pathとpublication authorityが一致しません")
+            if authority["source"] != {
+                "run_date": receipt["source"]["run_date"],
+                "run_id": receipt["source"]["run_id"],
+            }:
+                raise RotationError("manual receipt identityとpublication authorityが一致しません")
+            verify_publication_authority_live(authority, s3)
+            authority_fingerprint_verified = True
     else:
         if context is None:
             raise RotationError("managed previous baselineにはmanual recovery contextが必要です")
-        guard_manual_lock(
-            context,
-            s3,
-            sfn,
-            require_prepublication=getattr(args, "manual_prepublication_source", False),
-        )
         sync_dir = Path(args.sync_dir) if args.sync_dir else project_root / SYNC_STEP_DIR_NAME
         prepare_dir = Path(args.prepare_dir) if args.prepare_dir else project_root / PREPARE_STEP_DIR_NAME
         previous_summary = load_previous_sync_summary(
@@ -2355,6 +2860,19 @@ def run_manual_rotation(args, logger):
             previous_manifest, previous_summary.get("manifest_path")
         )
         manifest_inventory = load_recovery_manifest_inventory(previous_manifest)
+        authority = getattr(args, "_publication_authority", None)
+        if authority is not None:
+            if authority["publication_kind"] != "managed":
+                raise RotationError("managed previous baselineのauthority kindが不正です")
+            if authority["source"] != {
+                "run_date": provenance["run_date"], "run_id": provenance["run_id"]
+            }:
+                raise RotationError("managed previous baselineとauthority sourceが不一致です")
+            manifest_raw = previous_manifest.read_text(encoding="utf-8")
+            if hashlib.sha256(manifest_raw.encode("utf-8")).hexdigest() != authority["manifest_sha256"]:
+                raise RotationError("managed previous baseline authority manifest hash不一致")
+            verify_publication_authority_live(authority, s3)
+            authority_fingerprint_verified = True
         status = guard_pipeline_status(
             s3,
             EXPECTED_BUCKET,
@@ -2369,14 +2887,16 @@ def run_manual_rotation(args, logger):
         if {path: item["size"] for path, item in current_inventory.items()} != manifest_inventory:
             raise RotationError("managed previous manifestとCURRENT実体が一致しません")
     execution_guard = None
+    source_guard = None
     if context is not None:
         if receipt_path(context).parent.exists():
             raise RotationError("recovery IDは使用済みです")
-        guard_manual_lock(
+        source_guard = guard_manual_lock(
             context,
             s3,
             sfn,
             require_prepublication=getattr(args, "manual_prepublication_source", False),
+            authority_fingerprint_verified=authority_fingerprint_verified,
         )
     else:
         # 通常managed callerはenv/status/execution保護を維持。receiptはpreviousだけを承認。
@@ -2422,16 +2942,26 @@ def run_manual_rotation(args, logger):
                    "receipt": receipt,
                    "verified": True,
                    "context": context,
-                   "source_guard": status.get("recovery") if isinstance(status, dict) else None,
+                   "source_guard": (
+                       source_guard
+                       if source_guard is not None
+                       else status.get("recovery") if isinstance(status, dict) else None
+                   ),
                },
                "current_before": {"file_count": len(expected), "total_bytes": sum(expected.values())},
                "backup_before": {"file_count": len(bk1), "total_bytes": sum(v["size"] for v in bk1.values())},
-               "expected_backup": {"file_count": len(expected), "total_bytes": sum(expected.values())}}
+               "expected_backup": {"file_count": len(expected), "total_bytes": sum(expected.values())},
+               "side_effect_phase": PHASE_VALIDATING}
+    if getattr(args, "_publication_authority", None) is not None:
+        summary["publication_authority"] = _authority_summary(args._publication_authority)
     if execution_guard is not None:
         summary["immutable_execution_guard_contract_version"] = IMMUTABLE_EXECUTION_GUARD_CONTRACT_VERSION
         summary["current_execution_guard"] = execution_guard
     else:
         summary["manual_lock_verified"] = True
+    if not args.dry_run:
+        _record_rotation_phase(args, PHASE_ROTATION_STARTED)
+        summary["side_effect_phase"] = PHASE_ROTATION_STARTED
     run_sync(build_sync_argv(source, destination, config["PIPELINE_AWS_REGION"], args.dry_run), logger)
     if args.dry_run:
         summary["verify"] = {"verified": False, "skipped_reason": "dry-run"}
@@ -2444,6 +2974,8 @@ def run_manual_rotation(args, logger):
     summary["verify"] = compare_sets(expected, {p: f["size"] for p, f in after.items()}, logger)
     if not summary["verify"]["verified"]:
         raise RotationError("manual rotation BK1 verify失敗")
+    _record_rotation_phase(args, PHASE_ROTATION_VERIFIED)
+    summary["side_effect_phase"] = PHASE_ROTATION_VERIFIED
     return summary
 
 
@@ -2484,10 +3016,41 @@ def parse_args() -> argparse.Namespace:
     add_manual_recovery_arguments(parser)
     parser.add_argument("--manual-recovery-receipt", type=Path)
     parser.add_argument("--create-manual-receipt", action="store_true")
+    parser.add_argument(
+        "--resolve-publication-authority",
+        action="store_true",
+        help="S3変更なしでlatest verified publication authorityを解決する",
+    )
+    parser.add_argument(
+        "--authority-output",
+        default=None,
+        help="resolved publication authority JSONの出力先",
+    )
+    parser.add_argument(
+        "--publication-authority-file",
+        type=Path,
+        default=None,
+        help="runnerが直前に解決したpublication authority JSON",
+    )
     return parser.parse_args()
 
 
 def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
+    authority_path = getattr(args, "publication_authority_file", None)
+    if authority_path is not None:
+        authority = load_publication_authority(authority_path)
+        authority["authority_file"] = str(authority_path.resolve())
+        args._publication_authority = authority
+        if authority["publication_kind"] == "manual_recovery":
+            receipt_source = authority.get("receipt_source_path")
+            if not isinstance(receipt_source, str) or not receipt_source:
+                raise RotationError("manual publication authorityにreceipt pathがありません")
+            explicit = getattr(args, "manual_recovery_receipt", None)
+            if explicit is not None and explicit.resolve() != Path(receipt_source).resolve():
+                raise RotationError("明示receiptとpublication authorityが一致しません")
+            args.manual_recovery_receipt = Path(receipt_source)
+        elif getattr(args, "manual_recovery_receipt", None) is not None:
+            raise RotationError("managed publication authorityとmanual receiptは併用できません")
     if (getattr(args, "manual_recovery_receipt", None)
             or getattr(args, "create_manual_receipt", False)
             or manual_context(args) is not None):
@@ -2533,6 +3096,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "verify_wait_sec": wait_seconds,
         "wait_performed": False,
         "sync_summary_path": str(sync_summary_path),
+        "side_effect_phase": PHASE_VALIDATING,
     }
     if not args.dry_run:
         summary["immutable_execution_guard_contract_version"] = (
@@ -2552,6 +3116,19 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     )
 
     s3_client = build_s3_client(region)
+    authority = getattr(args, "_publication_authority", None)
+    if authority is not None:
+        if authority["publication_kind"] != "managed":
+            raise RotationError("通常managed経路のpublication authority kindが不正です")
+        if authority["source"] != {
+            "run_date": provenance["run_date"], "run_id": provenance["run_id"]
+        }:
+            raise RotationError("managed publication authorityと80-9 summaryが一致しません")
+        manifest_raw = previous_manifest_path.read_text(encoding="utf-8")
+        if hashlib.sha256(manifest_raw.encode("utf-8")).hexdigest() != authority["manifest_sha256"]:
+            raise RotationError("managed publication authority manifest hash不一致")
+        verify_publication_authority_live(authority, s3_client)
+        summary["publication_authority"] = _authority_summary(authority)
     stepfunctions_client = None
     if current_identity is not None:
         stepfunctions_client = build_stepfunctions_client(region)
@@ -2674,6 +3251,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     summary["expected_backup"] = {"file_count": len(current_before), "total_bytes": current_bytes}
 
     # ---- backup本体 -------------------------------------------------------
+    if not args.dry_run:
+        _record_rotation_phase(args, PHASE_ROTATION_STARTED)
+        summary["side_effect_phase"] = PHASE_ROTATION_STARTED
     argv = build_sync_argv(source_uri, destination_uri, region, args.dry_run)
     run_sync(argv, logger)
 
@@ -2705,6 +3285,9 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             f"size_mismatch={verify_result['size_mismatch_count']})"
         )
 
+    _record_rotation_phase(args, PHASE_ROTATION_VERIFIED)
+    summary["side_effect_phase"] = PHASE_ROTATION_VERIFIED
+
     logger.ok(
         f"bk1 verify成功: files={verify_result['actual_file_count']} / "
         f"bytes={verify_result['actual_total_bytes']}"
@@ -2715,6 +3298,29 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
 def main() -> int:
     logger = get_logger(STEP_NAME)
     args = parse_args()
+    if getattr(args, "resolve_publication_authority", False):
+        incompatible = (
+            args.bootstrap,
+            args.dry_run,
+            args.publication_authority_file is not None,
+            args.manual_recovery_receipt is not None,
+            args.create_manual_receipt,
+            manual_context(args) is not None,
+            resolve_recovery_target(args) is not None,
+        )
+        if not isinstance(args.authority_output, str) or not args.authority_output:
+            logger.error("--resolve-publication-authorityには--authority-outputが必要です")
+            return 1
+        if any(incompatible):
+            logger.error("publication authority解決とrotation/recovery optionは併用できません")
+            return 1
+        try:
+            resolve_latest_publication_authority(args, logger)
+            logger.ok("publication authority解決完了")
+            return 0
+        except Exception as exc:  # read-only resolverも不明状態はfail closedする
+            logger.error(f"publication authority解決失敗: {type(exc).__name__}: {exc}")
+            return 1
     if getattr(args, "create_manual_receipt", False):
         try:
             result = run(args, logger)
@@ -2731,6 +3337,8 @@ def main() -> int:
         args.step_dir = str(STEP_DIR / RESULT_DIR_NAME / "manual_recovery_runs" / args.manual_recovery_id)
     dirs = ensure_result_dirs(args.step_dir)
     summary_path = dirs["result"] / BACKUP_SUMMARY_FILENAME
+    args._summary_path = summary_path
+    _record_rotation_phase(args, PHASE_VALIDATING)
 
     summary: Dict[str, Any]
     exit_code = 0
@@ -2744,6 +3352,9 @@ def main() -> int:
             "operation": "bootstrap" if args.bootstrap else "rotation",
             "mode": "dry-run" if args.dry_run else "apply",
             "backup_status": "FAILED",
+            "side_effect_phase": getattr(args, "_side_effect_phase", PHASE_VALIDATING),
+            "run_date": os.environ.get("RUN_DATE"),
+            "run_id": os.environ.get("RUN_ID"),
             "error_message": str(exc),
         }
         if not args.dry_run:
@@ -2759,6 +3370,9 @@ def main() -> int:
             "operation": "bootstrap" if args.bootstrap else "rotation",
             "mode": "dry-run" if args.dry_run else "apply",
             "backup_status": "FAILED",
+            "side_effect_phase": getattr(args, "_side_effect_phase", PHASE_VALIDATING),
+            "run_date": os.environ.get("RUN_DATE"),
+            "run_id": os.environ.get("RUN_ID"),
             "error_message": f"{type(exc).__name__}: {exc}",
         }
         if not args.dry_run:
@@ -2767,9 +3381,7 @@ def main() -> int:
             )
         exit_code = 1
 
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
+    _write_json_atomic(summary_path, summary)
     logger.info(f"summary: {summary_path}")
 
     write_execution_time(
