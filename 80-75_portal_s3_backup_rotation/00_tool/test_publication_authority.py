@@ -233,6 +233,69 @@ class TestTailRecoveryGuard(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.decide(value)
 
+    def test_known_80_9_prepublish_failure_can_resume_same_formal_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for relative in ("80-75/01_result", "80-8/01_result", "80-9/01_result"):
+                (state / relative).mkdir(parents=True)
+            run_date, recovery_id = "20261111", "recovery-fixture"
+            rotation = {
+                "backup_status": "SUCCEEDED", "side_effect_phase": "ROTATION_VERIFIED",
+                "mode": "apply", "verify": {"verified": True},
+                "manual_recovery": {"context": {
+                    "run_date": run_date, "recovery_id": recovery_id,
+                }},
+            }
+            prepare = {"step": "80-8_portal_s3_prepare", "run_date": run_date,
+                       "run_id": recovery_id, "file_count": 1}
+            sync = {
+                "sync_status": "FAILED", "run_date": run_date, "run_id": recovery_id,
+                "error_message": (
+                    "RotationError: publication境界以降のFAILED runはrecoveryできません "
+                    "(step='80-75_portal_s3_backup_rotation' / "
+                    "boundary=80-75_portal_s3_backup_rotation)"
+                ),
+            }
+            (state / "80-75/01_result/portal_s3_backup_rotation_summary.json").write_text(json.dumps(rotation))
+            (state / "80-8/01_result/portal_s3_prepare_summary.json").write_text(json.dumps(prepare))
+            (state / "80-8/01_result/portal_s3_manifest.jsonl").write_text('{"relative_path":"x","size":1}\n')
+            (state / "80-9/01_result/portal_s3_sync_summary.json").write_text(json.dumps(sync))
+            self.assertEqual(
+                plan.decide_resume(state, run_date, recovery_id), "RESUME_80_9"
+            )
+
+            cases = []
+            changed = copy.deepcopy(sync)
+            changed["error_message"] = "unknown failure"
+            cases.append((rotation, prepare, changed))
+            changed = copy.deepcopy(sync)
+            changed["staging"] = {"file_count": 1}
+            cases.append((rotation, prepare, changed))
+            changed = copy.deepcopy(rotation)
+            changed["side_effect_phase"] = "ROTATION_STARTED"
+            cases.append((changed, prepare, sync))
+            changed = copy.deepcopy(prepare)
+            changed["run_id"] = "different-recovery"
+            cases.append((rotation, changed, sync))
+            for changed_rotation, changed_prepare, changed_sync in cases:
+                with self.subTest(changed_sync=changed_sync):
+                    (state / "80-75/01_result/portal_s3_backup_rotation_summary.json").write_text(
+                        json.dumps(changed_rotation)
+                    )
+                    (state / "80-8/01_result/portal_s3_prepare_summary.json").write_text(
+                        json.dumps(changed_prepare)
+                    )
+                    (state / "80-9/01_result/portal_s3_sync_summary.json").write_text(
+                        json.dumps(changed_sync)
+                    )
+                    with self.assertRaises(ValueError):
+                        plan.decide_resume(state, run_date, recovery_id)
+
+            receipt = state / "receipt.jsonl"
+            receipt.write_text("{}\n")
+            with self.assertRaises(ValueError):
+                plan.decide_resume(state, run_date, recovery_id, receipt)
+
 
 class TestBoundaryExecutionHistory(unittest.TestCase):
     def setUp(self):

@@ -95,6 +95,19 @@ def _find_call(calls, tool):
     return matches[0]
 
 
+def _find_rotation_call(calls):
+    matches = [
+        call
+        for call in calls
+        if call["arguments"]
+        and call["arguments"][0] == ROTATION_TOOL
+        and "--resolve-publication-authority" not in call["arguments"]
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one rotation call, got {len(matches)}")
+    return matches[0]
+
+
 class ManualRecoveryReceiptBridgeTest(unittest.TestCase):
     def test_runner_has_no_one_time_bridge(self):
         source = RUNNER.read_text(encoding="utf-8")
@@ -113,10 +126,10 @@ class ManualRecoveryReceiptBridgeTest(unittest.TestCase):
         self.assertEqual(0, bridge_run.returncode, bridge_run.stdout)
         self.assertEqual(0, other_run.returncode, other_run.stdout)
 
-        bridge_rotation = _find_call(bridge_calls, ROTATION_TOOL)
-        other_rotation = _find_call(other_calls, ROTATION_TOOL)
-        self.assertEqual([ROTATION_TOOL], bridge_rotation["arguments"])
-        self.assertEqual([ROTATION_TOOL], other_rotation["arguments"])
+        bridge_rotation = _find_rotation_call(bridge_calls)
+        other_rotation = _find_rotation_call(other_calls)
+        self.assertIn("--publication-authority-file", bridge_rotation["arguments"])
+        self.assertIn("--publication-authority-file", other_rotation["arguments"])
 
         self.assertEqual(
             [call["arguments"][0] for call in bridge_calls],
@@ -135,7 +148,7 @@ class ManualRecoveryReceiptBridgeTest(unittest.TestCase):
             completed, calls = _runner_probe(Path(temp_name), BRIDGE_RUN_DATE)
 
         self.assertEqual(0, completed.returncode, completed.stdout)
-        rotation = _find_call(calls, ROTATION_TOOL)
+        rotation = _find_rotation_call(calls)
         self.assertEqual("managed-identity-probe", rotation["run_id"])
         self.assertEqual(BRIDGE_RUN_DATE, rotation["run_date"])
 

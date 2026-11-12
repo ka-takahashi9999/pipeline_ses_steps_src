@@ -33,7 +33,20 @@ LOCK_FILE="$ROOT/00_pipeline/01_result/run_full_pipeline.lock"
 exec 9<>"$LOCK_FILE"
 /usr/bin/flock -n 9 || { echo "another pipeline run is active" >&2; exit 1; }
 mkdir -p "$ROOT/00_pipeline/01_result/manual_recovery"
-mkdir "$STATE_DIR" || { echo "recovery ID already used" >&2; exit 1; }
+RESUME_80_9=false
+if ! mkdir "$STATE_DIR" 2>/dev/null; then
+  RESUME_PLAN="$(python3 "$ROOT/80-75_portal_s3_backup_rotation/00_tool/tail_recovery_plan.py" \
+    --resume-state-dir "$STATE_DIR" --run-date "$RUN_DATE" --recovery-id "$RECOVERY_ID" \
+    --receipt-path "$ROOT/80-9_portal_s3_sync/01_result/manual_recovery/$RECOVERY_ID/receipt.jsonl")" || {
+      echo "recovery ID already used and is not safely resumable" >&2
+      exit 1
+    }
+  if [[ "$RESUME_PLAN" != "RESUME_80_9" ]]; then
+    echo "invalid formal recovery resume plan: $RESUME_PLAN" >&2
+    exit 1
+  fi
+  RESUME_80_9=true
+fi
 # lock file is already locked; truncate through the inherited descriptor.
 : > "$LOCK_FILE"
 printf '%s\n' "$RECOVERY_ID" >&9
@@ -46,6 +59,13 @@ log="$STATE_DIR/tail.log"
 run_step() {
   python3 "$@" 2>&1 | tee -a "$log"
 }
+if [[ "$RESUME_80_9" == true ]]; then
+  run_step "$ROOT/80-9_portal_s3_sync/00_tool/portal_s3_sync.py" \
+    --step-dir "$STATE_DIR/80-9" --prepare-dir "$STATE_DIR/80-8" \
+    --rotation-summary "$STATE_DIR/80-75/01_result/portal_s3_backup_rotation_summary.json" \
+    --run-date "$RUN_DATE" --run-id "$RECOVERY_ID" "${MANUAL_ARGS[@]}"
+  exit 0
+fi
 PREVIOUS_ARGS=(--manual-previous-managed)
 if [[ -n "${PREVIOUS_MANUAL_RECOVERY_RECEIPT:-}" ]]; then
   PREVIOUS_ARGS=(--manual-recovery-receipt "$PREVIOUS_MANUAL_RECOVERY_RECEIPT")
@@ -75,4 +95,5 @@ run_step "$ROOT/80-8_portal_s3_prepare/00_tool/portal_s3_prepare.py" \
   --step-dir "$STATE_DIR/80-8" --run-date "$RUN_DATE" --run-id "$RECOVERY_ID"
 run_step "$ROOT/80-9_portal_s3_sync/00_tool/portal_s3_sync.py" \
   --step-dir "$STATE_DIR/80-9" --prepare-dir "$STATE_DIR/80-8" \
+  --rotation-summary "$STATE_DIR/80-75/01_result/portal_s3_backup_rotation_summary.json" \
   --run-date "$RUN_DATE" --run-id "$RECOVERY_ID" "${MANUAL_ARGS[@]}"

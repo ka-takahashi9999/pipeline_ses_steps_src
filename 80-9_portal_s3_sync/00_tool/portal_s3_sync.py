@@ -665,6 +665,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-dir", default=None, help="80-8 stepディレクトリ（focused test用）")
     parser.add_argument("--run-date", default=None, help="RUN_DATE（既定は環境変数RUN_DATE）")
     parser.add_argument("--run-id", default=None, help="RUN_ID（既定は環境変数RUN_ID）")
+    parser.add_argument(
+        "--rotation-summary",
+        type=Path,
+        default=None,
+        help="formal tail recoveryで検証済みの80-75 ROTATION_VERIFIED summary",
+    )
     recovery_module().add_manual_recovery_arguments(parser)
     return parser.parse_args()
 
@@ -697,6 +703,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
     recovery = recovery_module()
     context = recovery.manual_context(args)
     recovery_s3 = recovery_sfn = bk1_before = None
+    rotation_checkpoint = None
     if context is not None:
         if args.dry_run:
             raise SyncError("manual recovery publishはdry-runでreceiptを確定できません")
@@ -706,11 +713,18 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             raise SyncError("recovery IDは使用済みです")
         recovery_s3 = build_s3_client(region)
         recovery_sfn = recovery.build_stepfunctions_client(region)
+        rotation_summary = getattr(args, "rotation_summary", None)
+        if rotation_summary is None:
+            raise SyncError("manual recovery publishには80-75 rotation checkpointが必要です")
+        rotation_checkpoint = recovery.verify_completed_rotation_checkpoint(
+            rotation_summary, context, recovery_s3
+        )
         recovery.guard_manual_lock(
             context,
             recovery_s3,
             recovery_sfn,
             require_prepublication=getattr(args, "manual_prepublication_source", False),
+            authority_fingerprint_verified=True,
         )
         bk1_before = recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX)
 
@@ -741,6 +755,8 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
         "selected_step_dir_count": len(step_dirs),
         "manifest_path": str(manifest_path),
     }
+    if rotation_checkpoint is not None:
+        summary["rotation_checkpoint"] = rotation_checkpoint
 
     stage_root = None
     try:
@@ -799,6 +815,7 @@ def run(args: argparse.Namespace, logger) -> Dict[str, Any]:
             recovery_s3,
             recovery_sfn,
             require_prepublication=getattr(args, "manual_prepublication_source", False),
+            authority_fingerprint_verified=True,
         )
         if recovery.complete_fingerprints(recovery_s3, recovery.EXPECTED_BACKUP_PREFIX) != bk1_before:
             raise SyncError("manual recovery公開中にBK1が変化しました")

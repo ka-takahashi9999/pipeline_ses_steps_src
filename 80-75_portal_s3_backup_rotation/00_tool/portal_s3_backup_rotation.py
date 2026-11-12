@@ -2756,6 +2756,87 @@ def verify_publication_authority_live(
         raise RotationError("publication authority確定後にBK1が変化しました")
 
 
+def verify_completed_rotation_checkpoint(
+    path: Path,
+    context: Dict[str, str],
+    s3_client,
+) -> Dict[str, Any]:
+    """formal tailのROTATION_VERIFIEDを80-9 publish前checkpointとして検証する。"""
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RotationError(f"80-75 rotation checkpointを読めません: {path} ({exc})") from exc
+    if (summary.get("step") != STEP_NAME
+            or summary.get("backup_status") != "SUCCEEDED"
+            or summary.get("mode") != "apply"
+            or summary.get("side_effect_phase") != PHASE_ROTATION_VERIFIED):
+        raise RotationError("80-75 rotation checkpointがROTATION_VERIFIEDではありません")
+    audit = summary.get("manual_recovery") or {}
+    if audit.get("context") != context or audit.get("verified") is not True:
+        raise RotationError("80-75 rotation checkpointのmanual contextが不一致です")
+    guard = audit.get("source_guard") or {}
+    required_guard = {
+        "at_validating_boundary": True,
+        "side_effect_phase": PHASE_VALIDATING,
+        "rotation_started": False,
+        "authority_fingerprint_verified": True,
+        "downstream_80_8_started": False,
+        "downstream_80_9_started": False,
+        "partial_publish_detected": False,
+        "publication_boundary_reached": False,
+        "source_execution_redrive_count": 0,
+    }
+    if any(guard.get(key) != value for key, value in required_guard.items()):
+        raise RotationError("80-75 rotation checkpointのsource guardが不完全です")
+    verify = summary.get("verify") or {}
+    if verify.get("verified") is not True:
+        raise RotationError("80-75 rotation checkpointのverifyが未成功です")
+    for key in ("missing_count", "extra_count", "size_mismatch_count"):
+        _require_zero(verify, key, "80-75 rotation checkpoint")
+    receipt = audit.get("receipt")
+    receipt_context, _, _ = validate_receipt_snapshot(receipt)
+    authority = summary.get("publication_authority") or {}
+    if (authority.get("publication_kind") != "manual_recovery"
+            or authority.get("source") != {
+                "run_date": receipt_context["run_date"],
+                "run_id": receipt_context["run_id"],
+            }):
+        raise RotationError("80-75 rotation checkpointのpublication authorityが不正です")
+    current = complete_fingerprints(s3_client, EXPECTED_CURRENT_PREFIX)
+    backup = complete_fingerprints(s3_client, EXPECTED_BACKUP_PREFIX)
+    if current != receipt["current_fingerprint"]:
+        raise RotationError("80-75後にCURRENTがprevious publicationから変化しました")
+    expected_projection = {
+        relative: {"size": item["size"], "etag": item["etag"]}
+        for relative, item in receipt["current_fingerprint"].items()
+    }
+    actual_projection = {
+        relative: {"size": item["size"], "etag": item["etag"]}
+        for relative, item in backup.items()
+    }
+    if actual_projection != expected_projection:
+        raise RotationError("ROTATION_VERIFIED後のBK1 path/size/ETagがprevious CURRENTと一致しません")
+    checkpoint_fingerprint = summary.get("backup_after_fingerprint")
+    if checkpoint_fingerprint is not None:
+        _validate_fingerprint_summary(checkpoint_fingerprint, "backup_after_fingerprint")
+        if _fingerprint_summary(backup) != checkpoint_fingerprint:
+            raise RotationError("ROTATION_VERIFIED後にBK1 fingerprintが変化しました")
+        fingerprint_method = "post_rotation_fingerprint"
+    else:
+        # phase導入前に完了した同一formal recoveryだけの互換経路。S3 copyで変わる
+        # LastModifiedは同一視せず、80-75 verify + live path/size/ETagで固定する。
+        fingerprint_method = "legacy_rotation_verify_plus_path_size_etag"
+    return {
+        "verified": True,
+        "rotation_summary_path": str(path.resolve()),
+        "side_effect_phase": PHASE_ROTATION_VERIFIED,
+        "current_file_count": len(current),
+        "current_total_bytes": sum(item["size"] for item in current.values()),
+        "bk1_matches_previous_current": True,
+        "bk1_fingerprint_verification_method": fingerprint_method,
+    }
+
+
 def guard_manual_lock(
     context,
     s3,
@@ -2985,6 +3066,7 @@ def run_manual_rotation(args, logger):
     summary["verify"] = compare_sets(expected, {p: f["size"] for p, f in after.items()}, logger)
     if not summary["verify"]["verified"]:
         raise RotationError("manual rotation BK1 verify失敗")
+    summary["backup_after_fingerprint"] = _fingerprint_summary(after)
     _record_rotation_phase(args, PHASE_ROTATION_VERIFIED)
     summary["side_effect_phase"] = PHASE_ROTATION_VERIFIED
     return summary

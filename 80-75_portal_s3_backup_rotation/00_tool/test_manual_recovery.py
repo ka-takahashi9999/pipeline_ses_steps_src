@@ -165,6 +165,54 @@ class TestManualReceipt(unittest.TestCase):
             fixtures.confirm_target.main()
         self.assertIn("【結果】OK", confirm_result.read_text())
 
+    def test_completed_rotation_checkpoint_requires_live_current_and_bk1_match(self):
+        current_context = {**self.context, "recovery_id": "next-recovery"}
+        summary = {
+            "step": target.STEP_NAME,
+            "backup_status": "SUCCEEDED",
+            "mode": "apply",
+            "side_effect_phase": target.PHASE_ROTATION_VERIFIED,
+            "manual_recovery": {
+                "context": current_context,
+                "verified": True,
+                "receipt": self.receipt,
+                "source_guard": {
+                    "at_validating_boundary": True,
+                    "side_effect_phase": target.PHASE_VALIDATING,
+                    "rotation_started": False,
+                    "authority_fingerprint_verified": True,
+                    "downstream_80_8_started": False,
+                    "downstream_80_9_started": False,
+                    "partial_publish_detected": False,
+                    "publication_boundary_reached": False,
+                    "source_execution_redrive_count": 0,
+                },
+            },
+            "publication_authority": {
+                "publication_kind": "manual_recovery",
+                "source": {"run_date": self.context["run_date"],
+                           "run_id": self.context["run_id"]},
+            },
+            "verify": {"verified": True, "missing_count": 0, "extra_count": 0,
+                       "size_mismatch_count": 0},
+        }
+        path = self.tmp / "rotation-summary.json"
+        path.write_text(json.dumps(summary))
+        with patch.object(target, "complete_fingerprints", side_effect=[
+            self.receipt["current_fingerprint"], {
+                path: {**item, "last_modified": "2026-08-21T00:00:00+00:00"}
+                for path, item in self.receipt["current_fingerprint"].items()
+            }
+        ]):
+            evidence = target.verify_completed_rotation_checkpoint(
+                path, current_context, self.s3
+            )
+        self.assertTrue(evidence["bk1_matches_previous_current"])
+        self.assertEqual(
+            evidence["bk1_fingerprint_verification_method"],
+            "legacy_rotation_verify_plus_path_size_etag",
+        )
+
     def test_receipt_missing_rejected_before_sync(self):
         self.path.unlink()
         with self.assertRaises(Exception):
@@ -375,10 +423,12 @@ class TestManualReceipt(unittest.TestCase):
         args.pipeline_root, args.prepare_dir, args.step_dir = str(root), str(prepare), str(self.tmp / "sync")
         Path(args.step_dir).mkdir()
         args.run_id, args.run_date = context["recovery_id"], context["run_date"]
+        args.rotation_summary = self.tmp / "rotation-summary.json"
         original_failed = copy.deepcopy(self.s3.documents)
         with patch.object(sync, "recovery_module", return_value=target), \
              patch.object(sync, "build_s3_client", return_value=self.s3), \
              patch.object(target, "build_stepfunctions_client", return_value=self.sfn), \
+             patch.object(target, "verify_completed_rotation_checkpoint", return_value={"verified": True}), \
              patch.object(target, "guard_manual_lock", return_value=None), patch.object(sync, "run_sync", return_value=[]) as publish, \
              patch.object(sync.time, "sleep"), patch.dict(os.environ, {"PORTAL_S3_VERIFY_WAIT_SEC": "0"}):
             publish.side_effect = sync.SyncError("simulated publication failure")

@@ -2071,7 +2071,10 @@ set -euo pipefail
 printf '%s\\n' "$*" >> "$CALL_LOG"
 count=$(wc -l < "$CALL_LOG")
 if [[ "${FAIL_CALL_INDEX:-0}" == "$count" ]]; then exit 9; fi
-if [[ "$1" == *"tail_recovery_plan.py" ]]; then printf '%s\n' SKIP_80_7; fi
+if [[ "$1" == *"tail_recovery_plan.py" ]]; then
+  if [[ " $* " == *" --resume-state-dir "* ]]; then exit 8; fi
+  printf '%s\n' SKIP_80_7
+fi
 """)
         fake.chmod(0o755)
         self.call_log = self.temp_path / "calls"
@@ -2149,7 +2152,7 @@ if [[ "$1" == *"tail_recovery_plan.py" ]]; then printf '%s\n' SKIP_80_7; fi
     def test_tail_recovery_id_cannot_be_reused(self):
         self.assertEqual(self.invoke().returncode, 0)
         self.assertNotEqual(self.invoke().returncode, 0)
-        self.assertEqual(len(self.call_log.read_text().splitlines()), 6)
+        self.assertEqual(len(self.call_log.read_text().splitlines()), 7)
 
 
 # ---------------------------------------------------------------------------
