@@ -2619,6 +2619,17 @@ def _latest_managed_success_verified_at(s3_client) -> Optional[str]:
         if document.get("status") == "RUNNING":
             # resolver自身を起動したmanaged run。80-75本体のexecution guardで厳格検証する。
             continue
+        source_pair = (
+            document.get("finished_at_source"), document.get("exit_code_source")
+        )
+        if source_pair != ("managed_wrapper", "managed_wrapper"):
+            if "managed_wrapper" in source_pair:
+                raise RotationError(
+                    "managed publication historyのprovenance sourceが片側だけmanagedです"
+                )
+            # manual analysis等が同じpipeline-status prefixに保存したterminal recordは
+            # managed publication時刻の比較対象にしない。
+            continue
         _validate_terminal_status_document(run, document, "managed publication history")
         if document.get("status") == "SUCCEEDED":
             if document.get("exit_code") != 0:

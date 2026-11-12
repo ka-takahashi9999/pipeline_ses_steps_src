@@ -62,6 +62,28 @@ def manual(when="2026-11-10T23:40:47+00:00", verified=True):
 
 
 class TestPublicationAuthoritySelection(unittest.TestCase):
+    def test_latest_managed_success_ignores_nonmanaged_terminal_records(self):
+        managed_run = {"run_date": "20261109", "run_id": "sfn-managed", "key": "managed"}
+        manual_run = {"run_date": "20261110", "run_id": "manual", "key": "manual"}
+        managed_status = {
+            "schema_version": "1.0", "run_id": "sfn-managed", "run_date": "20261109",
+            "status": "SUCCEEDED", "started_at": "2026-11-10T00:00:00+00:00",
+            "finished_at": "2026-11-10T01:00:00+00:00",
+            "finished_at_source": "managed_wrapper", "exit_code": 0,
+            "exit_code_source": "managed_wrapper", "current_step": "99-9",
+            "error_message": "", "log_s3_uri": "s3://fixture/log",
+            "updated_at": "2026-11-10T01:00:01+00:00",
+        }
+        manual_status = dict(managed_status, run_id="manual", run_date="20261110",
+                             finished_at_source="manual_analysis",
+                             exit_code_source="manual_analysis")
+        with patch.object(target, "list_status_runs", return_value=[managed_run, manual_run]), \
+             patch.object(target, "get_status_document", side_effect=[managed_status, manual_status]):
+            self.assertEqual(
+                target._latest_managed_success_verified_at(object()),
+                "2026-11-10T01:00:00+00:00",
+            )
+
     def test_case_a_managed_publication_is_selected(self):
         result = target.select_latest_publication_authority(
             managed(), [], inventory(), inventory(9),
