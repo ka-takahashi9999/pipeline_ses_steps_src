@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from common.skill_canonical_map import SKILL_CANONICAL_MAP
 from common.skill_registry import build_effective_matcher, build_registry_matcher
 from common.skill_registry_runtime import create_runtime_context, load_runtime_context
@@ -68,10 +70,18 @@ class SkillRegistryProductionTest(unittest.TestCase):
         )
 
     def test_group_ownership_is_declarative(self):
-        self.assertEqual(self.runtime.snapshot.production_canonical_names, ("Power BI",))
+        self.assertEqual(len(self.runtime.snapshot.production_canonical_names), 62)
+        self.assertEqual(
+            self.runtime.snapshot.production_canonical_names,
+            tuple(
+                name
+                for name in self.runtime.snapshot.canonical_names
+                if name not in {"Go", "Scrum", "組み込み"}
+            ),
+        )
         self.assertEqual(
             self.runtime.snapshot.shadow_canonical_names,
-            ("Spring Boot", "Node.js", "SQL Server", "Amazon Aurora"),
+            ("Go", "Scrum", "組み込み"),
         )
 
     @classmethod
@@ -123,7 +133,7 @@ class SkillRegistryProductionTest(unittest.TestCase):
         self.assertTrue(result[0])
         self.assertEqual(result[1], ["Power BI"])
 
-    def test_shadow_groups_keep_legacy_production_behavior(self):
+    def test_original_registry_groups_remain_canonicalized_in_production(self):
         body = "Springboot NodeJS SQLServer Aurora"
         dictionary = self.project_module.load_skill_dictionary(
             str(ROOT / "03-8_extract_project_skill_category/00_tool/skill_dictionary.txt")
@@ -140,16 +150,19 @@ class SkillRegistryProductionTest(unittest.TestCase):
             self.runtime.snapshot,
             required,
         )
-        self.assertEqual(overlay["skills"], legacy["skills"])
-        self.assertEqual(overlay["skills_by_category"], legacy["skills_by_category"])
-        self.assertEqual(overlay["primary_skills"], legacy["primary_skills"])
-        self.assertFalse(hits)
+        self.assertEqual(
+            overlay["skills"],
+            ["Spring Boot", "Node.js", "SQL Server", "Amazon Aurora"],
+        )
+        self.assertEqual(overlay["primary_skills"], ["Spring Boot"])
+        self.assertTrue(hits)
 
         values = ["Springboot", "NodeJS", "SQLServer", "Aurora"]
         normalized = self.skill_gate_module.normalize_registry_owned_skills(
             values, values, values, self.runtime
         )
-        self.assertEqual(normalized, (values, values, values))
+        canonical = ["Spring Boot", "Node.js", "SQL Server", "Amazon Aurora"]
+        self.assertEqual(normalized, (canonical, canonical, canonical))
 
         legacy_required = self.required_gate_module.judge_match(
             ["Springboot"], [], [], "Spring Boot", ""
@@ -157,7 +170,9 @@ class SkillRegistryProductionTest(unittest.TestCase):
         overlay_required = self.required_gate_module.judge_match_with_runtime(
             ["Springboot"], [], [], "Spring Boot", "", self.runtime
         )
-        self.assertEqual(overlay_required, legacy_required)
+        self.assertFalse(legacy_required[0])
+        self.assertTrue(overlay_required[0])
+        self.assertEqual(overlay_required[1], ["Spring Boot"])
 
     def test_06_11_matches_three_power_bi_surfaces_and_keeps_substring(self):
         for required, evidence in (
@@ -186,9 +201,12 @@ class SkillRegistryProductionTest(unittest.TestCase):
         self.assertEqual(record["primary_skills"], ["PowerBI"])
 
     def test_power_bi_legacy_ownership_restores_legacy_extraction(self):
-        raw = self.runtime.snapshot.raw_bytes.decode("utf-8").replace(
-            "    ownership: production\n", "    ownership: legacy\n", 1
-        )
+        data = yaml.safe_load(self.runtime.snapshot.raw_bytes)
+        for entry in data["skills"]:
+            if entry["canonical"] == "Power BI":
+                entry["ownership"] = "legacy"
+                break
+        raw = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
         from common.skill_registry import parse_registry_bytes
 
         rollback_snapshot = parse_registry_bytes(raw.encode("utf-8"))

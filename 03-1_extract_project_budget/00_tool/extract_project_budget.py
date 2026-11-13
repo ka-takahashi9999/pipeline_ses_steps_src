@@ -167,6 +167,10 @@ RX_FIXED_DAILY_YEN_VALUE = re.compile(
 RX_HOURLY_YEN = re.compile(
     r"時給\s*(?P<yen>\d{3,6})(?![\d,])\s*円"
 )
+RX_HOURLY_YEN_OPEN_HIGH_SUFFIX = re.compile(
+    r"(?P<raw>時給\s*[:：]?\s*(?P<yen>" + _YEN_INTEGER
+    + r")\s*円\s*(?:迄|まで))(?=[ \t]*(?:$|\n))"
+)
 RX_STANDALONE_HOURLY_YEN_COMMA = re.compile(
     r"\s*(?P<raw>時給\s*(?P<yen>\d{1,3}(?:,\d{3})+)\s*円)\s*"
 )
@@ -240,6 +244,25 @@ _RANGE_NUM_EXCLUDE_LINE_RE = re.compile(r"(精算|清算|年齢|勤務時間|勤
 _SECTION_HEADER_RE = re.compile(
     r"^\s*(?:[■●◇【\[]|案件名\b|案件\b|場所\b|時間\b|精算\b|清算\b|年齢\b|勤務時間\b|勤怠\b|稼働時間\b)"
 )
+_PRICE_HEADER_ONLY_RE = re.compile(
+    r"^\s*(?:"
+    r"【\s*(?:単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|予\s*算)\s*】|"
+    r"■\s*(?:単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|予\s*算)\s*■|"
+    r"(?:単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|予\s*算)\s*[:：]"
+    r")\s*$"
+)
+_PRICE_ROLE_SUBLABEL_RE = re.compile(
+    r"^\s*■\s*(?P<label>(?:"
+    r"[^:：\n]{1,24}(?:者|枠)|リーダー|メンバー|エンジニア|SE|PG|PM|PL"
+    r"))\s*[:：]\s*(?P<value>[^\n]+?)\s*$",
+    re.IGNORECASE,
+)
+_EXPLICIT_PRICE_UNIT_RE = re.compile(
+    r"(?:\d[\d,]*\s*(?:万(?:円)?|円)|[\\¥￥]\s*\d[\d,]*)"
+)
+_CONTRADICTORY_HOURLY_MAN_RE = re.compile(
+    r"時給[^\d\n]{0,10}\d[\d,]*\s*万(?:円)?"
+)
 _TIME_RANGE_RE = re.compile(r"\d{1,2}:\d{2}\s*[〜~\-]\s*\d{1,2}:\d{2}")
 
 # 明示的 /月 付き（日給より優先）
@@ -287,6 +310,7 @@ def _get_segments(text: str) -> List[str]:
             or RX_FIXED_DAILY_YEN.fullmatch(line)
             or RX_FIXED_DAILY_YEN_VALUE.fullmatch(line)
             or RX_HOURLY_YEN_RANGE.search(line)
+            or RX_HOURLY_YEN_OPEN_HIGH_SUFFIX.search(line)
             or RX_HOURLY_YEN.search(line)
             or RX_STANDALONE_HOURLY_YEN_COMMA.fullmatch(line)
             or RX_HOURLY_YEN_SLASH.search(line)
@@ -304,6 +328,19 @@ def _get_segments(text: str) -> List[str]:
             or RX_MAN_DAY_RANGE.search(line)
             or RX_MAN_DAY.search(line)
             or RX_NUM_RANGE_ONLY.search(line)
+        )
+
+    def _is_explicit_role_price_sublabel(line: str) -> bool:
+        """価格header直後の`■役割名: 明示価格`だけを値行として認める。"""
+        match = _PRICE_ROLE_SUBLABEL_RE.fullmatch(line)
+        if not match:
+            return False
+        value = match.group("value")
+        if _CONTRADICTORY_HOURLY_MAN_RE.search(value):
+            return False
+        return bool(
+            _EXPLICIT_PRICE_UNIT_RE.search(value)
+            and _has_price_value(value)
         )
 
     for idx, line in enumerate(lines):
@@ -326,6 +363,12 @@ def _get_segments(text: str) -> List[str]:
                 next_line = lines[next_idx].strip()
                 if not next_line:
                     continue
+                if (
+                    _PRICE_HEADER_ONLY_RE.fullmatch(line)
+                    and _is_explicit_role_price_sublabel(next_line)
+                ):
+                    seg_lines.append(next_line)
+                    break
                 if _SECTION_HEADER_RE.search(next_line):
                     break
                 if _has_price_value(next_line):
@@ -467,6 +510,18 @@ def _hourly_daily(seg: str) -> Optional[Tuple]:
                 "monthly",
                 m.group("raw"),
             )
+
+    m = RX_HOURLY_YEN_OPEN_HIGH_SUFFIX.search(seg)
+    if m:
+        v = _yen_to_int(m.group("yen")) * HOURLY_TO_MONTHLY
+        return (
+            v,
+            {"min": None, "max": v},
+            "hourly-yen-open-high",
+            0.82,
+            "monthly",
+            m.group("raw"),
+        )
 
     m = RX_HOURLY_YEN_RANGE.search(seg)
     if m:

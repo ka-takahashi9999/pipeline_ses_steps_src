@@ -1,7 +1,8 @@
-"""08-5 production Batch結果だけに適用するminimal safety guard。
+"""08-5 production結果に適用するminimal safety guard。
 
 このmoduleは判定をconfirmedへ昇格させない。曖昧または安全に証明できない
-Batch判定をhuman_reviewへ戻すことだけを責務とする。
+AI判定をhuman_reviewへ戻すことだけを責務とする。Batchの従来guardと
+legacyの局所guardが同じ年数/複合条件判定を共有する。
 """
 
 import copy
@@ -11,7 +12,7 @@ import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-GUARD_VERSION = "batch-minimal-safety-guard-v1"
+GUARD_VERSION = "minimal-safety-guard-v2"
 OPTIONAL_MARKERS = ("特に歓迎", "あれば尚可", "尚可", "歓迎", "推奨")
 YEAR_REQUIREMENT_RE = re.compile(
     r"(?P<years>\d+(?:\.\d+)?)\s*(?P<kind>年以上|年超)"
@@ -25,6 +26,23 @@ YEAR_ORDINAL_RE = re.compile(r"(?P<years>\d+)\s*年目")
 PROJECT_START_RE = re.compile(
     r"^\s*\d+(?:\.\d+)?\s*\|\s*20\d{2}\s*\|\s*年\s*\|\s*\d{1,2}\s*\|\s*月",
     re.MULTILINE,
+)
+GIT_REQUIRED_RE = re.compile(r"(?<![A-Za-z])Git(?![A-Za-z])|GitHub", re.IGNORECASE)
+GIT_SOURCE_RE = re.compile(
+    r"(?<![A-Za-z])Git(?![A-Za-z])|GitHub|GitLab|Bitbucket",
+    re.IGNORECASE,
+)
+GIT_COPILOT_RE = re.compile(r"GitHub\s*Copilot(?:\s+(?:Business|Enterprise))?", re.IGNORECASE)
+TEAM_REQUIRED_RE = re.compile(r"チーム|複数名|Scrum|Agile", re.IGNORECASE)
+TEAM_EVIDENCE_RE = re.compile(
+    r"チーム開発|複数名(?:で|の)?開発|チーム|テックリード|"
+    r"リーダー|メンバー|Scrum|Agile|人数|体制|\d+\s*(?:名|人)",
+    re.IGNORECASE,
+)
+REVIEW_REQUIRED_RE = re.compile(
+    r"Pull\s*Request|プルリクエスト|Merge\s*Request|"
+    r"code\s*review|コードレビュー|レビュー運用",
+    re.IGNORECASE,
 )
 
 # semantic alias辞書ではない。明示年数と同一required skill内の対象語を
@@ -209,6 +227,33 @@ def explicit_years_proven(
     return (best > required_months if strict_over else best >= required_months), proof
 
 
+def explicit_years_contradicted(
+    skill: str, evidence: str, skillsheet: str
+) -> Tuple[bool, Dict[str, int]]:
+    """単一対象技術の明示期間がrequired年数未満の場合だけTrue。
+
+    期間記載がない、複数技術のOR条件、対象技術と期間の対応が
+    不明な場合は自動降格しない。
+    """
+    requirement = _required_years(skill)
+    if requirement is None:
+        return False, {}
+    targets = _target_patterns(skill)
+    if len(targets) != 1:
+        return False, {}
+    _, proof = explicit_years_proven(skill, evidence, skillsheet)
+    actual_months = proof.get(targets[0][0], 0)
+    if actual_months <= 0:
+        return False, proof
+    required_months, strict_over = requirement
+    contradicted = (
+        actual_months <= required_months
+        if strict_over
+        else actual_months < required_months
+    )
+    return contradicted, proof
+
+
 def _downgrade(check: Dict[str, Any], reason: str) -> None:
     check["confidence"] = "human_review"
     check["recheck_match"] = True
@@ -303,6 +348,104 @@ def _apply_explicit_years_guard(
     return changed, decisions
 
 
+def _apply_explicit_years_contradiction_guard(
+    checks: List[Dict[str, Any]], skillsheet: str
+) -> Tuple[int, List[Dict[str, Any]]]:
+    changed = 0
+    decisions: List[Dict[str, Any]] = []
+    for check in checks:
+        if check.get("confidence") != "confirmed":
+            continue
+        skill = str(check.get("skill") or "")
+        contradicted, proof = explicit_years_contradicted(
+            skill, str(check.get("evidence") or ""), skillsheet
+        )
+        if not proof:
+            continue
+        decisions.append(
+            {
+                "skill": skill,
+                "contradicted": contradicted,
+                "proof_months_by_target": proof,
+            }
+        )
+        if contradicted:
+            _downgrade(check, "対象skillの明示期間がrequired年数未満のため人間確認")
+            changed += 1
+    return changed, decisions
+
+
+def _apply_git_compound_guard(
+    checks: List[Dict[str, Any]], skillsheet: str
+) -> int:
+    """Git系の明示的な複合requiredを、一部の証拠だけでconfirmedにしない。"""
+    normalized_sheet = sanitize_skillsheet_for_guard(skillsheet)
+    if not normalized_sheet:
+        return 0
+    # GitHub CopilotはAI coding toolであり、単独ではGit/GitHub運用証拠ではない。
+    source_sheet = GIT_COPILOT_RE.sub("", normalized_sheet)
+    changed = 0
+    for check in checks:
+        if check.get("confidence") != "confirmed":
+            continue
+        skill = _normalize(check.get("skill"))
+        # Copilot利用自体を求めるrequiredはソース管理compoundではない。
+        source_control_skill = GIT_COPILOT_RE.sub("", skill)
+        if (
+            not GIT_REQUIRED_RE.search(source_control_skill)
+            or not TEAM_REQUIRED_RE.search(source_control_skill)
+        ):
+            continue
+        evidence = _normalize(check.get("evidence"))
+        source_context = source_sheet + "\n" + GIT_COPILOT_RE.sub("", evidence)
+        evidence_context = normalized_sheet + "\n" + evidence
+        source_proven = bool(GIT_SOURCE_RE.search(source_context))
+        team_proven = bool(TEAM_EVIDENCE_RE.search(evidence_context))
+        review_proven = bool(REVIEW_REQUIRED_RE.search(evidence_context))
+        needs_review = bool(REVIEW_REQUIRED_RE.search(skill))
+        missing: List[str] = []
+        if not source_proven:
+            missing.append("Git/GitHub等のソース管理実績")
+        if not team_proven:
+            missing.append("チーム開発実績")
+        if needs_review and not review_proven:
+            missing.append("PR/MR/code review運用実績")
+        if missing:
+            _downgrade(
+                check,
+                "compound requiredの直接証拠不足: " + " / ".join(missing),
+            )
+            changed += 1
+    return changed
+
+
+def apply_local_false_positive_guard(
+    checks: Sequence[Dict[str, Any]], skillsheet: str
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Batch/legacy共通の局所guard。confirmedの全件一致時だけ保守側へ降格する。"""
+    guarded = copy.deepcopy(list(checks))
+    before_status = _status_from_checks(guarded)
+    reasons: List[str] = []
+    years_decisions: List[Dict[str, Any]] = []
+    if before_status == "confirmed":
+        years_changes, years_decisions = _apply_explicit_years_contradiction_guard(
+            guarded, skillsheet
+        )
+        compound_changes = _apply_git_compound_guard(guarded, skillsheet)
+        if years_changes:
+            reasons.append(f"explicit_years_contradicted:{years_changes}")
+        if compound_changes:
+            reasons.append(f"git_compound_evidence_missing:{compound_changes}")
+    return guarded, {
+        "guard_version": GUARD_VERSION,
+        "before_status": before_status,
+        "after_status": _status_from_checks(guarded),
+        "guard_reasons": reasons,
+        "explicit_years_contradiction_decisions": years_decisions,
+        "promoted_to_confirmed": 0,
+    }
+
+
 def apply_minimal_safety_guard(
     checks: Sequence[Dict[str, Any]],
     category_match: str,
@@ -317,6 +460,9 @@ def apply_minimal_safety_guard(
         check.get("confidence") == "confirmed" for check in before_checks
     )
     reasons: List[str] = []
+
+    guarded, local_metadata = apply_local_false_positive_guard(guarded, skillsheet)
+    reasons.extend(local_metadata["guard_reasons"])
 
     optional_changes = _apply_optional_guard(guarded)
     if optional_changes:
@@ -351,5 +497,8 @@ def apply_minimal_safety_guard(
         "after_status": _status_from_checks(guarded),
         "guard_reasons": reasons,
         "explicit_years_decisions": years_decisions,
+        "explicit_years_contradiction_decisions": local_metadata[
+            "explicit_years_contradiction_decisions"
+        ],
         "promoted_to_confirmed": 0,
     }

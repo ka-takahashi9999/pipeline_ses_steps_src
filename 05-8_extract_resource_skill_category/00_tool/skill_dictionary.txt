@@ -5,6 +5,11 @@
 # ・suggest_skill_dictionary.py でLLM提案候補を確認後、手動で追記すること
 
 バックエンド:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - Fastify
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - FreeMarker
+  - Servlet
   # DICT-02（2026-11-06 skill confirmation unit）
   - Haskell
   - VB6
@@ -127,6 +132,8 @@
   - "Play Framework"
 
 フロントエンド:
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - EJS
   # DICT-02（2026-11-06 skill confirmation unit）
   - face-api.js
   - JavaScript
@@ -192,6 +199,14 @@
   - "Windows Forms"
 
 インフラ:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - LAMP
+  - OpenShift
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Firewall
+  - ロードバランサー
+  - Cシェル
+  - Winバッチ
   # DICT-02（2026-11-06 skill confirmation unit）
   - IP-PBX
   - CTI
@@ -415,6 +430,12 @@
   - NetBackup
 
 クラウドサービス:
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Transit Gateway
+  - Secrets Manager
+  - Amazon Rekognition
+  - Heroku
+  - FJcloud
   # DICT-02（2026-11-06 skill confirmation unit）
   - V-ONEクラウド
   - "Apple Business Manager"
@@ -448,6 +469,10 @@
   - "Amazon Bedrock"
 
 DB:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - TiDB
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Teradata
   # DICT-02（2026-11-06 skill confirmation unit）
   - SQLAlchemy
   - SSIS
@@ -514,6 +539,10 @@ DB:
   - Aurora
 
 モバイル:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "Compose Multiplatform"
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Hilt
   # DICT-02（2026-11-06 skill confirmation unit）
   - RxAndroid
   - iOS
@@ -542,6 +571,13 @@ DB:
   - CocoaPods
 
 データ分析/AI:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - AIチャットボット
+  - Alteryx
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - OR-Tools
+  - CPLEX
+  - Pyomo
   # DICT-02（2026-11-06 skill confirmation unit）
   - "Google Colab"
   - MLOps
@@ -593,6 +629,15 @@ DB:
   - Haystack
 
 データ分析:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - ABテスト
+  - Dataform
+  - MicroStrategy
+  - "Power Query"
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - KNIME
+  - DuckDB
+  - Spotfire
   # DICT-02（2026-11-06 skill confirmation unit）
   - Polars
   - "Treasure Data"
@@ -653,6 +698,12 @@ DB:
   - DataStage
 
 AI:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "Google ML Kit"
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Human-in-the-loop
+  - Vertex AI
+  - AI-OCR
   # DICT-02（2026-11-06 skill confirmation unit）
   - Genspark
   - Whisper
@@ -698,6 +749,12 @@ AI:
   - Kiro
 
 セキュリティ:
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - AppGuard
+  - 特権アクセス管理システム
+  - セキュリティレビュー
+  - CVE
+  - OWASP ZAP
   # DICT-02（2026-11-06 skill confirmation unit）
   - i-FILTER
   - SSO
@@ -808,6 +865,11 @@ AI:
   - テックリード
 
 組み込み:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - ファームウェア
+  - ブートローダー
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - OBD
   # DICT-02（2026-11-06 skill confirmation unit）
   - CAPL
   - MPLAB
@@ -843,6 +905,15 @@ AI:
   - WinAMS
 
 業務系:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - HotScan
+  - ISO20022
+  - Kondor
+  - Murex
+  - RTGS
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Wagby
+  - HRMOS
   - mcframe
   - SAP
   - Salesforce
@@ -902,6 +973,13 @@ AI:
   - Pega
 
 ミドルウェア・基盤:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "Argo Workflows"
+  - BigFix
+  - "Data Protector"
+  - "Operations Bridge Manager"
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Corticon
   # DICT-02（2026-11-06 skill confirmation unit）
   - CLUSTERPRO
   - HULFT
@@ -959,6 +1037,9 @@ CAD系:
   - 問い合わせ対応
 
 ゲーム系:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - DirectX
+  - OpenGL
   - ゲーム
   - Unity
   - "3D背景"
@@ -977,6 +1058,8 @@ CAD系:
   - UniTask
 
 デザイン系:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "Adobe InDesign"
   - Figma
   - "Adobe XD"
   - Photoshop
@@ -1041,6 +1124,9 @@ VBA系:
   - "Access VBA"  # Excel VBAおよびAccess VBAの設計・実装・改修経験
 
 M365系:
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Microsoft Exchange
+  - Microsoft Purview
   - "Microsoft 365"
   - MCM
   - "Microsoft Configuration Manager"
@@ -1068,6 +1154,9 @@ M365系:
   - "Exchange Online"
 
 Google系:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "YouTube Analytics API"
+  - "YouTube Data API"
   # DICT-02（2026-11-06 skill confirmation unit）
   - AppSheet
   - GoogleApps
@@ -1081,6 +1170,8 @@ Google系:
   - ブロックチェーン
 
 CMS系:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - Sitecore
   - WordPress
   - CMS
   # DICT-02（2026-11-03 skill confirmation unit）
@@ -1094,6 +1185,10 @@ CMS系:
 
 #分類不可の為
 その他:
+  # DICT-02（2026-11-13 skill confirmation unit）
+  - "GitHub Enterprise Server"
+  # DICT-02（2026-11-10 skill confirmation unit）
+  - Sourcetree
   # DICT-02（2026-11-06 skill confirmation unit）
   - OpenAPI
   - MFC

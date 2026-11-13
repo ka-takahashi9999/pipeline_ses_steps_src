@@ -389,6 +389,46 @@ _COMPLETE_PROJECT_BLOCK_REQUIRED_LABEL_RES = (
     re.compile(r"(?m)^[ \t]*【募集】"),
 )
 
+# CHECK-01 (2026-11-13): `案件名` labelを持たず、独立見出しの後に
+# 裸の`■概要`から始まる完全な案件blockを連結する形式を限定補完する。
+# `■概要`の反復だけでは除外せず、案件紹介文・単価・追加属性・異なる見出しを
+# すべて必須にして、単一案件内の小見出しや募集ポジション列挙を除外する。
+_REPEATED_PROJECT_OVERVIEW_INTRO_RE = re.compile(
+    r"(?m)^[^\n]*(?:以下|下記)[、, \t]*案件を(?:ご)?紹介"
+    r"(?:させていただきます|させて頂きます|いたします|致します|します)[^\n]*$"
+)
+_REPEATED_PROJECT_OVERVIEW_HEADER_RE = re.compile(
+    r"(?m)^[ \t]*■[ \t]*(?:案件[ \t]*)?概要"
+    r"(?:[ \t]*■|[ \t]*[:：][^\n]*)?[ \t]*$"
+)
+_REPEATED_PROJECT_OVERVIEW_RATE_RE = re.compile(
+    r"(?m)^[ \t]*■[ \t]*単[ \t]*(?:価|金)[ \t]*(?:■|[:：])"
+)
+_REPEATED_PROJECT_OVERVIEW_ATTRIBUTE_RES = (
+    re.compile(
+        r"(?m)^[ \t]*■[ \t]*(?:期間|時期|開始時期)[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*■[ \t]*(?:場所|勤務地|勤務場所|作業場所|就業場所|勤務)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*■[ \t]*(?:募集(?:人数|人員|ポジション)?|人数)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*■[ \t]*(?:商流|契約(?:形態)?|精算(?:幅)?)"
+        r"[ \t]*(?:■|[:：])"
+    ),
+    re.compile(
+        r"(?m)^[ \t]*■[ \t]*(?:フェーズ|スキル|必須スキル|必須要件|"
+        r"国籍|言語|稼働)[ \t]*(?:■|[:：])"
+    ),
+)
+_REPEATED_PROJECT_OVERVIEW_SEPARATOR_RE = re.compile(
+    r"^[ \t]*[━─―ー=＝\-]{8,}[ \t]*$"
+)
+
 # CHECK-02 (2026-10-30): 明示された案件数と、完全な「■案件名」block数が
 # 一致する場合だけを、件数明示形式の限定補完として扱う。
 _COUNTED_PROJECT_SUBJECT_COUNT_RE = re.compile(
@@ -651,7 +691,7 @@ def _has_repeated_project_blocks(body: str) -> bool:
 
 
 def _has_repeated_complete_project_blocks(body: str) -> bool:
-    """完全な【案件】blockが5件以上反復する場合だけTrue。"""
+    """既存形式または限定fallbackで完全な案件block反復を判定する。"""
     normalized_body = unicodedata.normalize("NFKC", body)
     blocks = _COMPLETE_PROJECT_BLOCK_HEADER_RE.split(normalized_body)[1:]
     if len(blocks) >= 5 and all(
@@ -660,9 +700,76 @@ def _has_repeated_complete_project_blocks(body: str) -> bool:
         return True
 
     # 既存complete-block root causeの「■案件名■」等の表記差。
-    return len(_complete_distinct_named_project_block_titles(
-        normalized_body, _BOXED_PROJECT_NAME_BLOCK_HEADER_RE
+    if len(_complete_distinct_named_project_block_titles(
+            normalized_body, _BOXED_PROJECT_NAME_BLOCK_HEADER_RE)) >= 2:
+        return True
+
+    # `案件名` labelがない形式も、案件紹介文と完全な`■概要`blockが
+    # 2件以上揃う場合だけ、同じrepeated-complete責務で扱う。
+    return len(_complete_distinct_project_overview_block_titles(
+        normalized_body
     )) >= 2
+
+
+def _complete_distinct_project_overview_block_titles(body: str) -> List[str]:
+    """案件紹介文配下の、完全な`■概要`blockの異なる直前見出しを返す。"""
+    normalized_body = unicodedata.normalize("NFKC", body)
+    if not _REPEATED_PROJECT_OVERVIEW_INTRO_RE.search(normalized_body):
+        return []
+
+    headers = list(_REPEATED_PROJECT_OVERVIEW_HEADER_RE.finditer(normalized_body))
+    if len(headers) < 2:
+        return []
+
+    titles = []
+    normalized_titles = []
+    for index, header in enumerate(headers):
+        block_end = (
+            headers[index + 1].start()
+            if index + 1 < len(headers)
+            else len(normalized_body)
+        )
+        block = normalized_body[header.start():block_end]
+        if not _REPEATED_PROJECT_OVERVIEW_RATE_RE.search(block):
+            return []
+        attribute_count = sum(
+            bool(pattern.search(block))
+            for pattern in _REPEATED_PROJECT_OVERVIEW_ATTRIBUTE_RES
+        )
+        if attribute_count < 2:
+            return []
+
+        preceding_start = headers[index - 1].end() if index > 0 else 0
+        preceding_lines = [
+            line.strip()
+            for line in normalized_body[preceding_start:header.start()].splitlines()
+            if line.strip()
+        ]
+        while (
+            preceding_lines
+            and _REPEATED_PROJECT_OVERVIEW_SEPARATOR_RE.fullmatch(
+                preceding_lines[-1]
+            )
+        ):
+            preceding_lines.pop()
+        if not preceding_lines:
+            return []
+
+        title = preceding_lines[-1]
+        if (
+            title.startswith(("■", "【"))
+            or _REPEATED_PROJECT_OVERVIEW_INTRO_RE.fullmatch(title)
+        ):
+            return []
+        normalized_title = re.sub(r"[ \t]+", "", title).lower()
+        if not normalized_title:
+            return []
+        titles.append(title)
+        normalized_titles.append(normalized_title)
+
+    if len(set(normalized_titles)) != len(normalized_titles):
+        return []
+    return titles
 
 
 def _complete_distinct_named_project_block_titles(

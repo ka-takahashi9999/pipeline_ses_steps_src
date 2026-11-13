@@ -29,11 +29,18 @@ class SkillRegistryRuntimeTest(unittest.TestCase):
             )
             runtime = load_runtime_context(path, ROOT, expected_mode="registry_overlay")
             self.assertTrue(runtime.overlay_enabled)
-            self.assertEqual(runtime.snapshot.production_canonical_names, ("Power BI",))
+            self.assertEqual(
+                len(runtime.snapshot.production_canonical_names),
+                62,
+            )
             self.assertEqual(
                 runtime.snapshot.shadow_canonical_names,
-                ("Spring Boot", "Node.js", "SQL Server", "Amazon Aurora"),
+                ("Go", "Scrum", "組み込み"),
             )
+            self.assertIn("Power BI", runtime.snapshot.production_canonical_names)
+            self.assertIn("Google Workspace", runtime.snapshot.production_canonical_names)
+            self.assertIn("Amazon Aurora", runtime.snapshot.production_canonical_names)
+            self.assertIn("Microsoft 365", runtime.snapshot.production_canonical_names)
             self.assertEqual(
                 path,
                 create_runtime_context(

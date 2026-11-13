@@ -138,13 +138,13 @@ def implementation_identity(mode: str) -> Dict[str, Any]:
         "run_high_score_required_skill_recheck.py",
         "high_score_required_skill_recheck.py",
         "high_score_required_skill_recheck_core.py",
+        "batch_minimal_safety_guard.py",
     ]
     if mode == "batch":
         names.extend(
             [
                 "high_score_required_skill_recheck_batch.py",
                 "batch_aws_orchestration.py",
-                "batch_minimal_safety_guard.py",
             ]
         )
     files = {name: _file_sha256(TOOL_DIR / name) for name in names}

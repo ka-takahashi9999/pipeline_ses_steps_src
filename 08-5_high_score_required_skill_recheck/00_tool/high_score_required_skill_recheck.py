@@ -27,6 +27,7 @@ from common.llm_client import call_llm
 from common.logger import get_logger
 from common.skillsheet_ai_context import build_skillsheet_ai_context
 from common.skill_policy import AUTO_TRUE_RECHECK_REASON, is_auto_true_skill
+import batch_minimal_safety_guard as SAFETY_GUARD
 import high_score_required_skill_recheck_core as SHARED_CORE
 
 STEP_NAME = "08-5_high_score_required_skill_recheck"
@@ -620,9 +621,9 @@ def _restore_pre_override_check(check: Dict[str, Any]) -> bool:
 
 
 def _replay_postprocessing_record(
-    record: Dict[str, Any],
+    record: Dict[str, Any], skillsheet_text: str = "",
 ) -> Tuple[Dict[str, Any], int, int]:
-    """保存済みAI出力からOR補正だけを再計算する（LLM呼び出しなし）。"""
+    """保存済みAI出力からOR補正と局所guardを再計算する（LLM呼び出しなし）。"""
     result = deepcopy(record)
     checks = result.get("required_skill_checks")
     if not isinstance(checks, list):
@@ -647,6 +648,7 @@ def _replay_postprocessing_record(
     recheck_info["not_confirmed_count"] = sum(
         1 for check in checks if check.get("confidence") == "not_confirmed"
     )
+    result, _ = apply_legacy_safety_guard_to_result(result, skillsheet_text)
     return result, restored_count, override_count
 
 
@@ -682,6 +684,27 @@ def _add_recheck_result(
         STATUS_HUMAN_REVIEW,
         STATUS_NOT_CONFIRMED,
     )
+
+
+def apply_legacy_safety_guard_to_result(
+    result: Dict[str, Any], skillsheet_text: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """legacyの正常AI結果へBatchと共通の局所safety guardを適用する。"""
+    guarded_result = deepcopy(result)
+    checks = guarded_result.get("required_skill_checks")
+    if not isinstance(checks, list):
+        raise ValueError("required_skill_checksがlistでない")
+    guarded_checks, metadata = SAFETY_GUARD.apply_local_false_positive_guard(
+        checks, skillsheet_text
+    )
+    guarded_result["required_skill_checks"] = guarded_checks
+    SHARED_CORE.refresh_result_counts(
+        guarded_result,
+        STATUS_CONFIRMED,
+        STATUS_HUMAN_REVIEW,
+        STATUS_NOT_CONFIRMED,
+    )
+    return guarded_result, metadata
 
 
 def _make_error(
@@ -804,13 +827,12 @@ def _process_record(
             ),
         )
 
-    return (
-        _add_recheck_result(
-            record, source_score_band, checks, skillsheet_chars_used,
-            category_match, category_note, apply_auto_true_override=True,
-        ),
-        None,
+    result = _add_recheck_result(
+        record, source_score_band, checks, skillsheet_chars_used,
+        category_match, category_note, apply_auto_true_override=True,
     )
+    result, _ = apply_legacy_safety_guard_to_result(result, skillsheet_text)
+    return result, None
 
 
 def _init_output_files() -> None:
@@ -954,9 +976,20 @@ def _run_postprocessing_replay(
 
     restored_total = 0
     override_total = 0
+    skillsheet_map = _load_skillsheet_map()
     start_time = time.time()
     for record in records:
-        replayed, restored_count, override_count = _replay_postprocessing_record(record)
+        resource_mid = str(record.get("resource_info", {}).get("message_id", ""))
+        skillsheet_record = skillsheet_map.get(resource_mid) or {}
+        normalized_skillsheet = str(skillsheet_record.get("skillsheet") or "").strip()
+        skillsheet_text = (
+            _truncate_skillsheet(build_skillsheet_ai_context(normalized_skillsheet))
+            if skillsheet_record.get("success", False) and normalized_skillsheet
+            else ""
+        )
+        replayed, restored_count, override_count = _replay_postprocessing_record(
+            record, skillsheet_text
+        )
         _write_result(replayed)
         restored_total += restored_count
         override_total += override_count

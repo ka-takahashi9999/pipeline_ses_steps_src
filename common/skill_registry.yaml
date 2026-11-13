@@ -36,7 +36,7 @@ allowed_categories:
 
 skills:
   - canonical: Spring Boot
-    ownership: shadow
+    ownership: production
     category: バックエンド
     aliases:
       - Springboot
@@ -47,7 +47,7 @@ skills:
     note: SpringBoot is absorbed by case-insensitive matching.
 
   - canonical: Node.js
-    ownership: shadow
+    ownership: production
     category: バックエンド
     aliases:
       - NodeJS
@@ -58,7 +58,7 @@ skills:
     note: Existing NodeJS alias behavior is preserved.
 
   - canonical: SQL Server
-    ownership: shadow
+    ownership: production
     category: DB
     aliases:
       - SQLServer
@@ -70,7 +70,7 @@ skills:
     note: Existing SQL Server aliases are preserved.
 
   - canonical: Amazon Aurora
-    ownership: shadow
+    ownership: production
     category: DB
     aliases:
       - Aurora
@@ -91,3 +91,663 @@ skills:
     enabled: true
     source: CHECK-07 / M0 shadow migration
     note: Power BI spacing and hyphen variants.
+
+  - canonical: Web API
+    ownership: production
+    category: バックエンド
+    aliases:
+      - WebAPI
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: PL/SQL
+    ownership: production
+    category: バックエンド
+    aliases:
+      - PLSQL
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Slashless spelling variant only.
+
+  - canonical: Azure Functions
+    ownership: production
+    category: バックエンド
+    aliases:
+      - AzureFunction
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Joined singular surface is normalized to the product name.
+
+  - canonical: React
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - React.js
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Dot-js spelling variant only.
+
+  - canonical: AngularJS
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - Angular.js
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Dot spelling variant only; Angular remains a separate skill.
+
+  - canonical: Tailwind CSS
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - TailwindCSS
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Google Cloud
+    ownership: production
+    category: インフラ
+    aliases:
+      - GoogleCloud
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only; GCP is deferred to the abbreviation batch.
+
+  - canonical: Palo Alto
+    ownership: production
+    category: インフラ
+    aliases:
+      - PaloAlto
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Fargate
+    ownership: production
+    category: インフラ
+    aliases: []
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Case-insensitive ownership absorbs the legacy lowercase duplicate.
+
+  - canonical: Azure Monitor
+    ownership: production
+    category: インフラ
+    aliases:
+      - AzureMonitor
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Active Directory
+    ownership: production
+    category: インフラ
+    aliases:
+      - ActiveDirectory
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: React Native
+    ownership: production
+    category: モバイル
+    aliases:
+      - ReactNative
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only; React remains a separate skill.
+
+  - canonical: Google Analytics
+    ownership: production
+    category: データ分析
+    aliases:
+      - GoogleAnalytics
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Redshift
+    ownership: production
+    category: DB
+    aliases: []
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Case-insensitive ownership absorbs the legacy lowercase duplicate.
+
+  - canonical: SOC 2
+    ownership: production
+    category: セキュリティ
+    aliases:
+      - SOC2
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Deep Security
+    ownership: production
+    category: セキュリティ
+    aliases:
+      - DeepSecurity
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: As-Is/To-Be
+    ownership: production
+    category: プロジェクト管理
+    aliases:
+      - AsIs/ToBe
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Hyphen spelling variant only.
+
+  - canonical: S/4HANA
+    ownership: production
+    category: 業務系
+    aliases:
+      - S4HANA
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Slashless spelling variant only.
+
+  - canonical: Unreal Engine
+    ownership: production
+    category: ゲーム系
+    aliases:
+      - UnrealEngine
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Excel VBA
+    ownership: production
+    category: VBA系
+    aliases:
+      - ExcelVBA
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant and duplicate legacy surfaces.
+
+  - canonical: Access VBA
+    ownership: production
+    category: VBA系
+    aliases:
+      - AccessVBA
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Power Apps
+    ownership: production
+    category: M365系
+    aliases:
+      - PowerApps
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: Google Workspace
+    ownership: production
+    category: Google系
+    aliases:
+      - GoogleWorkspace
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Spacing variant only.
+
+  - canonical: テストケース作成
+    ownership: production
+    category: テスト/品質
+    aliases: []
+    match_mode: phrase
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 1 / 2026-11-13
+    note: Exact duplicate legacy entries are owned once by the registry.
+
+  - canonical: Go
+    ownership: shadow
+    category: バックエンド
+    aliases:
+      - Golang
+      - Go言語
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common language-name variants; kept shadow because bare Go collides with Go/No-Go wording.
+
+  - canonical: Ruby on Rails
+    ownership: production
+    category: バックエンド
+    aliases:
+      - Rails
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common product abbreviation.
+
+  - canonical: VB6
+    ownership: production
+    category: バックエンド
+    aliases:
+      - Visual Basic6.0
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Versioned product-name variant.
+
+  - canonical: Express
+    ownership: production
+    category: バックエンド
+    aliases:
+      - Express-JS
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Product-name variant.
+
+  - canonical: Vue.js
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - Vue
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common product abbreviation.
+
+  - canonical: Material UI
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - MUI
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common product acronym.
+
+  - canonical: Nuxt
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - Nuxt.js
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Current and common historical product surfaces.
+
+  - canonical: Vue.js 3
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - Vue3.js
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Versioned product-name variant.
+
+  - canonical: Kubernetes
+    ownership: production
+    category: インフラ
+    aliases:
+      - k8s
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Standard product abbreviation.
+
+  - canonical: RHEL
+    ownership: production
+    category: インフラ
+    aliases:
+      - Red Hat Enterprise Linux
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Official product acronym and expanded name.
+
+  - canonical: Windowsバッチ
+    ownership: production
+    category: インフラ
+    aliases:
+      - Winバッチ
+    match_mode: phrase
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common platform-name abbreviation.
+
+  - canonical: KornShell
+    ownership: production
+    category: インフラ
+    aliases:
+      - ksh
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Standard shell abbreviation.
+
+  - canonical: vSphere
+    ownership: production
+    category: インフラ
+    aliases:
+      - VMware vSphere
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed surface; VMware remains a separate legacy skill.
+
+  - canonical: ESXi
+    ownership: production
+    category: インフラ
+    aliases:
+      - VMware ESXi
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed surface; VMware remains a separate legacy skill.
+
+  - canonical: BIG-IP
+    ownership: production
+    category: インフラ
+    aliases:
+      - F5 BIG-IP
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed surface; F5 remains a separate legacy skill.
+
+  - canonical: AWS Bedrock
+    ownership: production
+    category: クラウドサービス
+    aliases:
+      - Amazon Bedrock
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Equivalent vendor product surfaces; AWS remains a separate legacy skill.
+
+  - canonical: Adobe XD
+    ownership: production
+    category: デザイン系
+    aliases:
+      - XD
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common product abbreviation.
+
+  - canonical: Adobe Photoshop
+    ownership: production
+    category: デザイン系
+    aliases:
+      - Photoshop
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed and common product surfaces.
+
+  - canonical: Intune
+    ownership: production
+    category: M365系
+    aliases:
+      - Microsoft Intune
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed product surface.
+
+  - canonical: Microsoft 365
+    ownership: production
+    category: M365系
+    aliases:
+      - M365
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Standard product abbreviation.
+
+  - canonical: Oracle Database
+    ownership: production
+    category: DB
+    aliases:
+      - OracleDB
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Common product abbreviation; Oracle remains a separate legacy skill.
+
+  - canonical: UiPath
+    ownership: production
+    category: RPA系
+    aliases:
+      - RPA UiPath
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Domain-prefixed product surface.
+
+  - canonical: Automation Anywhere
+    ownership: production
+    category: RPA系
+    aliases:
+      - Autometion Anywhere
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Legacy typographical variant.
+
+  - canonical: Dataverse
+    ownership: production
+    category: 業務系
+    aliases:
+      - Microsoft Dataverse
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 2 / 2026-11-13
+    note: Vendor-prefixed product surface.
+
+  - canonical: Windows Forms
+    ownership: production
+    category: フロントエンド
+    aliases:
+      - WinForm
+      - WinForms
+      - Windows Form
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Product-name variants; legacy canonical category is preserved.
+
+  - canonical: Firewall
+    ownership: production
+    category: インフラ
+    aliases:
+      - ファイアウォール
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: English and Japanese surfaces denote the same infrastructure concept.
+
+  - canonical: Machine Learning
+    ownership: production
+    category: データ分析/AI
+    aliases:
+      - 機械学習
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: English and Japanese surfaces denote the same concept.
+
+  - canonical: Deep Learning
+    ownership: production
+    category: データ分析/AI
+    aliases:
+      - 深層学習
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: English and Japanese surfaces denote the same concept.
+
+  - canonical: Agile
+    ownership: production
+    category: プロジェクト管理
+    aliases:
+      - アジャイル
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: PM-category bilingual development-method surface.
+
+  - canonical: Scrum
+    ownership: shadow
+    category: プロジェクト管理
+    aliases:
+      - スクラム
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Kept shadow because production ownership suppresses an existing Scrum skill in longest-match cases.
+
+  - canonical: 組み込み
+    ownership: shadow
+    category: 組み込み
+    aliases:
+      - 組込
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Kept shadow because production ownership suppresses an existing embedded-systems skill in longest-match cases.
+
+  - canonical: PL/I
+    ownership: production
+    category: 汎用機系
+    aliases:
+      - PL/1
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: IBM language spelling variant; boundary matching avoids numeric fragments.
+
+  - canonical: Group Policy Object
+    ownership: production
+    category: インフラ
+    aliases:
+      - GPO
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: GPO only; the broader Group Policy phrase is intentionally excluded.
+
+  - canonical: IBM License Metric Tool
+    ownership: production
+    category: ミドルウェア・基盤
+    aliases:
+      - ILMT
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Official product acronym.
+
+  - canonical: HPE Serviceguard
+    ownership: production
+    category: ミドルウェア・基盤
+    aliases:
+      - ServiceGuard
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Case-insensitive matching absorbs Serviceguard without a duplicate alias.
+
+  - canonical: Crystal Reports
+    ownership: production
+    category: データ分析
+    aliases:
+      - Crystal Report
+    match_mode: boundary
+    case_sensitive: false
+    enabled: true
+    source: GEN-01 Batch 3 / 2026-11-13
+    note: Product singular/plural variant; SAP remains a separate skill and raw evidence retains vendor text.

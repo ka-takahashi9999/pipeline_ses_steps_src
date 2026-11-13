@@ -221,11 +221,14 @@ EXCEL_NOISE_CELL_TEXTS = {
 }
 
 XLSX_CUSTOM_PROPERTIES = "docProps/custom.xml"
-XLSX_REQUIRED_MEMBERS = {
+XLSX_BASE_REQUIRED_MEMBERS = {
     "[Content_Types].xml",
     "_rels/.rels",
     "xl/workbook.xml",
     "xl/_rels/workbook.xml.rels",
+}
+XLSX_REQUIRED_MEMBERS = {
+    *XLSX_BASE_REQUIRED_MEMBERS,
     XLSX_CUSTOM_PROPERTIES,
 }
 CUSTOM_PROPERTIES_NS = (
@@ -233,6 +236,38 @@ CUSTOM_PROPERTIES_NS = (
 )
 CUSTOM_PROPERTIES_VALUE_NS = (
     "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+)
+EXCEL_MAX_ROW = 1_048_576
+EXCEL_MAX_COLUMN = 16_384
+PATHOLOGICAL_DIMENSION_MIN_RATIO = 1_000
+STRICT_SPREADSHEET_NS = "http://purl.oclc.org/ooxml/spreadsheetml/main"
+STRICT_OFFICE_REL_NS = "http://purl.oclc.org/ooxml/officeDocument/relationships"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+STRICT_NAMESPACE_REPLACEMENTS = (
+    (
+        b"http://purl.oclc.org/ooxml/spreadsheetml/main",
+        b"http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    ),
+    (
+        b"http://purl.oclc.org/ooxml/officeDocument/relationships",
+        b"http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    ),
+    (
+        b"http://purl.oclc.org/ooxml/drawingml/main",
+        b"http://schemas.openxmlformats.org/drawingml/2006/main",
+    ),
+    (
+        b"http://purl.oclc.org/ooxml/officeDocument/extendedProperties",
+        b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties",
+    ),
+    (
+        b"http://purl.oclc.org/ooxml/officeDocument/docPropsVTypes",
+        b"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
+    ),
+)
+_CELL_REFERENCE_RE = re.compile(r"^\$?([A-Z]{1,3})\$?([1-9]\d*)$")
+_DIMENSION_REFERENCE_RE = re.compile(
+    r"^\$?([A-Z]{1,3})\$?([1-9]\d*)(?::\$?([A-Z]{1,3})\$?([1-9]\d*))?$"
 )
 
 
@@ -424,21 +459,349 @@ def _sanitize_missing_custom_property_names(data: bytes) -> Optional[bytes]:
         return None
 
 
+def _excel_column_number(column_name: str) -> int:
+    """Excel列名を1始まりの列番号へ変換する。"""
+    number = 0
+    for char in column_name:
+        number = number * 26 + (ord(char) - ord("A") + 1)
+    return number
+
+
+def _excel_column_name(column_number: int) -> str:
+    """1始まりの列番号をExcel列名へ変換する。"""
+    chars: List[str] = []
+    while column_number > 0:
+        column_number, remainder = divmod(column_number - 1, 26)
+        chars.append(chr(ord("A") + remainder))
+    return "".join(reversed(chars))
+
+
+def _parse_dimension_reference(reference: str) -> Optional[Tuple[int, int, int, int]]:
+    """dimension refを(min_col, min_row, max_col, max_row)へ変換する。"""
+    match = _DIMENSION_REFERENCE_RE.fullmatch(reference or "")
+    if not match:
+        return None
+    start_col, start_row, end_col, end_row = match.groups()
+    end_col = end_col or start_col
+    end_row = end_row or start_row
+    return (
+        _excel_column_number(start_col),
+        int(start_row),
+        _excel_column_number(end_col),
+        int(end_row),
+    )
+
+
+def _worksheet_has_pathological_dimension(worksheet: Any) -> bool:
+    """openpyxlがExcel上限級の宣言dimensionを保持しているか確認する。"""
+    return (
+        (worksheet.max_row or 0) >= EXCEL_MAX_ROW
+        or (worksheet.max_column or 0) >= EXCEL_MAX_COLUMN
+    )
+
+
+def _data_cell_bounds(worksheet_root: ET.Element) -> Optional[Tuple[int, int, int, int, int]]:
+    """値・inline文字列・数式を持つcellだけから実データ範囲を返す。"""
+    min_col: Optional[int] = None
+    min_row: Optional[int] = None
+    max_col = 0
+    max_row = 0
+    data_cell_count = 0
+
+    for cell in worksheet_root.iter():
+        if _xml_local_name(cell.tag) != "c":
+            continue
+        reference = cell.get("r") or ""
+        match = _CELL_REFERENCE_RE.fullmatch(reference)
+        if not match:
+            continue
+        if not any(
+            _xml_local_name(child.tag) in {"v", "is", "f"}
+            for child in list(cell)
+        ):
+            continue
+
+        column = _excel_column_number(match.group(1))
+        row = int(match.group(2))
+        min_col = column if min_col is None else min(min_col, column)
+        min_row = row if min_row is None else min(min_row, row)
+        max_col = max(max_col, column)
+        max_row = max(max_row, row)
+        data_cell_count += 1
+
+    if min_col is None or min_row is None:
+        return None
+    return min_col, min_row, max_col, max_row, data_cell_count
+
+
+def _replace_worksheet_dimension(
+    worksheet_xml: bytes, old_reference: str, new_reference: str
+) -> Optional[bytes]:
+    """dimension ref属性だけを置換し、その他のworksheet XMLを保持する。"""
+    pattern = re.compile(
+        rb'(<(?:[A-Za-z_][\w.-]*:)?dimension\b[^>]*\bref=["\'])'
+        + re.escape(old_reference.encode("ascii"))
+        + rb'(["\'])'
+    )
+    replaced, count = pattern.subn(
+        lambda match: match.group(1) + new_reference.encode("ascii") + match.group(2),
+        worksheet_xml,
+        count=1,
+    )
+    return replaced if count == 1 else None
+
+
+def _sanitize_pathological_worksheet_dimensions(data: bytes) -> Optional[bytes]:
+    """
+    Excel上限級かつ実データ範囲との乖離が極端なdimensionだけを補正する。
+
+    元bytesは変更せず、条件成立時だけメモリ上のOOXMLコピーを返す。
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(data), "r") as source:
+            entries = source.infolist()
+            if len(entries) > MAX_OOXML_ZIP_ENTRIES or source.testzip() is not None:
+                return None
+
+            names = [entry.filename for entry in entries if not entry.is_dir()]
+            if any(names.count(required) != 1 for required in XLSX_BASE_REQUIRED_MEMBERS):
+                return None
+            worksheet_names = [
+                name
+                for name in names
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            ]
+            if not worksheet_names:
+                return None
+
+            workbook_root = ET.fromstring(source.read("xl/workbook.xml"))
+            relationships_root = ET.fromstring(
+                source.read("xl/_rels/workbook.xml.rels")
+            )
+            if (
+                _xml_local_name(workbook_root.tag) != "workbook"
+                or _xml_local_name(relationships_root.tag) != "Relationships"
+            ):
+                return None
+
+            replacements: Dict[str, bytes] = {}
+            for name in worksheet_names:
+                worksheet_xml = source.read(name)
+                worksheet_root = ET.fromstring(worksheet_xml)
+                if _xml_local_name(worksheet_root.tag) != "worksheet":
+                    return None
+
+                dimension = next(
+                    (
+                        element
+                        for element in worksheet_root.iter()
+                        if _xml_local_name(element.tag) == "dimension"
+                    ),
+                    None,
+                )
+                if dimension is None:
+                    continue
+                old_reference = dimension.get("ref") or ""
+                declared = _parse_dimension_reference(old_reference)
+                if declared is None:
+                    continue
+                declared_min_col, declared_min_row, declared_max_col, declared_max_row = declared
+                if (
+                    declared_max_row < EXCEL_MAX_ROW
+                    and declared_max_col < EXCEL_MAX_COLUMN
+                ):
+                    continue
+
+                actual = _data_cell_bounds(worksheet_root)
+                if actual is None:
+                    continue
+                actual_min_col, actual_min_row, actual_max_col, actual_max_row, _ = actual
+                declared_area = (
+                    (declared_max_col - declared_min_col + 1)
+                    * (declared_max_row - declared_min_row + 1)
+                )
+                actual_area = (
+                    (actual_max_col - actual_min_col + 1)
+                    * (actual_max_row - actual_min_row + 1)
+                )
+                if actual_area <= 0 or declared_area < (
+                    actual_area * PATHOLOGICAL_DIMENSION_MIN_RATIO
+                ):
+                    continue
+
+                new_reference = "{}{}:{}{}".format(
+                    _excel_column_name(actual_min_col),
+                    actual_min_row,
+                    _excel_column_name(actual_max_col),
+                    actual_max_row,
+                )
+                if new_reference == old_reference:
+                    continue
+                replaced = _replace_worksheet_dimension(
+                    worksheet_xml, old_reference, new_reference
+                )
+                if replaced is None:
+                    return None
+                replacements[name] = replaced
+
+            if not replacements:
+                return None
+
+            sanitized_buffer = BytesIO()
+            with zipfile.ZipFile(sanitized_buffer, "w") as destination:
+                destination.comment = source.comment
+                for entry in entries:
+                    member_data = replacements.get(entry.filename, source.read(entry))
+                    destination.writestr(entry, member_data)
+            return sanitized_buffer.getvalue()
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        ET.ParseError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return None
+
+
+def _normalize_strict_ooxml_namespaces(data: bytes) -> Optional[bytes]:
+    """構造が正常なStrict XLSXだけをTransitional namespaceのコピーへ変換する。"""
+    try:
+        with zipfile.ZipFile(BytesIO(data), "r") as source:
+            entries = source.infolist()
+            if len(entries) > MAX_OOXML_ZIP_ENTRIES or source.testzip() is not None:
+                return None
+
+            names = [entry.filename for entry in entries if not entry.is_dir()]
+            if any(names.count(required) != 1 for required in XLSX_BASE_REQUIRED_MEMBERS):
+                return None
+            worksheet_names = [
+                name
+                for name in names
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            ]
+            if not worksheet_names:
+                return None
+
+            content_types_root = ET.fromstring(source.read("[Content_Types].xml"))
+            package_relationships_root = ET.fromstring(source.read("_rels/.rels"))
+            workbook_root = ET.fromstring(source.read("xl/workbook.xml"))
+            workbook_relationships_root = ET.fromstring(
+                source.read("xl/_rels/workbook.xml.rels")
+            )
+            if (
+                _xml_local_name(content_types_root.tag) != "Types"
+                or _xml_local_name(package_relationships_root.tag) != "Relationships"
+                or workbook_root.tag != f"{{{STRICT_SPREADSHEET_NS}}}workbook"
+                or workbook_relationships_root.tag
+                != f"{{{PACKAGE_REL_NS}}}Relationships"
+            ):
+                return None
+
+            sheets = [
+                element
+                for element in workbook_root.iter()
+                if element.tag == f"{{{STRICT_SPREADSHEET_NS}}}sheet"
+            ]
+            relationship_by_id = {
+                element.get("Id"): element
+                for element in workbook_relationships_root
+                if _xml_local_name(element.tag) == "Relationship"
+            }
+            if not sheets:
+                return None
+            for sheet in sheets:
+                relationship_id = sheet.get(f"{{{STRICT_OFFICE_REL_NS}}}id")
+                relationship = relationship_by_id.get(relationship_id)
+                if relationship is None:
+                    return None
+                if relationship.get("Type") != (
+                    f"{STRICT_OFFICE_REL_NS}/worksheet"
+                ):
+                    return None
+                target = (relationship.get("Target") or "").lstrip("/")
+                if not target or ".." in target.split("/"):
+                    return None
+                member_name = target if target.startswith("xl/") else f"xl/{target}"
+                if member_name not in worksheet_names:
+                    return None
+
+            for name in names:
+                if name == "[Content_Types].xml" or name.endswith((".xml", ".rels")):
+                    root = ET.fromstring(source.read(name))
+                    if name in worksheet_names and root.tag != (
+                        f"{{{STRICT_SPREADSHEET_NS}}}worksheet"
+                    ):
+                        return None
+
+            sanitized_buffer = BytesIO()
+            with zipfile.ZipFile(sanitized_buffer, "w") as destination:
+                destination.comment = source.comment
+                for entry in entries:
+                    member_data = source.read(entry)
+                    if entry.filename.endswith((".xml", ".rels")):
+                        for strict_namespace, transitional_namespace in (
+                            STRICT_NAMESPACE_REPLACEMENTS
+                        ):
+                            member_data = member_data.replace(
+                                strict_namespace, transitional_namespace
+                            )
+                    destination.writestr(entry, member_data)
+            return sanitized_buffer.getvalue()
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        ET.ParseError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return None
+
+
 def _load_xlsx_workbook(data: bytes) -> Any:
-    """通常loadを優先し、限定条件成立時だけsanitized copyを1回再読込する。"""
+    """通常loadを優先し、限定条件成立時だけsanitized copyを再読込する。"""
     import openpyxl
 
     try:
-        return openpyxl.load_workbook(BytesIO(data), data_only=True, read_only=True)
-    except Exception as error:
-        if not _is_missing_custom_property_name_error(error):
-            raise
-        sanitized = _sanitize_missing_custom_property_names(data)
-        if sanitized is None:
-            raise
-        return openpyxl.load_workbook(
-            BytesIO(sanitized), data_only=True, read_only=True
+        workbook = openpyxl.load_workbook(
+            BytesIO(data), data_only=True, read_only=True
         )
+    except Exception as error:
+        if _is_missing_custom_property_name_error(error):
+            sanitized = _sanitize_missing_custom_property_names(data)
+            if sanitized is None:
+                raise
+            return openpyxl.load_workbook(
+                BytesIO(sanitized), data_only=True, read_only=True
+            )
+        strict_copy = _normalize_strict_ooxml_namespaces(data)
+        if strict_copy is None:
+            raise
+        workbook = openpyxl.load_workbook(
+            BytesIO(strict_copy), data_only=True, read_only=True
+        )
+        if not workbook.sheetnames:
+            raise ValueError("Strict OOXML変換後もworksheetを取得できません")
+        logger.info("Strict OOXML namespace fallbackを適用")
+        return workbook
+
+    if workbook.sheetnames:
+        return workbook
+
+    strict_copy = _normalize_strict_ooxml_namespaces(data)
+    if strict_copy is None:
+        return workbook
+    strict_workbook = openpyxl.load_workbook(
+        BytesIO(strict_copy), data_only=True, read_only=True
+    )
+    if not strict_workbook.sheetnames:
+        raise ValueError("Strict OOXML変換後もworksheetを取得できません")
+    logger.info("Strict OOXML namespace fallbackを適用")
+    return strict_workbook
 
 
 def extract_text_from_excel(data: bytes, filename: str = "") -> str:
@@ -466,6 +829,11 @@ def extract_text_from_excel(data: bytes, filename: str = "") -> str:
 
     # .xlsx (ZIP形式)
     wb = _load_xlsx_workbook(data)
+    if any(_worksheet_has_pathological_dimension(sheet) for sheet in wb.worksheets):
+        sanitized = _sanitize_pathological_worksheet_dimensions(data)
+        if sanitized is not None:
+            logger.info(f"異常worksheet dimension fallbackを適用: {filename}")
+            wb = _load_xlsx_workbook(sanitized)
     rows = []
     for sname in wb.sheetnames:
         sheet = wb[sname]

@@ -21,7 +21,7 @@ from common.phase_extractor import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_SHA256 = "4c5d14b5fae35801efba6eb0367a3d85d578099b2bd9cf065d612991e416a8e7"
+EXPECTED_SHA256 = "f4932d47d81256140965b677182771f8e8ba957cdfd6282f7444d26aedf22619"
 
 
 def _load_step_module(name: str, relative_path: str):
@@ -50,7 +50,10 @@ class PhaseExtractorTest(unittest.TestCase):
 
         self.assertEqual(hashlib.sha256(raw).hexdigest(), EXPECTED_SHA256)
         self.assertEqual(len(data), 12)
-        self.assertEqual(sum(len(keywords) for keywords in data.values()), 170)
+        self.assertEqual(sum(len(keywords) for keywords in data.values()), 175)
+        self.assertIn("要件策定", data["要件定義"])
+        self.assertIn("試験工程", data["テスト"])
+        self.assertIn("移管計画の策定", data["移行"])
         self.assertIn("業務要件の確認", data["要件調査"])
         self.assertIn("運用試験", data["テスト"])
         self.assertIn("運用フローの設計", data["運用保守"])
@@ -58,9 +61,31 @@ class PhaseExtractorTest(unittest.TestCase):
         self.assertIn("性能試験", data["テスト"])
         self.assertIn("運用引継ぎ", data["運用保守"])
         self.assertIn("運用手順書", data["運用保守"])
+        self.assertIn("現行解析", data["要件調査"])
+        self.assertIn("運用方法の検討", data["運用保守"])
         all_keywords = {keyword for keywords in data.values() for keyword in keywords}
         self.assertNotIn("リファクタリング", all_keywords)
         self.assertNotIn("障害時顧客対応", all_keywords)
+        for held_keyword in (
+            "障害調査",
+            "ジョブ設計",
+            "受入",
+            "設計",
+            "調査",
+            "運用",
+            "評価",
+            "業務要求整理",
+            "受け入れ",
+            "本番導入",
+            "顧客折衝",
+            "仕様調整",
+            "構成管理",
+            "PM/PL",
+            "品質管理",
+            "QA",
+            "システム導入",
+        ):
+            self.assertNotIn(held_keyword, all_keywords)
 
     def test_load_is_deterministic_and_keyword_order_is_stable(self):
         first = load_phase_dictionary(str(PHASE_DICTIONARY_PATH))
@@ -99,7 +124,7 @@ class PhaseExtractorTest(unittest.TestCase):
         self.assertEqual(extract_phases("工程の記載なし", phase_dict), ([], None))
         self.assertEqual(extract_phases(None, phase_dict), ([], None))
 
-    def test_all_170_keywords_assign_to_their_category(self):
+    def test_all_175_keywords_assign_to_their_category(self):
         validated = validate_phase_dictionary(str(PHASE_DICTIONARY_PATH))
         phase_dict = load_phase_dictionary(str(PHASE_DICTIONARY_PATH))
         for expected_phase, keywords in validated.items():

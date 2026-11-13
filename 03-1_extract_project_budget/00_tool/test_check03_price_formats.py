@@ -102,6 +102,67 @@ class Check03ProjectPriceFormatsTest(unittest.TestCase):
                     record["unit_price_sub_infor"]["range"], expected_range
                 )
 
+    def test_price_header_accepts_explicit_role_sublabel_value(self):
+        cases = {
+            "【単価】\n■定常作業者：〜40万": (
+                400000,
+                {"min": None, "max": 400000},
+                "monthly",
+            ),
+            "【単価】\n■リーダー：60万円": (
+                600000,
+                None,
+                "monthly",
+            ),
+            "【単価】\n■担当者：時給2,700円まで": (
+                432000,
+                {"min": None, "max": 432000},
+                "monthly",
+            ),
+        }
+        for body, (expected, expected_range, expected_kind) in cases.items():
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertEqual(record["unit_price"], expected)
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["range"], expected_range
+                )
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["kind"], expected_kind
+                )
+
+    def test_price_header_rejects_non_price_section_values(self):
+        cases = (
+            "【単価】\n■勤務地：東京",
+            "【単価】\n■募集：2名",
+            "【単価】\n■精算：140-180h",
+            "【単価】\n■年齢：45歳",
+            "【単価】\n■稼働：100%",
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    target.build_record("fixture", body)["unit_price"]
+                )
+
+    def test_existing_bullet_role_price_is_preserved(self):
+        record = target.build_record(
+            "fixture",
+            "【単価】\n・リーダー：60万円\n・担当：55万円",
+        )
+        self.assertEqual(record["unit_price"], 600000)
+        self.assertEqual(
+            record["unit_price_sub_infor"]["unit_price_raw"], "60万円"
+        )
+
+    def test_held_hourly_man_conflict_in_mail_context_stays_null(self):
+        body = (
+            "【案件】filemaker PM要員\n"
+            + "業務内容の説明です。\n" * 20
+            + "・時給：65万円※応相談\n"
+        )
+        self.assertIsNone(target.build_record("fixture", body)["unit_price"])
+
     def test_hourly_prefix_open_high_requires_explicit_price_context(self):
         positive_cases = (
             "単価：時給 ～2,500円",
@@ -132,6 +193,46 @@ class Check03ProjectPriceFormatsTest(unittest.TestCase):
             with self.subTest(body=body):
                 record = target.build_record("fixture", body)
                 self.assertIsNone(record["unit_price"])
+
+    def test_hourly_suffix_open_high_uses_existing_conversion(self):
+        positive_cases = (
+            "時給2,700円迄",
+            "時給2700円迄",
+            "時給2,700円まで",
+            "単金：時給2,700円迄",
+            "単価：時給 2,700円まで",
+            "●単金＿＿＿＿：時給2,700円迄",
+        )
+        for body in positive_cases:
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertEqual(record["unit_price"], 432000)
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["range"],
+                    {"min": None, "max": 432000},
+                )
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["reason"],
+                    "hourly-yen-open-high",
+                )
+
+    def test_hourly_suffix_open_high_rejects_other_meanings(self):
+        negative_cases = {
+            "時給2,700円以上": None,
+            "時給2,700円程度": None,
+            "時給応相談": target.SKILL_BASED_PRICE,
+            "2,700円迄": None,
+            "時給2,700円まで応相談": target.SKILL_BASED_PRICE,
+            "管理番号：2700": None,
+        }
+        for body, existing_value in negative_cases.items():
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertEqual(record["unit_price"], existing_value)
+                self.assertNotEqual(
+                    record["unit_price_sub_infor"]["reason"],
+                    "hourly-yen-open-high",
+                )
 
     def test_monthly_amount_precedes_hourly_equivalent(self):
         record = target.build_record(

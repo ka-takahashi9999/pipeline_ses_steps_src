@@ -62,6 +62,29 @@ class ResourceLocationParserTest(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 self.assertEqual(source, "label")
 
+    def test_adopted_a5_resource_terms(self):
+        cases = {
+            "三ッ沢上町駅": "関東地方",
+            "杉並区": "関東地方",
+        }
+        for location_text, expected in cases.items():
+            with self.subTest(location_text=location_text):
+                actual, _raw, source = parse_location(
+                    f"最寄駅: {location_text}", self.entries
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(source, "label")
+
+    def test_held_terms_remain_unknown(self):
+        for location_text in ("西鉄津福駅", "駒澤大学前駅", "入間駅", "臼井駅"):
+            with self.subTest(location_text=location_text):
+                actual, raw, source = parse_location(
+                    f"最寄駅: {location_text}", self.entries
+                )
+                self.assertEqual(actual, "unknown")
+                self.assertIsNone(raw)
+                self.assertEqual(source, "")
+
 
 if __name__ == "__main__":
     unittest.main()
