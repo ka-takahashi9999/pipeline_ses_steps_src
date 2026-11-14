@@ -70,6 +70,179 @@ class ExplicitYearsContradictionGuardTest(unittest.TestCase):
         )
         self.assertEqual("confirmed", check["confidence"])
 
+    def test_spring_boot_four_years_two_months_is_human_review(self):
+        skillsheet = (
+            "1 | 2022/6～2024.1 | Spring Boot開発\n"
+            "2 | 2021/10～2022.5 | SpringBoot開発\n"
+            "3 | 2019/12～2021.9 | Spring Boot開発\n"
+        )
+        check, metadata = _apply(
+            "Java(Spring Boot)を用いた開発経験5年以上目安",
+            skillsheet,
+            "Spring Boot開発経験",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        decision = metadata["explicit_years_contradiction_decisions"][0]
+        self.assertEqual({"spring_boot": 50}, decision["proof_months_by_target"])
+
+    def test_spring_boot_five_years_keeps_confirmed(self):
+        check, _ = _apply(
+            "Java(Spring Boot)を用いた開発経験5年以上",
+            "1 | 2020/1～2024/12 | Spring Boot開発",
+            "Spring Boot開発経験",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_spring_boot_mixed_date_range_is_included(self):
+        skillsheet = (
+            "1 | 2022/6～2024.1 | Spring Boot開発\n"
+            "2 | 2021/10～2022.5 | SpringBoot開発\n"
+            "3 | 2019/12～2021.9 | Spring Boot開発\n"
+            "4 | 2018年10月～2019/11 | SpringBoot開発\n"
+        )
+        check, metadata = _apply(
+            "Java(Spring Boot)を用いた開発経験5年以上目安",
+            skillsheet,
+            "Spring Boot開発経験",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+        decision = metadata["explicit_years_contradiction_decisions"][0]
+        self.assertEqual({"spring_boot": 64}, decision["proof_months_by_target"])
+
+    def test_long_java_is_not_added_to_short_spring_boot(self):
+        skillsheet = (
+            "Java | 実務経験 | 10年\n"
+            "1 | 2024/1～2024/12 | Spring Boot開発\n"
+        )
+        check, metadata = _apply(
+            "Java(Spring Boot)を用いた開発経験5年以上",
+            skillsheet,
+            "Java 10年 / Spring Boot 1年",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        decision = metadata["explicit_years_contradiction_decisions"][0]
+        self.assertNotIn("java", decision["proof_months_by_target"])
+
+    def test_power_automate_one_year_does_not_reuse_other_rpa_years(self):
+        skillsheet = (
+            "1 | 2024-07-01 00:00:00 | ～ | 2025-06-01 00:00:00 | "
+            "Power Automate開発\n"
+            "UiPath 5年\nBizRobo! 4年\nBlue Prism 3年\n"
+        )
+        check, metadata = _apply(
+            "Power Platform(Power AppsまたはPower Automate)を用いた開発経験2年以上",
+            skillsheet,
+            "Power Automate実務経験",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        decision = metadata["explicit_years_contradiction_decisions"][0]
+        self.assertEqual(12, decision["proof_months_by_target"]["power_automate"])
+
+    def test_power_automate_two_years_keeps_confirmed(self):
+        check, _ = _apply(
+            "Power Platform(Power AppsまたはPower Automate)を用いた開発経験2年以上",
+            "1 | 2023-01-01 00:00:00 | ～ | 2024-12-01 00:00:00 | "
+            "Power Automate開発",
+            "Power Automate実務経験",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_or_candidate_years_are_not_added_together(self):
+        skillsheet = (
+            "1 | 2024/1～2024/12 | Power Apps開発\n"
+            "2 | 2023/1～2023/12 | Power Automate開発\n"
+        )
+        check, metadata = _apply(
+            "Power AppsまたはPower Automateを用いた開発経験2年以上",
+            skillsheet,
+            "Power Apps / Power Automate各1年",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        decision = metadata["explicit_years_contradiction_decisions"][0]
+        self.assertEqual(12, decision["proof_months_by_target"]["power_apps"])
+        self.assertEqual(12, decision["proof_months_by_target"]["power_automate"])
+
+
+class SpecificTechnologyGuardTest(unittest.TestCase):
+    def test_react_only_does_not_prove_typescript(self):
+        check, metadata = _apply(
+            "TypeScript(React)を用いた開発経験2年以上",
+            "React.jsによるフロントエンド開発 3年",
+            "React.js 3年",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        self.assertIn(
+            "specific_technology_evidence_missing:1", metadata["guard_reasons"]
+        )
+
+    def test_typescript_direct_evidence_keeps_confirmed(self):
+        check, _ = _apply(
+            "TypeScript(React)を用いた開発経験2年以上",
+            "TypeScript / React.js 3年",
+            "TypeScript 3年",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_typescript_spelling_alias_keeps_confirmed(self):
+        check, _ = _apply(
+            "TypeScript開発経験",
+            "Typescriptによる開発を担当",
+            "Typescript",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_generic_parent_does_not_prove_specific_child(self):
+        check, _ = _apply(
+            "Azure Functionsの開発経験",
+            "Azure環境の設計・構築経験",
+            "Azure経験",
+        )
+        self.assertEqual("human_review", check["confidence"])
+
+
+class PmoRoleGuardTest(unittest.TestCase):
+    def test_pm_only_does_not_prove_pmo(self):
+        check, metadata = _apply(
+            "PMOとして3~5年程度の参画経験",
+            "PMとして約6年間経験",
+            "PMとして約6年間経験",
+        )
+        self.assertEqual("human_review", check["confidence"])
+        self.assertIn("pmo_role_evidence_insufficient:1", metadata["guard_reasons"])
+
+    def test_direct_pmo_without_year_requirement_keeps_confirmed(self):
+        check, _ = _apply(
+            "PMOとしての参画経験",
+            "PMOメンバーとして進捗管理を担当",
+            "PMOメンバー",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_pmo_assistant_without_duration_is_human_review(self):
+        check, _ = _apply(
+            "PMOとして3~5年程度の参画経験",
+            "PMO補佐として進捗管理を担当",
+            "PMO補佐",
+        )
+        self.assertEqual("human_review", check["confidence"])
+
+    def test_pmo_with_explicit_duration_keeps_confirmed(self):
+        check, _ = _apply(
+            "PMOとして3~5年程度の参画経験",
+            "PMOとして4年の実務経験",
+            "PMOとして4年",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+
+    def test_pmo_or_pm_requirement_is_outside_role_guard(self):
+        check, metadata = _apply(
+            "PMO または PMとしての実務経験(目安3年以上)",
+            "PMとして4年の実務経験",
+            "PMとして4年",
+        )
+        self.assertEqual("confirmed", check["confidence"])
+        self.assertEqual([], metadata["guard_reasons"])
+
 
 class GitCompoundGuardTest(unittest.TestCase):
     STRICT = "Git/GitHubを利用したチーム開発経験(プルリクエストでのレビュー運用)"

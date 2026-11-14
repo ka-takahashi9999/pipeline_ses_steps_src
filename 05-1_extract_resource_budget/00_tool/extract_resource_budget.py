@@ -194,6 +194,14 @@ RX_START_DATE_SLASH_MAN = re.compile(
     r"(?:即日|\d{1,2}\s*月)\s*[〜~\-]?\s*[\/／]\s*(\d{2,3})\s*万[円]?"
 )
 
+# price headerがないresourceプロフィールでも、行全体が
+# 「両端の明示単位付き月額range + 税区分」の場合だけ補完する。
+RX_STANDALONE_TAXED_MAN_RANGE = re.compile(
+    r"^\s*(?P<low>\d{1,3})\s*万(?:円)?\s*" + _SEP
+    + r"\s*(?P<high>\d{1,3})\s*万(?:円)?\s*"
+    r"(?P<tax>税別|税込)\s*$"
+)
+
 
 # ── セグメント抽出 ────────────────────────────────────────
 def _get_segments(text: str) -> List[str]:
@@ -213,6 +221,27 @@ def _get_segments(text: str) -> List[str]:
 # ── 抽出関数 ─────────────────────────────────────────────
 def _yen_to_int(value: str) -> int:
     return int(value.replace(",", ""))
+
+
+def _standalone_taxed_man_range(text: str) -> Optional[Tuple]:
+    """独立行の明示月額rangeと税区分の組み合わせだけを抽出する。"""
+    for line in text.splitlines():
+        match = RX_STANDALONE_TAXED_MAN_RANGE.fullmatch(line)
+        if not match:
+            continue
+        low = int(match.group("low")) * 10000
+        high = int(match.group("high")) * 10000
+        minimum, maximum = min(low, high), max(low, high)
+        if not (_PRICE_MIN <= minimum and maximum <= _PRICE_MAX):
+            continue
+        return (
+            (minimum + maximum) // 2,
+            minimum,
+            maximum,
+            "standalone-taxed-man-range",
+            match.group(0).strip(),
+        )
+    return None
 
 
 def _hourly_daily(seg: str) -> Optional[Tuple]:
@@ -504,6 +533,10 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int]
         if len(text) <= 200:
             segments = [text]
         else:
+            result = _standalone_taxed_man_range(text)
+            if result:
+                price, p_min, p_max, reason, raw = result
+                return price, p_min, p_max, reason, raw
             return None, None, None, "no-price-keyword", ""
 
     skill_found = False
@@ -551,6 +584,12 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[int], Optional[int]
 
     if skill_found:
         return SKILL_BASED_PRICE, None, None, "skill-based", "スキル見合い"
+
+    # 既存parserがnullの場合だけ、独立行の明示税区分付きrangeを補完する。
+    result = _standalone_taxed_man_range(text)
+    if result:
+        price, p_min, p_max, reason, raw = result
+        return price, p_min, p_max, reason, raw
 
     return None, None, None, "no-match", ""
 

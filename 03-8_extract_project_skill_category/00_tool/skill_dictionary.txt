@@ -430,6 +430,8 @@
   - NetBackup
 
 クラウドサービス:
+  # DICT-02（2026-11-14 skill confirmation unit）
+  - Webex
   # DICT-02（2026-11-10 skill confirmation unit）
   - Transit Gateway
   - Secrets Manager
@@ -749,6 +751,9 @@ AI:
   - Kiro
 
 セキュリティ:
+  # DICT-02（2026-11-14 skill confirmation unit）
+  - SKYSEA
+  - Auth0
   # DICT-02（2026-11-10 skill confirmation unit）
   - AppGuard
   - 特権アクセス管理システム
@@ -865,6 +870,8 @@ AI:
   - テックリード
 
 組み込み:
+  # DICT-02（2026-11-14 skill confirmation unit）
+  - CAN通信
   # DICT-02（2026-11-13 skill confirmation unit）
   - ファームウェア
   - ブートローダー
@@ -973,6 +980,8 @@ AI:
   - Pega
 
 ミドルウェア・基盤:
+  # DICT-02（2026-11-14 skill confirmation unit）
+  - PRIMECLUSTER
   # DICT-02（2026-11-13 skill confirmation unit）
   - "Argo Workflows"
   - BigFix
@@ -1185,6 +1194,9 @@ CMS系:
 
 #分類不可の為
 その他:
+  # DICT-02（2026-11-14 skill confirmation unit）
+  - ITIL
+  - TeamSpirit
   # DICT-02（2026-11-13 skill confirmation unit）
   - "GitHub Enterprise Server"
   # DICT-02（2026-11-10 skill confirmation unit）

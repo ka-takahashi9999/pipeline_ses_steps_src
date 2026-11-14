@@ -4,7 +4,7 @@
 ② duplicate_proposal_check が true/false のみ
 ③ diff_file 件数整合性を確認
 ④ HITキーはSuccess Cacheに存在する
-⑤ MISSキーはSuccess Cacheに存在しない
+⑤ MISSキーはSuccess Cache不存在または保存済みfingerprint不一致
 ⑥ HIT + MISS = 今回pair集合（message_idペア / comparison_key の両方で確認）
 """
 
@@ -19,6 +19,8 @@ from common.json_utils import count_jsonl, read_jsonl_as_list
 from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
+    build_input_fingerprints,
+    cache_fingerprint_status,
     comparison_key_from_dict,
     comparison_key_from_diff_record,
     is_complete_comparison_key,
@@ -37,6 +39,13 @@ OUTPUT_DUPLICATE = STEP_DIR / "01_result/99_duplicate_duplicate_proposal_check.j
 OUTPUT_DIFF_FILE = STEP_DIR / "01_result/duplicate_proposal_check_diff_file.jsonl"
 OUTPUT_BK_DIFF_FILE = STEP_DIR / "01_result/bk_duplicate_proposal_check_diff_file.jsonl"
 SUCCESS_CACHE_FILE = SUCCESS_CACHE_PATH
+INPUT_PROJECT_SKILLS = (
+    project_root
+    / "03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl"
+)
+INPUT_SKILLSHEETS = (
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
+)
 CONFIRM_RESULT = STEP_DIR / "02_confirm/confirm_result_duplicate_proposal_check.txt"
 
 
@@ -59,6 +68,29 @@ def diff_comparison_key(record: dict) -> tuple:
     if "comparison_key" in record:
         return comparison_key_from_dict(record["comparison_key"])
     return comparison_key_from_diff_record(record)
+
+
+def fingerprint_status_for_record(
+    record: dict, cache_entry: dict, project_skills: Dict[str, dict], skillsheets: Dict[str, dict]
+) -> str:
+    project_mid, resource_mid = message_id_key(record)
+    project_record = project_skills.get(project_mid) or {}
+    skillsheet_record = skillsheets.get(resource_mid) or {}
+    required = project_record.get("required_skills")
+    skillsheet = skillsheet_record.get("skillsheet")
+    current_fingerprints = {}
+    if (
+        isinstance(required, list)
+        and skillsheet_record.get("success")
+        and isinstance(skillsheet, str)
+        and skillsheet.strip()
+    ):
+        current_fingerprints = build_input_fingerprints(
+            required, skillsheet, project_record.get("optional_skills") or []
+        )
+    return cache_fingerprint_status(
+        cache_entry, current_fingerprints
+    )
 
 
 def main() -> None:
@@ -85,6 +117,14 @@ def main() -> None:
     except Exception as e:
         success_cache = {}
         cache_load_error = str(e)
+    project_skills = {
+        record.get("message_id", ""): record
+        for record in read_jsonl_as_list(str(INPUT_PROJECT_SKILLS))
+    }
+    skillsheets = {
+        record.get("message_id", ""): record
+        for record in read_jsonl_as_list(str(INPUT_SKILLSHEETS))
+    }
 
     lines += [
         f"入力件数                 : {input_count}",
@@ -163,7 +203,24 @@ def main() -> None:
         lines.append("[OK] 新規/重複の全ペアが diff_file の comparison_key と対応")
 
     hit_not_in_cache = sum(1 for k in hit_keys if k is not None and k not in success_cache)
-    miss_in_cache = sum(1 for k in miss_keys if k is not None and k in success_cache)
+    hit_fingerprint_ng = sum(
+        1
+        for record, key in zip(duplicate_records, hit_keys)
+        if key is not None
+        and key in success_cache
+        and fingerprint_status_for_record(
+            record, success_cache[key], project_skills, skillsheets
+        ) not in ("match", "missing")
+    )
+    miss_with_matching_fingerprint = sum(
+        1
+        for record, key in zip(new_records, miss_keys)
+        if key is not None
+        and key in success_cache
+        and fingerprint_status_for_record(
+            record, success_cache[key], project_skills, skillsheets
+        ) in ("match", "missing")
+    )
 
     if hit_not_in_cache:
         msg = f"[NG] HITキーがSuccess Cacheに存在しない: {hit_not_in_cache}件"
@@ -172,12 +229,22 @@ def main() -> None:
     else:
         lines.append("[OK] HITキーはすべてSuccess Cacheに存在する")
 
-    if miss_in_cache:
-        msg = f"[NG] MISSキーがSuccess Cacheに存在する: {miss_in_cache}件"
+    if hit_fingerprint_ng:
+        msg = f"[NG] HITキーのfingerprintが一致しない: {hit_fingerprint_ng}件"
         lines.append(msg)
         errors.append(msg)
     else:
-        lines.append("[OK] MISSキーはSuccess Cacheに存在しない")
+        lines.append("[OK] HITキーはfingerprint一致またはfingerprint未保存の旧Cache")
+
+    if miss_with_matching_fingerprint:
+        msg = (
+            "[NG] fingerprint一致cacheがあるのにMISS: "
+            f"{miss_with_matching_fingerprint}件"
+        )
+        lines.append(msg)
+        errors.append(msg)
+    else:
+        lines.append("[OK] MISSはcache不存在または保存済みfingerprint不一致")
 
     diff_message_keys = {message_id_key(r) for r in diff_records}
     hit_message_keys = {message_id_key(r) for r in duplicate_records}

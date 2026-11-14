@@ -4,20 +4,26 @@ Success Cache 共通モジュール
 06-80 の重複判定 / 08-1 の過去評価結果復元の正本として使用する。
 
 方針:
-- identity は comparison_key（project_from / project_subject / resource_from / resource_subject）
+- lookup identity は comparison_key
+- fingerprint保存済みCacheは入力一致を必須とし、未保存の旧Cacheは段階移行として再利用する
 - message_id は「今回run内の追跡」用であり identity ではない
 - cache不整合は黙って無視せず SuccessCacheError で停止する
 
 Step側でcacheのJSON構造を直接組み立てないこと。必ずこのモジュールを使用すること。
 """
 
+import hashlib
+import json
 import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from common.json_utils import read_jsonl, write_jsonl
 
 CACHE_VERSION = 1
+INPUT_FINGERPRINT_VERSION = 1
 CACHE_FILENAME = "success_cache_requirement_skill_ai_matching.jsonl"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +100,73 @@ def format_comparison_key(key: ComparisonKey) -> str:
     )
 
 
+# ---------------------------------------------------------- input fingerprints
+
+
+def _normalize_required_text(value: Any) -> str:
+    """required条件のhash用正規化。表記上の空白・大小差だけを吸収する。"""
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", " ", normalized).strip().casefold()
+
+
+def _normalize_skillsheet_text(value: Any) -> str:
+    """04-2 normalized本文のhash用正規化。改行差と行末空白だけを吸収する。"""
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+$", "", line) for line in normalized.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def build_input_fingerprints(
+    required_skills: List[Any],
+    normalized_skillsheet: str,
+    optional_skills: List[Any] = None,
+) -> Dict[str, Any]:
+    """07評価入力の条件（順序非依存）と04-2本文のfingerprintを作る。"""
+    def normalized_skill_payload(items: List[Any]) -> str:
+        values: List[str] = []
+        for item in items or []:
+            value = item.get("skill", "") if isinstance(item, dict) else item
+            values.append(_normalize_required_text(value))
+        return json.dumps(
+            sorted(values), ensure_ascii=False, separators=(",", ":")
+        )
+
+    return {
+        "fingerprint_version": INPUT_FINGERPRINT_VERSION,
+        "required_sha256": _sha256_text(normalized_skill_payload(required_skills)),
+        "optional_sha256": _sha256_text(normalized_skill_payload(optional_skills or [])),
+        "skillsheet_sha256": _sha256_text(
+            _normalize_skillsheet_text(normalized_skillsheet)
+        ),
+    }
+
+
+def cache_fingerprint_status(
+    cache_entry: Dict[str, Any], current_fingerprints: Dict[str, Any]
+) -> str:
+    """fingerprint状態を返す。missingは段階移行中の旧Cacheを表す。"""
+    cached = cache_entry.get("input_fingerprints")
+    if not isinstance(cached, dict):
+        return "missing"
+    fields = (
+        "fingerprint_version",
+        "required_sha256",
+        "optional_sha256",
+        "skillsheet_sha256",
+    )
+    if any(field not in cached for field in fields):
+        return "missing"
+    matches = all(
+        cached[field] == current_fingerprints.get(field) for field in fields
+    )
+    return "match" if matches else "mismatch"
+
+
 # ---------------------------------------------------------------- entry
 
 
@@ -104,9 +177,10 @@ def build_cache_entry(
     required_skills: List[Any],
     optional_skills: List[Any],
     evaluation_meta: Dict[str, Any],
+    input_fingerprints: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """Success Cache 1エントリを組み立てる（07-1正常結果の再利用に必要な最小限）。"""
-    return {
+    entry = {
         "cache_version": CACHE_VERSION,
         "comparison_key": comparison_key_to_dict(comparison_key),
         "source_message_ids": {
@@ -117,6 +191,9 @@ def build_cache_entry(
         "optional_skills": optional_skills,
         "evaluation_meta": evaluation_meta,
     }
+    if input_fingerprints is not None:
+        entry["input_fingerprints"] = input_fingerprints
+    return entry
 
 
 def _validate_skill_list(entry: Dict[str, Any], field: str, where: str) -> None:
@@ -165,6 +242,21 @@ def validate_cache_entry(entry: Any, where: str) -> ComparisonKey:
 
     if not isinstance(entry.get("evaluation_meta"), dict):
         raise SuccessCacheError(f"{where}: 必須評価schema欠落 (evaluation_meta がdictでない)")
+
+    fingerprints = entry.get("input_fingerprints")
+    if fingerprints is not None:
+        if not isinstance(fingerprints, dict):
+            raise SuccessCacheError(f"{where}: input_fingerprints がdictでない")
+        if fingerprints.get("fingerprint_version") != INPUT_FINGERPRINT_VERSION:
+            raise SuccessCacheError(
+                f"{where}: fingerprint_version不一致 "
+                f"(期待={INPUT_FINGERPRINT_VERSION} "
+                f"実際={fingerprints.get('fingerprint_version')!r})"
+            )
+        for field in ("required_sha256", "optional_sha256", "skillsheet_sha256"):
+            value = fingerprints.get(field)
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise SuccessCacheError(f"{where}: input_fingerprints.{field} が不正")
 
     return key
 

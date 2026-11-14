@@ -123,6 +123,57 @@ class SkillRegistryProductionTest(unittest.TestCase):
         self.assertEqual(record["skills_by_category"], {"データ分析": ["Power BI"]})
         self.assertEqual(len([hit for hit in hits if hit["canonical"] == "Power BI"]), 1)
 
+    def test_20261114_adopted_legacy_skills_extract_in_both_steps(self):
+        expected = {
+            "ITIL": "その他",
+            "TeamSpirit": "その他",
+            "SKYSEA": "セキュリティ",
+            "Auth0": "セキュリティ",
+            "Webex": "クラウドサービス",
+            "CAN通信": "組み込み",
+            "PRIMECLUSTER": "ミドルウェア・基盤",
+        }
+        body = " / ".join(expected)
+        project, _ = self.project_module.build_registry_overlay_record(
+            "p", body, self.matcher, self.required_matcher, self.runtime.snapshot, {}
+        )
+        resource, _ = self.resource_module.build_registry_overlay_record(
+            "r", body, self.matcher
+        )
+        self.assertEqual(project["skills"], list(expected))
+        self.assertEqual(resource["skills"], list(expected))
+        self.assertEqual(project["primary_skills"], list(expected))
+        for skill, category in expected.items():
+            self.assertIn(skill, project["skills_by_category"][category])
+            self.assertIn(skill, resource["skills_by_category"][category])
+
+    def test_20261114_ambiguous_or_parent_surfaces_are_not_added(self):
+        negative_cases = {
+            "Aruba島への旅行": "Aruba",
+            "KVMスイッチを接続": "KVM",
+            "I have no notion of that.": "Notion",
+            "この仕様書はMarkdown形式です": "Markdown",
+            "Microsoft Defender for Cloud": "Microsoft Defender",
+        }
+        for body, excluded in negative_cases.items():
+            with self.subTest(body=body):
+                skills = [hit.canonical for hit in self.matcher.find_hits(body)]
+                self.assertNotIn(excluded, skills)
+
+    def test_20261114_longest_match_keeps_existing_child_and_can_product(self):
+        skills = [
+            hit.canonical
+            for hit in self.matcher.find_hits(
+                "Microsoft Defender for Endpoint / CANalyzer / CAN通信 / SKYSEA"
+            )
+        ]
+        self.assertIn("Microsoft Defender for Endpoint", skills)
+        self.assertIn("CANalyzer", skills)
+        self.assertIn("CAN通信", skills)
+        self.assertIn("SKYSEA", skills)
+        self.assertNotIn("Microsoft Defender", skills)
+        self.assertNotIn("CAN", skills)
+
     def test_06_8_matches_registry_canonicals(self):
         project, resource, primary = self.skill_gate_module.normalize_registry_owned_skills(
             ["PowerBI"], ["Power-BI"], ["Power BI"], self.runtime

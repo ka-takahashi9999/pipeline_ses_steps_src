@@ -7,6 +7,53 @@ import extract_project_budget as target
 
 
 class Check03ProjectPriceFormatsTest(unittest.TestCase):
+    def test_price_section_fallback_accepts_later_open_high(self):
+        cases = {
+            (
+                "●単価\n"
+                "業務経験、スキルを見て総合的に判断\n"
+                "希望単価 MAX37月額（140〜180Hr）\n"
+                "スキル次第でMax41万\n"
+                "●その他条件\n"
+                "Max90万"
+            ): 410000,
+            "【単価】\n説明行\nMAX 80万円\n【場所】東京": 800000,
+            "■単金■\n説明行\n上限70万\n■場所■東京": 700000,
+        }
+        for body, expected in cases.items():
+            with self.subTest(body=body):
+                record = target.build_record("fixture", body)
+                self.assertEqual(record["unit_price"], expected)
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["range"],
+                    {"min": None, "max": expected},
+                )
+                self.assertEqual(
+                    record["unit_price_sub_infor"]["reason"],
+                    "price-section-open-high",
+                )
+
+    def test_price_section_fallback_rejects_non_price_or_later_sections(self):
+        cases = (
+            "●単価\n説明行\n●その他\nMax90万",
+            "●単価\n説明行\n410000",
+            "●単価\n精算幅:140-180h",
+            "●単価\n人数:2名",
+            "●単価\n稼働率:80%",
+            "●単価\nversion 41",
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                self.assertIsNone(target.build_record("fixture", body)["unit_price"])
+
+    def test_existing_price_precedes_price_section_fallback(self):
+        record = target.build_record(
+            "fixture",
+            "●単価\n65万円\n説明行\nMax80万\n●その他",
+        )
+        self.assertEqual(record["unit_price"], 650000)
+        self.assertEqual(record["unit_price_sub_infor"]["reason"], "man")
+
     def test_explicit_price_precedes_skill_based_fallback(self):
         explicit = target.build_record(
             "fixture",

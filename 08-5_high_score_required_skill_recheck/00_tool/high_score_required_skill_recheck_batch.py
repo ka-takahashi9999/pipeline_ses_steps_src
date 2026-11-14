@@ -309,12 +309,12 @@ def _build_request_context(
             "dispatch": "local_fallback",
             "fallback_reason": "スキルシート欠落のため人間確認",
             "skillsheet_text": "",
+            "guard_skillsheet_text": "",
             "project_body_text": "",
         }
     normalized = str(skillsheet_record.get("skillsheet") or "").strip()
-    skillsheet_text = DIRECT._truncate_skillsheet(
-        build_skillsheet_ai_context(normalized)
-    )
+    guard_skillsheet_text = build_skillsheet_ai_context(normalized)
+    skillsheet_text = DIRECT._truncate_skillsheet(guard_skillsheet_text)
     project_body = cleaned_email_map.get(project_id, "")
     project_body_text = DIRECT._truncate_project_body(project_body) if project_body else ""
     response_schema = DIRECT._build_schema(required_skills)
@@ -331,6 +331,7 @@ def _build_request_context(
         **base,
         "dispatch": "batch",
         "skillsheet_text": skillsheet_text,
+        "guard_skillsheet_text": guard_skillsheet_text,
         "project_body_text": project_body_text,
         "response_schema": response_schema,
         "body": body,
@@ -371,6 +372,9 @@ def _manifest_entry(
         "required_skills": context["required_skills"],
         "required_skill_count": len(context["required_skills"]),
         "skillsheet_text": context["skillsheet_text"],
+        "guard_skillsheet_text": context.get(
+            "guard_skillsheet_text", context["skillsheet_text"]
+        ),
         "skillsheet_chars_used": len(context["skillsheet_text"]),
         "project_body_text": context["project_body_text"],
         "source_record": context["source_record"],
@@ -1589,7 +1593,7 @@ def _apply_guard_to_result(
         checks,
         str(result.get("category_match") or "unclear"),
         schema_valid,
-        str(entry.get("skillsheet_text") or ""),
+        str(entry.get("guard_skillsheet_text") or entry.get("skillsheet_text") or ""),
     )
     result["required_skill_checks"] = guarded_checks
     result["category_match"] = guarded_category

@@ -43,6 +43,7 @@ from common.success_cache import (  # noqa: E402
     SuccessCacheError,
     build_cache_entry,
     build_comparison_key,
+    build_input_fingerprints,
     comparison_key_from_dict,
     load_success_cache,
     upsert_success_cache,
@@ -110,6 +111,11 @@ def skills(tag: str) -> List[dict]:
     return [{"skill": f"skill-{tag}", "match": True, "note": "ok"}]
 
 
+FIXTURE_REQUIRED = [{"skill": "fixture-required", "match": None, "note": None}]
+FIXTURE_SKILLSHEET = "normalized fixture skillsheet"
+FIXTURE_FINGERPRINTS = build_input_fingerprints(FIXTURE_REQUIRED, FIXTURE_SKILLSHEET)
+
+
 def ai_result(project_mid: str, resource_mid: str, tag: str) -> dict:
     return {
         "project_info": {"message_id": project_mid},
@@ -141,6 +147,8 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         # 06-80
         self.pairs_file = self.tmp / "input_pairs.jsonl"
         self.mail_master_file = self.tmp / "mail_master.jsonl"
+        self.project_skills_file = self.tmp / "project_skills.jsonl"
+        self.skillsheets_file = self.tmp / "skillsheets.jsonl"
         self.new_file = self.dup_dir / "01_result/duplicate_proposal_check.jsonl"
         self.duplicate_file = self.dup_dir / "01_result/99_duplicate.jsonl"
         self.diff_file = self.dup_dir / "01_result/diff_file.jsonl"
@@ -150,6 +158,8 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         dup_mod.INPUT_PAIRS = self.pairs_file
         dup_mod.INPUT_MAIL_MASTER = self.mail_master_file
         dup_mod.INPUT_SUCCESS_CACHE = self.cache_file
+        dup_mod.INPUT_PROJECT_SKILLS = self.project_skills_file
+        dup_mod.INPUT_SKILLSHEETS = self.skillsheets_file
         dup_mod.OUTPUT_NEW = self.new_file
         dup_mod.OUTPUT_DUPLICATE = self.duplicate_file
         dup_mod.OUTPUT_DIFF_FILE = self.diff_file
@@ -167,6 +177,8 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         merge_mod.INPUT_DIFF_FILE = self.diff_file
         merge_mod.INPUT_NEW_AI_RESULT = self.ai_result_file
         merge_mod.SUCCESS_CACHE_FILE = self.cache_file
+        merge_mod.INPUT_PROJECT_SKILLS = self.project_skills_file
+        merge_mod.INPUT_SKILLSHEETS = self.skillsheets_file
         merge_mod.OUTPUT_MERGED = self.merged_file
         merge_mod.OUTPUT_RESTORED = self.restored_file
         merge_mod.OUTPUT_ERROR = self.error_file
@@ -178,6 +190,8 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         confirm_dup_mod.OUTPUT_DIFF_FILE = self.diff_file
         confirm_dup_mod.OUTPUT_BK_DIFF_FILE = self.bk_diff_file
         confirm_dup_mod.SUCCESS_CACHE_FILE = self.cache_file
+        confirm_dup_mod.INPUT_PROJECT_SKILLS = self.project_skills_file
+        confirm_dup_mod.INPUT_SKILLSHEETS = self.skillsheets_file
         confirm_dup_mod.CONFIRM_RESULT = self.dup_dir / "02_confirm/confirm_result.txt"
 
         confirm_merge_mod.INPUT_NEW_PAIRS = self.new_file
@@ -199,6 +213,22 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
     def setup_inputs(self, mails: List[dict], pairs: List[dict]) -> None:
         write_jsonl(self.mail_master_file, mails)
         write_jsonl(self.pairs_file, pairs)
+        write_jsonl(
+            self.project_skills_file,
+            [
+                {"message_id": record["project_info"]["message_id"],
+                 "required_skills": FIXTURE_REQUIRED, "optional_skills": []}
+                for record in pairs
+            ],
+        )
+        write_jsonl(
+            self.skillsheets_file,
+            [
+                {"message_id": record["resource_info"]["message_id"],
+                 "success": True, "skillsheet": FIXTURE_SKILLSHEET}
+                for record in pairs
+            ],
+        )
 
     def run_06_80(self) -> None:
         dup_mod.main()
@@ -227,7 +257,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {"llm_model": "old"})],
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {"llm_model": "old"}, FIXTURE_FINGERPRINTS)],
         )
         self.setup_inputs(
             [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
@@ -245,7 +275,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {})],
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
         )
         self.setup_inputs(
             [
@@ -268,7 +298,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {"llm_model": "old"})],
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {"llm_model": "old"}, FIXTURE_FINGERPRINTS)],
         )
         self.setup_inputs(
             [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
@@ -290,6 +320,101 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
             entry["source_message_ids"],
             {"project_message_id": "AAA", "resource_message_id": "BBB"},
         )
+
+    def test_3a_required_change_is_cache_miss(self):
+        key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
+        self.setup_inputs(
+            [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
+            [pair("CCC", "DDD")],
+        )
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
+        )
+        write_jsonl(
+            self.project_skills_file,
+            [{"message_id": "CCC", "required_skills": [{"skill": "changed required"}], "optional_skills": []}],
+        )
+        self.run_06_80()
+        self.assertEqual([("CCC", "DDD")], [message_key(r) for r in read_jsonl(self.new_file)])
+
+    def test_3b_skillsheet_change_with_same_sender_subject_is_cache_miss(self):
+        key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
+        self.setup_inputs(
+            [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
+            [pair("CCC", "DDD")],
+        )
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
+        )
+        write_jsonl(
+            self.skillsheets_file,
+            [{"message_id": "DDD", "success": True, "skillsheet": "changed normalized body"}],
+        )
+        self.run_06_80()
+        self.assertEqual([("CCC", "DDD")], [message_key(r) for r in read_jsonl(self.new_file)])
+
+    def test_3c_missing_fingerprint_legacy_cache_is_hit(self):
+        key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
+        self.setup_inputs(
+            [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
+            [pair("CCC", "DDD")],
+        )
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {})],
+        )
+        self.run_06_80()
+        self.assertEqual(
+            [("CCC", "DDD")],
+            [message_key(r) for r in read_jsonl(self.duplicate_file)],
+        )
+
+    def test_3c2_optional_change_is_cache_miss(self):
+        key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
+        self.setup_inputs(
+            [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
+            [pair("CCC", "DDD")],
+        )
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(key, "AAA", "BBB", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
+        )
+        write_jsonl(
+            self.project_skills_file,
+            [{
+                "message_id": "CCC",
+                "required_skills": FIXTURE_REQUIRED,
+                "optional_skills": [{"skill": "changed optional"}],
+            }],
+        )
+        self.run_06_80()
+        self.assertEqual(
+            [("CCC", "DDD")],
+            [message_key(r) for r in read_jsonl(self.new_file)],
+        )
+
+    def test_3d_required_order_change_keeps_cache_hit(self):
+        key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
+        ordered_required = [{"skill": "condition A"}, {"skill": "condition B"}]
+        self.setup_inputs(
+            [mail("CCC", "p@x.com", "案件A"), mail("DDD", "r@y.com", "要員B")],
+            [pair("CCC", "DDD")],
+        )
+        write_jsonl(
+            self.cache_file,
+            [build_cache_entry(
+                key, "AAA", "BBB", skills("cached"), [], {},
+                build_input_fingerprints(ordered_required, FIXTURE_SKILLSHEET),
+            )],
+        )
+        write_jsonl(
+            self.project_skills_file,
+            [{"message_id": "CCC", "required_skills": list(reversed(ordered_required)), "optional_skills": []}],
+        )
+        self.run_06_80()
+        self.assertEqual([("CCC", "DDD")], [message_key(r) for r in read_jsonl(self.duplicate_file)])
 
     def test_4_in_previous_diff_but_cache_miss_goes_to_07_1(self):
         """4. 前回diffには存在するがCache MISS → 07-1入力へ入る"""
@@ -360,7 +485,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         key = build_comparison_key("p@x.com", "案件A", "r@y.com", "要員B")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(key, "OLD_P", "OLD_R", skills("cached"), [], {})],
+            [build_cache_entry(key, "OLD_P", "OLD_R", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
         )
         # mail master に OLD_P / OLD_R は存在しない
         self.setup_inputs(
@@ -416,7 +541,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         key = build_comparison_key("p0@x.com", "案件0", "r0@y.com", "要員0")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(key, "OLD_P", "OLD_R", skills("cached"), [], {})],
+            [build_cache_entry(key, "OLD_P", "OLD_R", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
         )
         mails = []
         pairs = []
@@ -466,7 +591,7 @@ class SuccessCacheFlowTestCase(unittest.TestCase):
         normal_key = build_comparison_key("p0@x.com", "案件0", "r0@y.com", "要員0")
         write_jsonl(
             self.cache_file,
-            [build_cache_entry(normal_key, "OLD_P", "OLD_R", skills("cached"), [], {})],
+            [build_cache_entry(normal_key, "OLD_P", "OLD_R", skills("cached"), [], {}, FIXTURE_FINGERPRINTS)],
         )
         self.setup_inputs(
             [

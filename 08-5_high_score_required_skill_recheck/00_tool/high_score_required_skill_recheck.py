@@ -831,7 +831,7 @@ def _process_record(
         record, source_score_band, checks, skillsheet_chars_used,
         category_match, category_note, apply_auto_true_override=True,
     )
-    result, _ = apply_legacy_safety_guard_to_result(result, skillsheet_text)
+    result, _ = apply_legacy_safety_guard_to_result(result, skillsheet_context)
     return result, None
 
 
@@ -983,7 +983,7 @@ def _run_postprocessing_replay(
         skillsheet_record = skillsheet_map.get(resource_mid) or {}
         normalized_skillsheet = str(skillsheet_record.get("skillsheet") or "").strip()
         skillsheet_text = (
-            _truncate_skillsheet(build_skillsheet_ai_context(normalized_skillsheet))
+            build_skillsheet_ai_context(normalized_skillsheet)
             if skillsheet_record.get("success", False) and normalized_skillsheet
             else ""
         )

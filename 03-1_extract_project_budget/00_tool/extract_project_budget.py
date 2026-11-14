@@ -251,6 +251,16 @@ _PRICE_HEADER_ONLY_RE = re.compile(
     r"(?:単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|予\s*算)\s*[:：]"
     r")\s*$"
 )
+_PRICE_SECTION_HEADER_ONLY_RE = re.compile(
+    r"^\s*(?:[■●◇・]\s*)?"
+    r"(?:【\s*)?"
+    r"(?:単\s*価|単\s*金|月\s*額|報\s*酬|金\s*額|予\s*算)"
+    r"(?:\s*(?:】|■))?(?:\s*[:：])?\s*$"
+)
+_PRICE_SECTION_OPEN_HIGH_RE = re.compile(
+    r"(?:[Mm][Aa][Xx]|上限)\s*[:：]?\s*"
+    r"(?P<amount>\d{1,3})\s*万[円]?"
+)
 _PRICE_ROLE_SUBLABEL_RE = re.compile(
     r"^\s*■\s*(?P<label>(?:"
     r"[^:：\n]{1,24}(?:者|枠)|リーダー|メンバー|エンジニア|SE|PG|PM|PL"
@@ -394,6 +404,38 @@ def _get_segments(text: str) -> List[str]:
 
 def _yen_to_int(value: str) -> int:
     return int(value.replace(",", ""))
+
+
+def _price_section_open_high(text: str) -> Optional[Tuple]:
+    """明示price headerから次sectionまでの単位付き上限値を返す。"""
+    lines = text.splitlines()
+    candidates = []
+    for index, line in enumerate(lines):
+        if not _PRICE_SECTION_HEADER_ONLY_RE.fullmatch(line):
+            continue
+        for next_line in lines[index + 1:]:
+            stripped = next_line.strip()
+            if not stripped:
+                continue
+            if _SECTION_HEADER_RE.search(stripped):
+                break
+            for match in _PRICE_SECTION_OPEN_HIGH_RE.finditer(stripped):
+                value = int(match.group("amount")) * 10000
+                if _PRICE_MIN <= value <= _PRICE_MAX:
+                    candidates.append((value, match.group(0)))
+        if candidates:
+            break
+    if not candidates:
+        return None
+    value, raw = max(candidates, key=lambda item: item[0])
+    return (
+        value,
+        {"min": None, "max": value},
+        "price-section-open-high",
+        0.88,
+        "monthly",
+        raw,
+    )
 
 
 def _tokenize_standalone_hourly_field(
@@ -811,6 +853,11 @@ def rule_extract(body: str) -> Tuple[Optional[int], Optional[Dict], str, float, 
 
     if skill_found:
         return SKILL_BASED_PRICE, None, "skill-based", 0.70, "monthly", "スキル見合い"
+
+    # 既存parserがnullの場合だけ、明示price section内の単位付きopen-highを補完する。
+    result = _price_section_open_high(text)
+    if result:
+        return result
 
     return None, None, "no-match", 0.0, "unknown", ""
 

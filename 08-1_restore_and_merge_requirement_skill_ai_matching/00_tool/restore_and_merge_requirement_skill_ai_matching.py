@@ -17,11 +17,12 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 from common.file_utils import ensure_result_dirs, write_error_log, write_execution_time
-from common.json_utils import read_jsonl_as_list, write_jsonl
+from common.json_utils import read_jsonl_as_dict, read_jsonl_as_list, write_jsonl
 from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
     build_cache_entry,
+    build_input_fingerprints,
     comparison_key_from_dict,
     comparison_key_from_diff_record,
     comparison_key_to_dict,
@@ -49,6 +50,13 @@ INPUT_NEW_AI_RESULT = (
     / "07-1_requirement_skill_ai_matching/01_result/requirement_skill_ai_matching.jsonl"
 )
 SUCCESS_CACHE_FILE = SUCCESS_CACHE_PATH
+INPUT_PROJECT_SKILLS = (
+    project_root
+    / "03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl"
+)
+INPUT_SKILLSHEETS = (
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
+)
 
 OUTPUT_RESTORED = STEP_DIR / "01_result/restored_requirement_skill_ai_matching.jsonl"
 OUTPUT_MERGED = STEP_DIR / "01_result/merged_requirement_skill_ai_matching.jsonl"
@@ -195,6 +203,8 @@ def main() -> None:
         new_pairs = read_jsonl_as_list(str(INPUT_NEW_PAIRS))
         new_ai_results = read_jsonl_as_list(str(INPUT_NEW_AI_RESULT))
         diff_records = read_jsonl_as_list(str(INPUT_DIFF_FILE))
+        project_skills = read_jsonl_as_dict(str(INPUT_PROJECT_SKILLS), key="message_id")
+        skillsheets = read_jsonl_as_dict(str(INPUT_SKILLSHEETS), key="message_id")
 
         logger.info(
             "入力件数: "
@@ -328,6 +338,23 @@ def main() -> None:
             merged_records.append(normalized)
             new_used_count += 1
 
+            project_record = project_skills.get(message_key[0]) or {}
+            skillsheet_record = skillsheets.get(message_key[1]) or {}
+            required_skills = project_record.get("required_skills")
+            normalized_skillsheet = skillsheet_record.get("skillsheet")
+            if not isinstance(required_skills, list):
+                raise RuntimeError(
+                    f"cache fingerprint作成用requiredがない: {message_key[0]}"
+                )
+            if (
+                not skillsheet_record.get("success")
+                or not isinstance(normalized_skillsheet, str)
+                or not normalized_skillsheet.strip()
+            ):
+                raise RuntimeError(
+                    f"cache fingerprint作成用skillsheetがない: {message_key[1]}"
+                )
+
             cache_upsert_entries.append(
                 build_cache_entry(
                     comparison_key,
@@ -336,6 +363,11 @@ def main() -> None:
                     normalized["project_info"]["required_skills"],
                     normalized["project_info"]["optional_skills"],
                     normalized.get("evaluation_meta", {}),
+                    build_input_fingerprints(
+                        required_skills,
+                        normalized_skillsheet,
+                        project_record.get("optional_skills") or [],
+                    ),
                 )
             )
 

@@ -165,6 +165,15 @@ _STOP_FULL_LINE_RE = re.compile(
     r'ご不明な点|お気軽にお問い合わせ)',
 )
 
+_CHECK04_VERIFIED_SECTION_HARD_STOP_NORMS = {
+    '狙い目ポイント',
+}
+
+
+def _is_check04_verified_section_hard_stop(line: str) -> bool:
+    """確認済みのfull-line section終端だけをhard stopとして扱う。"""
+    return _normalize_hdr(line) in _CHECK04_VERIFIED_SECTION_HARD_STOP_NORMS
+
 # 署名開始を示す行（行頭に会社形態名・連絡先フィールドが来る）
 # 「株式会社XXX」は区切り文字不要。TEL/Email 等はコロン等のセパレータが必要
 _SIGNATURE_STOP_RE = re.compile(
@@ -228,6 +237,8 @@ def _is_stop_section(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
+    if _is_check04_verified_section_hard_stop(s):
+        return True
     # 行全体パターン
     if _STOP_FULL_LINE_RE.search(s):
         return True
@@ -331,6 +342,20 @@ _OPTIONAL_HDR_NORM_RE = re.compile(
     r')$',
     re.IGNORECASE
 )
+
+# CHECK-04限定: latest runの原文で確認済みの完全行だけを追加する。
+# prefix/substring推測には広げず、正規化後の完全一致で判定する。
+_CHECK04_VERIFIED_REQUIRED_HDR_NORMS = {
+    '要件スキル',
+    '必須:※必須/尚可スキルへ〇×コメントをお願い致します',
+    '必須:以下のいずれかの経験',
+    '応募条件(業務SE/PG)',
+    '必要経験',
+}
+
+_CHECK04_VERIFIED_OPTIONAL_HDR_NORMS = {
+    '歓迎スキル・ご経験(必須ではありません)',
+}
 
 # CHECK-04限定: 通常の見出し判定・stop判定では失われる確認済み表記だけを扱う。
 # 一般的な複合見出し推測には広げない。
@@ -591,6 +616,12 @@ def _classify_line(
     # required sectionを開始する。header単独やoptional/説明suffixには広げない。
     if _is_generic_header_with_required_scope(line):
         return 'required_header', ''
+
+    # latest runで確認済みの完全行だけを、通常のstop/inline判定より先に確定する。
+    if norm in _CHECK04_VERIFIED_REQUIRED_HDR_NORMS:
+        return 'required_header', ''
+    if norm in _CHECK04_VERIFIED_OPTIONAL_HDR_NORMS:
+        return 'optional_header', ''
 
     # 「業務内容・必須スキル」は通常のstop判定にも一致するため、
     # 確認済みの限定見出しだけstop判定より先に確定する。
@@ -1286,7 +1317,11 @@ def _is_hard_stop(line: str) -> bool:
     セクション区切り（期間・備考等）はハード停止ではなく STATE_NONE に戻す。
     """
     s = _n(line.strip())
-    return bool(_SIGNATURE_STOP_RE.match(s) or _STOP_FULL_LINE_RE.search(line))
+    return bool(
+        _is_check04_verified_section_hard_stop(line)
+        or _SIGNATURE_STOP_RE.match(s)
+        or _STOP_FULL_LINE_RE.search(line)
+    )
 
 
 _REQUIRED_CHECKLIST_HEADER = 'スキル確認項目'

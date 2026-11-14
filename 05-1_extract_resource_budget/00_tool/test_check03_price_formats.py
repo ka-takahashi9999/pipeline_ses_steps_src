@@ -7,6 +7,43 @@ import extract_resource_budget as target
 
 
 class Check03ResourcePriceFormatsTest(unittest.TestCase):
+    def test_standalone_taxed_man_range_in_long_profile(self):
+        for tax_label in ("税別", "税込"):
+            with self.subTest(tax_label=tax_label):
+                body = (
+                    "ERP導入コンサルタントの経歴概要です。\n" * 20
+                    + "135万円〜150万円 {}\n".format(tax_label)
+                    + "要件定義から移行まで対応可能です。\n" * 20
+                )
+                self.assertEqual(
+                    target.rule_extract(body),
+                    (
+                        1425000,
+                        1350000,
+                        1500000,
+                        "standalone-taxed-man-range",
+                        "135万円〜150万円 {}".format(tax_label),
+                    ),
+                )
+
+    def test_standalone_taxed_range_rejects_non_price_ranges(self):
+        cases = (
+            "140-180h",
+            "30〜40歳",
+            "1〜2名",
+            "3〜5年",
+            "6o万円",
+            "135〜150 税別",
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                body = "要員の経歴概要です。\n" * 20 + value
+                self.assertIsNone(target.rule_extract(body)[0])
+
+    def test_existing_price_precedes_standalone_taxed_range_fallback(self):
+        body = "単価:80万円\n" + "経歴詳細です。\n" * 20 + "135万円〜150万円 税別"
+        self.assertEqual(target.rule_extract(body)[:4], (800000, None, None, "man"))
+
     def test_labeled_bare_comma_monthly_with_trailing_hyphen(self):
         cases = (
             "月 額:750,000-",

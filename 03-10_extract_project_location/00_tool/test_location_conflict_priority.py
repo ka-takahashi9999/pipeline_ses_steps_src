@@ -74,6 +74,10 @@ class LocationConflictPriorityTest(unittest.TestCase):
         self.assert_location("三宮", "近畿地方")
         self.assert_location("茅ケ崎(常駐)", "関東地方")
 
+    def test_ichibamae_and_longer_station_form(self):
+        self.assert_location("市場前", "関東地方")
+        self.assert_location("市場前駅", "関東地方")
+
     def test_same_start_prefers_longer_keyword(self):
         entries = [
             ("中部地方", "長岡", re.compile("長岡")),

@@ -2,7 +2,9 @@
 06-80_duplicate_proposal_check
 06-30 通過ペアの comparison_key を Success Cache と照合し、新規(Cache MISS)/重複(Cache HIT)に仕分けする。
 
-重複判定の正本は Success Cache（再利用可能な07-1成功評価結果）であり、前回diffではない。
+重複判定の正本は Success Cache。fingerprint保存済みCacheは
+required/optional条件とnormalized skillsheetの一致を必須とし、
+未保存の旧Cacheは段階移行として従来どおりHITを許可する。
 前回diff（bk_diff_file）は監査・確認用途としてのみ残す。
 """
 
@@ -21,7 +23,9 @@ from common.logger import get_logger
 from common.success_cache import (
     COMPARISON_KEY_FIELDS,
     SUCCESS_CACHE_PATH,
+    build_input_fingerprints,
     build_comparison_key,
+    cache_fingerprint_status,
     comparison_key_from_dict,
     comparison_key_from_diff_record,
     comparison_key_to_dict,
@@ -40,6 +44,13 @@ INPUT_MAIL_MASTER = (
     project_root / "01-1_fetch_gmail/01_result/fetch_gmail_mail_master.jsonl"
 )
 INPUT_SUCCESS_CACHE = SUCCESS_CACHE_PATH
+INPUT_PROJECT_SKILLS = (
+    project_root
+    / "03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl"
+)
+INPUT_SKILLSHEETS = (
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
+)
 
 OUTPUT_NEW = STEP_DIR / "01_result/duplicate_proposal_check.jsonl"
 OUTPUT_DUPLICATE = STEP_DIR / "01_result/99_duplicate_duplicate_proposal_check.jsonl"
@@ -108,6 +119,24 @@ def find_incomplete_comparison_keys(diff_records: List[dict]) -> List[dict]:
     return incomplete
 
 
+def current_input_fingerprints(
+    pair: dict, project_skills: Dict[str, dict], skillsheets: Dict[str, dict]
+) -> dict:
+    project_mid = pair.get("project_info", {}).get("message_id", "")
+    resource_mid = pair.get("resource_info", {}).get("message_id", "")
+    project_record = project_skills.get(project_mid) or {}
+    skillsheet_record = skillsheets.get(resource_mid) or {}
+    required_skills = project_record.get("required_skills")
+    skillsheet = skillsheet_record.get("skillsheet")
+    if not isinstance(required_skills, list):
+        return {}
+    if not skillsheet_record.get("success") or not isinstance(skillsheet, str) or not skillsheet.strip():
+        return {}
+    return build_input_fingerprints(
+        required_skills, skillsheet, project_record.get("optional_skills") or []
+    )
+
+
 def main() -> None:
     logger = get_logger(STEP_NAME)
     dirs = ensure_result_dirs(str(STEP_DIR))
@@ -116,6 +145,8 @@ def main() -> None:
     try:
         pairs = read_jsonl_as_list(str(INPUT_PAIRS))
         mail_master = read_jsonl_as_dict(str(INPUT_MAIL_MASTER), key="message_id")
+        project_skills = read_jsonl_as_dict(str(INPUT_PROJECT_SKILLS), key="message_id")
+        skillsheets = read_jsonl_as_dict(str(INPUT_SKILLSHEETS), key="message_id")
         logger.info(f"入力ペア数={len(pairs)} メールマスタ件数={len(mail_master)}")
 
         diff_records = [build_compare_key_record(pair, mail_master) for pair in pairs]
@@ -183,6 +214,7 @@ def main() -> None:
         new_records: List[dict] = []
         duplicate_records: List[dict] = []
         previous_diff_overlap_count = 0
+        fingerprint_counts = {"match": 0, "mismatch": 0, "missing": 0}
 
         for pair, diff_record in zip(pairs, diff_records):
             record = dict(pair)
@@ -191,7 +223,19 @@ def main() -> None:
             if comparison_key in previous_key_set:
                 previous_diff_overlap_count += 1
 
-            is_duplicate = comparison_key in success_cache
+            cache_entry = success_cache.get(comparison_key)
+            is_duplicate = False
+            if cache_entry is not None:
+                current_fingerprints = current_input_fingerprints(
+                    pair, project_skills, skillsheets
+                )
+                fingerprint_status = cache_fingerprint_status(
+                    cache_entry, current_fingerprints
+                )
+                fingerprint_counts[fingerprint_status] += 1
+                # 段階移行: fingerprint未保存の旧Cacheは従来どおりHIT。
+                # fingerprint保存済みCacheだけ、明確な不一致をMISSにする。
+                is_duplicate = fingerprint_status in ("match", "missing")
             record["duplicate_proposal_check"] = is_duplicate
 
             if is_duplicate:
@@ -208,6 +252,9 @@ def main() -> None:
             f"Subject fallback: project={project_fallback_count} "
             f"resource={resource_fallback_count} pairs={fallback_pair_count} "
             "comparison_key空値=0 "
+            f"fingerprint一致={fingerprint_counts['match']} "
+            f"不一致={fingerprint_counts['mismatch']} "
+            f"旧Cache(fingerprintなし)={fingerprint_counts['missing']} "
             f"前回diffにも存在={previous_diff_overlap_count}（監査用途 / 判定未使用）"
         )
 

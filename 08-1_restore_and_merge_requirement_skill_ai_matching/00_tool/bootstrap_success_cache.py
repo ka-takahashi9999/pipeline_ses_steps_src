@@ -33,6 +33,7 @@ from common.logger import get_logger
 from common.success_cache import (
     SUCCESS_CACHE_PATH,
     build_cache_entry,
+    build_input_fingerprints,
     comparison_key_from_dict,
     comparison_key_from_diff_record,
     is_complete_comparison_key,
@@ -49,6 +50,13 @@ DEFAULT_AI_RESULT = (
 DEFAULT_DIFF_FILE = (
     project_root
     / "06-80_duplicate_proposal_check/01_result/duplicate_proposal_check_diff_file.jsonl"
+)
+DEFAULT_PROJECT_SKILLS = (
+    project_root
+    / "03-50_extract_project_required_skills/01_result/extract_project_required_skills.jsonl"
+)
+DEFAULT_SKILLSHEETS = (
+    project_root / "04-2_normalize_skillsheets_text/01_result/normalize_skillsheets_text.jsonl"
 )
 
 RUNNING_PIPELINE_PATTERNS = (
@@ -96,6 +104,8 @@ def file_run_date(path: Path) -> str:
 def validate_and_build(
     ai_result_path: Path,
     diff_path: Path,
+    project_skills_path: Path,
+    skillsheets_path: Path,
     cache_path: Path,
     expected_count: int,
     expected_run_date: str,
@@ -114,7 +124,13 @@ def validate_and_build(
         issues.append(f"Pipeline関連プロセスが実行中: {running[:3]}")
 
     # 3. 元データ存在
-    for path, label in ((ai_result_path, "07-1正常結果"), (diff_path, "06-80 diff_file")):
+    source_files = (
+        (ai_result_path, "07-1正常結果"),
+        (diff_path, "06-80 diff_file"),
+        (project_skills_path, "03-50 required"),
+        (skillsheets_path, "04-2 normalized skillsheet"),
+    )
+    for path, label in source_files:
         if not path.exists():
             issues.append(f"{label}が存在しない: {path}")
     if issues:
@@ -131,6 +147,14 @@ def validate_and_build(
 
     ai_results = read_jsonl_as_list(str(ai_result_path))
     diff_records = read_jsonl_as_list(str(diff_path))
+    project_skills = {
+        record.get("message_id", ""): record
+        for record in read_jsonl_as_list(str(project_skills_path))
+    }
+    skillsheets = {
+        record.get("message_id", ""): record
+        for record in read_jsonl_as_list(str(skillsheets_path))
+    }
     logger.info(f"07-1正常結果={len(ai_results)}件 06-80 diff_file={len(diff_records)}件")
 
     # 5. 件数一致
@@ -182,6 +206,21 @@ def validate_and_build(
             issues.append(f"required_skills/optional_skillsが欠落: {message_key}")
             continue
 
+        project_record = project_skills.get(message_key[0]) or {}
+        skillsheet_record = skillsheets.get(message_key[1]) or {}
+        current_required = project_record.get("required_skills")
+        normalized_skillsheet = skillsheet_record.get("skillsheet")
+        if not isinstance(current_required, list):
+            issues.append(f"fingerprint用requiredが欠落: {message_key}")
+            continue
+        if (
+            not skillsheet_record.get("success")
+            or not isinstance(normalized_skillsheet, str)
+            or not normalized_skillsheet.strip()
+        ):
+            issues.append(f"fingerprint用skillsheetが欠落: {message_key}")
+            continue
+
         entry = build_cache_entry(
             comparison_key,
             message_key[0],
@@ -189,6 +228,11 @@ def validate_and_build(
             required_skills,
             optional_skills,
             record.get("evaluation_meta", {}),
+            build_input_fingerprints(
+                current_required,
+                normalized_skillsheet,
+                project_record.get("optional_skills") or [],
+            ),
         )
         try:
             validate_cache_entry(entry, f"bootstrap {message_key}")
@@ -218,6 +262,8 @@ def main() -> None:
     parser.add_argument("--expected-run-date", default="")
     parser.add_argument("--ai-result", default=str(DEFAULT_AI_RESULT))
     parser.add_argument("--diff-file", default=str(DEFAULT_DIFF_FILE))
+    parser.add_argument("--project-skills", default=str(DEFAULT_PROJECT_SKILLS))
+    parser.add_argument("--skillsheets", default=str(DEFAULT_SKILLSHEETS))
     parser.add_argument("--cache", default=str(SUCCESS_CACHE_PATH))
     args = parser.parse_args()
 
@@ -228,6 +274,8 @@ def main() -> None:
         entries, issues = validate_and_build(
             Path(args.ai_result),
             Path(args.diff_file),
+            Path(args.project_skills),
+            Path(args.skillsheets),
             cache_path,
             args.expected_count,
             args.expected_run_date,
